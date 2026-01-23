@@ -83,4 +83,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+    # удерживаем контейнер живым для Railway
+    import time
+    while True:
+        time.sleep(3600)
+
