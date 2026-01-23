@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 PRICE_RUB = 299
 PERIOD_DAYS = 30
 
+MSK = timezone(timedelta(hours=3))
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -86,14 +88,14 @@ def days_left(end_at: datetime | None) -> int:
     if not end_at:
         return 0
     delta = end_at - utcnow()
-    return max(0, (delta.days + (1 if delta.seconds > 0 else 0)))
+    # округление вверх до целого дня, если есть секунды
+    return max(0, delta.days + (1 if delta.seconds > 0 else 0))
 
 
 def fmt_dt(dt: datetime | None) -> str:
     if not dt:
         return "—"
-    # выводим в формате ДД.ММ.ГГГГ HH:MM (UTC)
-    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
 def main_menu_kb():
@@ -107,9 +109,9 @@ def main_menu_kb():
     return kb.as_markup()
 
 
-def cabinet_kb(is_active: bool):
+def cabinet_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="💳 Продлить", callback_data="pay")  # ведёт в оплату
+    kb.button(text="💳 Продлить", callback_data="pay")
     kb.button(text="⬅️ Назад", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
@@ -156,12 +158,6 @@ async def render_cabinet(session: AsyncSession, tg_id: int) -> str:
 
 
 async def apply_success_payment(session: AsyncSession, tg_id: int) -> tuple[datetime, int]:
-    """
-    Эмулируем успешную оплату:
-      - добавляем запись Payment
-      - продлеваем Subscription.end_at на +30 дней
-      - start_at выставляем при первой активации
-    """
     await ensure_user(session, tg_id)
     sub = await get_or_create_sub(session, tg_id)
 
@@ -214,10 +210,8 @@ async def main() -> None:
     async def cabinet(cb: CallbackQuery):
         async with Session() as session:
             text = await render_cabinet(session, cb.from_user.id)
-            sub = await get_or_create_sub(session, cb.from_user.id)
-            active = bool(sub.end_at and sub.end_at > utcnow() and sub.is_active)
 
-        await cb.message.edit_text(text, reply_markup=cabinet_kb(active), parse_mode="Markdown")
+        await cb.message.edit_text(text, reply_markup=cabinet_kb(), parse_mode="Markdown")
         await cb.answer()
 
     @dp.callback_query(F.data == "pay")
@@ -237,7 +231,7 @@ async def main() -> None:
             new_end, left = await apply_success_payment(session, cb.from_user.id)
 
         await cb.message.edit_text(
-            f"✅ Оплата прошла успешно.\n\n"
+            "✅ Оплата прошла успешно.\n\n"
             f"🟦 СБС активен до: {fmt_dt(new_end)}\n"
             f"⏳ Осталось дней: {left}\n\n"
             "🌍 VPN (mock): активирован.\n"
