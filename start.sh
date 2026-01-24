@@ -9,10 +9,9 @@ set -e
 
 if [ $rc -ne 0 ]; then
   echo "[boot] alembic upgrade failed (rc=$rc)."
-  echo "[boot] If DB already has tables, stamping head to avoid crash..."
-  # Mark current DB as being at latest revision, so app can start without dropping DB.
+  echo "[boot] stamping head to avoid crash..."
   python -m alembic stamp head || true
 fi
 
 echo "[boot] starting bot..."
-python -m app.main
+python main.py
