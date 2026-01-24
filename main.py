@@ -4,20 +4,18 @@ import os
 import secrets
 from datetime import datetime, timezone, timedelta
 
+import qrcode
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery,
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    FSInputFile,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import text
 from dateutil.relativedelta import relativedelta
-
-import qrcode
-from aiogram.types import FSInputFile
 
 
 # ================== CONFIG ==================
@@ -90,7 +88,6 @@ def days_left(end_at: datetime | None) -> int:
 # ================== DB ==================
 engine = create_async_engine(make_async_db_url(DATABASE_URL), pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
 
 MIGRATION_SQL = [
     # base tables (create if empty)
@@ -181,41 +178,58 @@ async def run_migrations():
             try:
                 await session.execute(text(stmt))
             except Exception as e:
-                # не валим бот миграциями — в логах будет видно, но бот будет жить
-                print("[MIGRATION WARN]", str(e)[:250], "||", stmt[:120])
+                # миграции не должны ронять бот
+                print("[MIGRATION WARN]", str(e)[:220], "||", stmt[:120])
         await session.commit()
 
 
-# ================== UI ==================
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Личный кабинет"), KeyboardButton(text="🌍 VPN")],
-            [KeyboardButton(text="💳 Оплата"), KeyboardButton(text="❓ FAQ")],
-            [KeyboardButton(text="🛠 Поддержка")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-def cabinet_inline_kb() -> InlineKeyboardMarkup:
+# ================== INLINE UI ==================
+def kb_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
+    b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
+    b.button(text="🌍 VPN", callback_data="nav:vpn")
+    b.button(text="💳 Оплата", callback_data="nav:pay")
+    b.button(text="❓ FAQ", callback_data="nav:faq")
+    b.button(text="🛠 Поддержка", callback_data="nav:support")
+    b.adjust(1)
     return b.as_markup()
 
 
-def vpn_inline_kb() -> InlineKeyboardMarkup:
+def kb_back_home() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_cabinet() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_pay() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Тест-оплата 299 ₽ (успех)", callback_data="pay:mock:1m")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_vpn() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
     b.button(text="📥 Скачать мой конфиг", callback_data="vpn:conf")
     b.button(text="🔁 Показать QR", callback_data="vpn:qr")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
 
 
-def vpn_reset_confirm_kb() -> InlineKeyboardMarkup:
+def kb_vpn_reset_confirm() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, сбросить", callback_data="vpn:reset:do")
     b.button(text="❌ Отмена", callback_data="vpn:reset:cancel")
@@ -223,19 +237,12 @@ def vpn_reset_confirm_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def payment_inline_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Тест-оплата 299 ₽ (успех)", callback_data="pay:mock:1m")
-    return b.as_markup()
-
-
-# ================== VPN MOCK ==================
+# ================== VPN MOCK HELPERS ==================
 def fake_key_b64() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
 
 
 def alloc_ip(tg_id: int) -> str:
-    # 10.66.0.0/16 deterministic
     a = (tg_id % 250) + 2
     b = ((tg_id // 250) % 250) + 2
     return f"10.66.{b}.{a}/32"
@@ -344,14 +351,16 @@ async def ensure_peer_for_active_sub(session: AsyncSession, tg_id: int):
     sub = await get_sub(session, tg_id)
     if not sub:
         return None
-    _, end_at, _, status = sub
-    end_at_utc = ensure_aware_utc(end_at)
+
+    end_at_utc = ensure_aware_utc(sub[1])
+    status = sub[3]
     if not end_at_utc or status != "active" or end_at_utc <= utcnow():
         return None
 
     peer = await get_active_peer(session, tg_id)
     if peer:
         return peer
+
     await create_peer(session, tg_id, reason=None)
     return await get_active_peer(session, tg_id)
 
@@ -360,10 +369,7 @@ async def apply_payment_add_month(session: AsyncSession, tg_id: int):
     sub = await get_sub(session, tg_id)
     now = utcnow()
 
-    end_at = None
-    if sub:
-        end_at = ensure_aware_utc(sub[1])
-
+    end_at = ensure_aware_utc(sub[1]) if sub else None
     base = end_at if (end_at and end_at > now) else now
     new_end = base + relativedelta(months=+PERIOD_MONTHS)
 
@@ -377,7 +383,6 @@ async def apply_payment_add_month(session: AsyncSession, tg_id: int):
         {"id": tg_id, "end_at": new_end},
     )
 
-    # IMPORTANT: fill BOTH period_days and period_months (your DB requires period_days NOT NULL)
     await session.execute(
         text("""
         INSERT INTO payments (tg_id, amount, currency, provider, status, paid_at, period_days, period_months)
@@ -390,25 +395,28 @@ async def apply_payment_add_month(session: AsyncSession, tg_id: int):
     return new_end
 
 
-# ================== HANDLERS ==================
-def is_menu(message: Message, text_: str) -> bool:
-    return (message.text or "").strip() == text_
+# ================== SCREEN RENDERERS (edit_text only) ==================
+HOME_TEXT = "✅ PoC запущен!\n\nВыберите раздел:"
 
 
-async def show_cabinet(msg: Message):
+async def render_home(cb: CallbackQuery):
+    await cb.message.edit_text(HOME_TEXT, reply_markup=kb_main())
+    await cb.answer()
+
+
+async def render_cabinet(cb: CallbackQuery):
+    tg_id = cb.from_user.id
     async with SessionLocal() as session:
-        tg_id = msg.from_user.id
         await ensure_user(session, tg_id)
-
         sub = await get_sub(session, tg_id)
         pay = await last_payment(session, tg_id)
         peer = await get_active_peer(session, tg_id)
 
-    start_at, end_at, is_active, status = sub if sub else (None, None, False, "expired")
-    end_at_utc = ensure_aware_utc(end_at)
-    active = bool(end_at_utc and end_at_utc > utcnow() and status == "active" and is_active)
+    end_at_utc = ensure_aware_utc(sub[1]) if sub else None
+    is_active = bool(sub and sub[2] and sub[3] == "active" and end_at_utc and end_at_utc > utcnow())
 
-    vpn_status = "Активен ✅" if (peer is not None) else "Отключён ❌"
+    vpn_status = "Активен ✅" if peer is not None else "Отключён ❌"
+
     pay_line = "—"
     if pay:
         pid, amount, currency, pstatus, paid_at = pay
@@ -416,77 +424,85 @@ async def show_cabinet(msg: Message):
 
     text_msg = (
         "👤 *Личный кабинет*\n\n"
-        f"🧾 *СБС*: {'Активен ✅' if active else 'Истёк ❌'}\n"
+        f"🧾 *СБС*: {'Активен ✅' if is_active else 'Истёк ❌'}\n"
         f"📅 Окончание: *{fmt_dt(end_at_utc)}*\n"
         f"⏳ Осталось дней: *{days_left(end_at_utc)}*\n\n"
         f"🌍 *VPN*: {vpn_status}\n\n"
         f"💳 *Последний платёж*: {pay_line}\n"
     )
-    await msg.answer(text_msg, parse_mode="Markdown", reply_markup=cabinet_inline_kb())
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_cabinet())
+    await cb.answer()
 
 
-async def show_vpn(msg: Message):
+async def render_vpn(cb: CallbackQuery):
+    tg_id = cb.from_user.id
     async with SessionLocal() as session:
-        tg_id = msg.from_user.id
         await ensure_user(session, tg_id)
-
         peer = await ensure_peer_for_active_sub(session, tg_id)
 
     if not peer:
-        await msg.answer(
-            "🌍 *VPN*\n\nНужна активная подписка.\nОткрой *💳 Оплата* и нажми тест-оплату.",
-            parse_mode="Markdown",
-            reply_markup=vpn_inline_kb(),
+        text_msg = (
+            "🌍 *VPN*\n\n"
+            "Чтобы получить VPN — нужна активная подписка СБС.\n"
+            "Открой *💳 Оплата* и нажми тест-оплату."
         )
-        return
+    else:
+        text_msg = (
+            "🌍 *VPN*\n\n"
+            "Конфиг готов. Он **не меняется при продлении**.\n"
+            "Можно скачать конфиг или показать QR.\n\n"
+            "Сброс VPN создаст новый конфиг."
+        )
 
-    await msg.answer(
-        "🌍 *VPN*\n\nКонфиг готов. Он **не меняется при продлении**.\nМожно скачать конфиг или показать QR.",
-        parse_mode="Markdown",
-        reply_markup=vpn_inline_kb(),
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn())
+    await cb.answer()
+
+
+async def render_pay(cb: CallbackQuery):
+    text_msg = (
+        "💳 *Оплата*\n\n"
+        "PoC: кнопка ниже имитирует успешную оплату 299 ₽\n"
+        "и продлевает подписку на **1 календарный месяц**."
     )
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_pay())
+    await cb.answer()
 
 
-async def show_pay(msg: Message):
-    await msg.answer(
-        "💳 *Оплата*\n\nPoC: кнопка ниже имитирует успешную оплату 299 ₽ и продлевает на 1 календарный месяц.",
-        parse_mode="Markdown",
-        reply_markup=payment_inline_kb(),
-    )
-
-
-async def show_faq(msg: Message):
-    await msg.answer(
+async def render_faq(cb: CallbackQuery):
+    text_msg = (
         "❓ *FAQ*\n\n"
         "• СБС — единая подписка.\n"
         "• VPN-конфиг не меняется при продлении.\n"
-        "• По окончании СБС доступ отключается автоматически.\n",
-        parse_mode="Markdown",
+        "• По окончании СБС доступ отключается автоматически.\n"
     )
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_back_home())
+    await cb.answer()
 
 
-async def show_support(msg: Message):
-    await msg.answer("🛠 Поддержка: напиши сюда и приложи скрин/описание проблемы.")
+async def render_support(cb: CallbackQuery):
+    text_msg = "🛠 Поддержка\n\nНапиши сюда и приложи скрин/описание проблемы."
+    await cb.message.edit_text(text_msg, reply_markup=kb_back_home())
+    await cb.answer()
 
 
-# ================== CALLBACKS ==================
-async def cb_pay_success(cb: CallbackQuery):
+# ================== ACTION CALLBACKS ==================
+async def action_pay_success(cb: CallbackQuery):
     tg_id = cb.from_user.id
     async with SessionLocal() as session:
         await ensure_user(session, tg_id)
         new_end = await apply_payment_add_month(session, tg_id)
         await ensure_peer_for_active_sub(session, tg_id)
 
-    await cb.message.edit_text(
+    text_msg = (
         "✅ *Оплата успешна!*\n\n"
         f"🟦 СБС активен до: *{fmt_dt(new_end)}*\n"
-        "🌍 VPN работает — можете пользоваться.",
-        parse_mode="Markdown",
+        "🌍 VPN работает — можете пользоваться."
     )
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_main())
     await cb.answer()
 
 
-async def cb_vpn_conf(cb: CallbackQuery):
+async def action_vpn_send_conf(cb: CallbackQuery):
     tg_id = cb.from_user.id
     async with SessionLocal() as session:
         peer = await ensure_peer_for_active_sub(session, tg_id)
@@ -503,10 +519,10 @@ async def cb_vpn_conf(cb: CallbackQuery):
         f.write(conf)
 
     await cb.message.answer_document(FSInputFile(path), caption="📥 Ваш WireGuard конфиг (.conf)")
-    await cb.answer()
+    await cb.answer("Конфиг отправлен")
 
 
-async def cb_vpn_qr(cb: CallbackQuery):
+async def action_vpn_show_qr(cb: CallbackQuery):
     tg_id = cb.from_user.id
     async with SessionLocal() as session:
         peer = await ensure_peer_for_active_sub(session, tg_id)
@@ -523,44 +539,45 @@ async def cb_vpn_qr(cb: CallbackQuery):
     img.save(path)
 
     await cb.message.answer_photo(FSInputFile(path), caption="🔁 QR для импорта в WireGuard")
-    await cb.answer()
+    await cb.answer("QR отправлен")
 
 
-async def cb_vpn_guide(cb: CallbackQuery):
-    await cb.message.answer(
+async def action_vpn_guide(cb: CallbackQuery):
+    text_msg = (
         "📖 *Инструкция*\n\n"
         "1) Установи приложение WireGuard.\n"
         "2) Импортируй конфиг (.conf) или отсканируй QR.\n"
         "3) Включи туннель.\n\n"
-        "Если проблемы — попробуй ♻️ Сбросить VPN.",
-        parse_mode="Markdown",
+        "Если проблемы — попробуй ♻️ Сбросить VPN."
     )
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn())
     await cb.answer()
 
 
-async def cb_vpn_reset_confirm(cb: CallbackQuery):
-    await cb.message.answer(
-        "♻️ *Сбросить VPN?*\n\nСтарый доступ будет отключён, вы получите новый конфиг.",
-        parse_mode="Markdown",
-        reply_markup=vpn_reset_confirm_kb(),
+async def action_vpn_reset_confirm(cb: CallbackQuery):
+    text_msg = (
+        "♻️ *Сбросить VPN?*\n\n"
+        "Старый доступ будет отключён, вы получите новый конфиг."
     )
+    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn_reset_confirm())
     await cb.answer()
 
 
-async def cb_vpn_reset_do(cb: CallbackQuery):
+async def action_vpn_reset_do(cb: CallbackQuery):
     tg_id = cb.from_user.id
+
     async with SessionLocal() as session:
         sub = await get_sub(session, tg_id)
         end_at_utc = ensure_aware_utc(sub[1]) if sub else None
         status = sub[3] if sub else "expired"
+
         if not end_at_utc or status != "active" or end_at_utc <= utcnow():
             await cb.answer("Нужна активная подписка.", show_alert=True)
             return
 
         peer = await get_active_peer(session, tg_id)
         if peer:
-            peer_id = peer[0]
-            await revoke_peer(session, peer_id, "manual_reset")
+            await revoke_peer(session, peer[0], "manual_reset")
 
         priv, ip = await create_peer(session, tg_id, "manual_reset")
 
@@ -573,14 +590,21 @@ async def cb_vpn_reset_do(cb: CallbackQuery):
     qr_path = f"/tmp/sbs-{tg_id}-qr.png"
     img.save(qr_path)
 
-    await cb.message.answer("✅ VPN сброшен. Отправляю новый конфиг и QR…")
+    # обновляем экран VPN (одним сообщением)
+    await cb.message.edit_text(
+        "✅ *VPN сброшен.*\n\nНиже отправил новый конфиг и QR.",
+        parse_mode="Markdown",
+        reply_markup=kb_vpn(),
+    )
+    # файлы отдельными сообщениями (так устроен Telegram)
     await cb.message.answer_document(FSInputFile(conf_path), caption="📥 Новый конфиг (.conf)")
     await cb.message.answer_photo(FSInputFile(qr_path), caption="🔁 Новый QR")
     await cb.answer()
 
 
-async def cb_vpn_reset_cancel(cb: CallbackQuery):
-    await cb.answer("Ок, отменено.")
+async def action_vpn_reset_cancel(cb: CallbackQuery):
+    # возвращаемся на экран VPN без создания новых сообщений
+    await render_vpn(cb)
 
 
 # ================== SCHEDULER 30s ==================
@@ -591,7 +615,6 @@ async def scheduler_loop(bot: Bot):
         try:
             async with SessionLocal() as session:
                 now = utcnow()
-                # expire subs
                 r = await session.execute(
                     text("""
                     SELECT tg_id FROM subscriptions
@@ -623,8 +646,8 @@ async def scheduler_loop(bot: Bot):
                         try:
                             await bot.send_message(
                                 tg_id,
-                                "❌ СБС закончился. VPN отключён.\n\nНажмите «💳 Оплата», чтобы продлить.",
-                                reply_markup=main_menu_kb(),
+                                "❌ СБС закончился. VPN отключён.\n\nНажмите «Оплата», чтобы продлить.",
+                                reply_markup=kb_main(),
                             )
                         except Exception:
                             pass
@@ -645,54 +668,67 @@ async def main():
     async def start(msg: Message):
         async with SessionLocal() as session:
             await ensure_user(session, msg.from_user.id)
-        await msg.answer("✅ PoC запущен!\n\nВыбирай раздел:", reply_markup=main_menu_kb())
+        await msg.answer(HOME_TEXT, reply_markup=kb_main())
 
-    @dp.message(F.text)
-    async def router(msg: Message):
-        if is_menu(msg, "👤 Личный кабинет"):
-            await show_cabinet(msg)
-            return
-        if is_menu(msg, "🌍 VPN"):
-            await show_vpn(msg)
-            return
-        if is_menu(msg, "💳 Оплата"):
-            await show_pay(msg)
-            return
-        if is_menu(msg, "❓ FAQ"):
-            await show_faq(msg)
-            return
-        if is_menu(msg, "🛠 Поддержка"):
-            await show_support(msg)
-            return
-        await msg.answer("Выберите пункт меню 👇", reply_markup=main_menu_kb())
+    @dp.message(Command("menu"))
+    async def menu_cmd(msg: Message):
+        async with SessionLocal() as session:
+            await ensure_user(session, msg.from_user.id)
+        await msg.answer(HOME_TEXT, reply_markup=kb_main())
 
-    @dp.callback_query(F.data == "pay:mock:1m")
+    # NAV
+    @dp.callback_query(F.data == "nav:home")
+    async def _home(cb: CallbackQuery):
+        await render_home(cb)
+
+    @dp.callback_query(F.data == "nav:cabinet")
+    async def _cab(cb: CallbackQuery):
+        await render_cabinet(cb)
+
+    @dp.callback_query(F.data == "nav:vpn")
+    async def _vpn(cb: CallbackQuery):
+        await render_vpn(cb)
+
+    @dp.callback_query(F.data == "nav:pay")
     async def _pay(cb: CallbackQuery):
-        await cb_pay_success(cb)
+        await render_pay(cb)
+
+    @dp.callback_query(F.data == "nav:faq")
+    async def _faq(cb: CallbackQuery):
+        await render_faq(cb)
+
+    @dp.callback_query(F.data == "nav:support")
+    async def _support(cb: CallbackQuery):
+        await render_support(cb)
+
+    # ACTIONS
+    @dp.callback_query(F.data == "pay:mock:1m")
+    async def _pay_success(cb: CallbackQuery):
+        await action_pay_success(cb)
 
     @dp.callback_query(F.data == "vpn:conf")
-    async def _conf(cb: CallbackQuery):
-        await cb_vpn_conf(cb)
+    async def _vpn_conf(cb: CallbackQuery):
+        await action_vpn_send_conf(cb)
 
     @dp.callback_query(F.data == "vpn:qr")
-    async def _qr(cb: CallbackQuery):
-        await cb_vpn_qr(cb)
+    async def _vpn_qr(cb: CallbackQuery):
+        await action_vpn_show_qr(cb)
 
     @dp.callback_query(F.data == "vpn:guide")
-    async def _guide(cb: CallbackQuery):
-        await cb_vpn_guide(cb)
+    async def _vpn_guide(cb: CallbackQuery):
+        await action_vpn_guide(cb)
 
     @dp.callback_query(F.data == "vpn:reset:confirm")
-    async def _reset_confirm(cb: CallbackQuery):
-        await cb_vpn_reset_confirm(cb)
+    async def _vpn_reset_confirm(cb: CallbackQuery):
+        await action_vpn_reset_confirm(cb)
 
     @dp.callback_query(F.data == "vpn:reset:do")
-    async def _reset_do(cb: CallbackQuery):
-        await cb_vpn_reset_do(cb)
+    async def _vpn_reset_do(cb: CallbackQuery):
+        await action_vpn_reset_do(cb)
 
     @dp.callback_query(F.data == "vpn:reset:cancel")
-    async def _reset_cancel(cb: CallbackQuery):
-        await cb_vpn_reset_cancel(cb)
+    async def _vpn_reset_cancel(cb: CallbackQuery):
+        await action_vpn_reset_cancel(cb)
 
     asyncio.create_task(scheduler_loop(bot))
     await dp.start_polling(bot)
