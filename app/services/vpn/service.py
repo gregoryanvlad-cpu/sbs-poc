@@ -36,11 +36,12 @@ def encrypt(secret: str, data: str) -> str:
 
 class VPNService:
     def __init__(self) -> None:
+        # password is optional now (when using WG_SSH_PRIVATE_KEY)
         self.provider = WireGuardSSHProvider(
             host=os.environ["WG_SSH_HOST"],
             port=int(os.environ.get("WG_SSH_PORT", "22")),
             user=os.environ["WG_SSH_USER"],
-            password=os.environ["WG_SSH_PASSWORD"],
+            password=os.environ.get("WG_SSH_PASSWORD"),  # may be None
             interface=os.environ.get("VPN_INTERFACE", "wg0"),
         )
         self.server_pub = os.environ["VPN_SERVER_PUBLIC_KEY"]
@@ -63,13 +64,12 @@ class VPNService:
     async def create_peer(self, tg_id: int, client_ip: str) -> Dict[str, Any]:
         client_priv, client_pub = gen_keys()
         await self.provider.add_peer(client_pub, client_ip)
-
         return {
             "tg_id": tg_id,
             "client_ip": client_ip,
             "public_key": client_pub,
             "client_private_key_enc": encrypt(self.enc_secret, client_priv),
-            "client_private_key_plain": client_priv,  # only for building config now
+            "client_private_key_plain": client_priv,
         }
 
     def build_wg_conf(self, peer: Dict[str, Any], user_label: Optional[str] = None) -> str:
