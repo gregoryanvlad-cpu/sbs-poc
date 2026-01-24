@@ -1,6 +1,7 @@
 import asyncssh
 import logging
 import os
+import tempfile
 
 log = logging.getLogger(__name__)
 
@@ -12,31 +13,33 @@ class WireGuardSSHProvider:
         self.user = user
         self.password = password
         self.interface = interface
-        self.private_key = os.environ.get("WG_SSH_PRIVATE_KEY")
+
+        self._key_path = None
+        key = os.environ.get("WG_SSH_PRIVATE_KEY")
+        if key:
+            f = tempfile.NamedTemporaryFile(
+                delete=False,
+                mode="w",
+                prefix="wgkey_",
+                suffix=".key",
+            )
+            f.write(key)
+            f.close()
+            os.chmod(f.name, 0o600)
+            self._key_path = f.name
+            log.info("SSH private key written to temp file")
 
     async def _connect(self):
-        if self.private_key:
-            log.info("SSH auth via private key")
-            return await asyncssh.connect(
-                self.host,
-                port=self.port,
-                username=self.user,
-                client_keys=[self.private_key],
-                known_hosts=None,
-                connect_timeout=8,
-                login_timeout=8,
-            )
-        else:
-            log.info("SSH auth via password")
-            return await asyncssh.connect(
-                self.host,
-                port=self.port,
-                username=self.user,
-                password=self.password,
-                known_hosts=None,
-                connect_timeout=8,
-                login_timeout=8,
-            )
+        return await asyncssh.connect(
+            self.host,
+            port=self.port,
+            username=self.user,
+            client_keys=[self._key_path] if self._key_path else None,
+            password=None if self._key_path else self.password,
+            known_hosts=None,
+            connect_timeout=8,
+            login_timeout=8,
+        )
 
     async def _run(self, cmd: str) -> str:
         async with await self._connect() as conn:
@@ -44,11 +47,7 @@ class WireGuardSSHProvider:
             return res.stdout or ""
 
     async def add_peer(self, public_key: str, client_ip: str) -> None:
-        cmd = f"wg set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
-        log.info("WG add peer pub=%s ip=%s", public_key, client_ip)
-        await self._run(cmd)
+        await self._run(f"wg set {self.interface} peer {public_key} allowed-ips {client_ip}/32")
 
     async def remove_peer(self, public_key: str) -> None:
-        cmd = f"wg set {self.interface} peer {public_key} remove"
-        log.info("WG remove peer pub=%s", public_key)
-        await self._run(cmd)
+        await self._run(f"wg set {self.interface} peer {public_key} remove")
