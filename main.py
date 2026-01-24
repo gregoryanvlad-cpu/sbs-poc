@@ -16,6 +16,7 @@ from dateutil.relativedelta import relativedelta
 # ================== CONFIG ==================
 PRICE_RUB = 299
 PERIOD_MONTHS = 1
+PERIOD_DAYS = 30  # для совместимости со старой схемой payments.period_days
 MSK = timezone(timedelta(hours=3))
 
 
@@ -24,7 +25,6 @@ def utcnow() -> datetime:
 
 
 def ensure_aware_utc(dt: datetime | None) -> datetime | None:
-    """Bring datetime to tz-aware UTC (works for values returned by Postgres too)."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -42,7 +42,6 @@ def days_left(end_at: datetime | None) -> int:
     if not end_at:
         return 0
     delta = end_at - utcnow()
-    # округляем вверх до дней, если осталось хоть что-то
     return max(0, delta.days + (1 if delta.seconds > 0 else 0))
 
 
@@ -58,6 +57,7 @@ def make_async_db_url(url: str) -> str:
 
 # ================== DB: SAFE AUTO-MIGRATION ==================
 MIGRATION_SQL = [
+    # base tables
     """
     CREATE TABLE IF NOT EXISTS users (
         tg_id BIGINT PRIMARY KEY,
@@ -82,10 +82,11 @@ MIGRATION_SQL = [
         provider VARCHAR(32) NOT NULL DEFAULT 'mock',
         status VARCHAR(16) NOT NULL DEFAULT 'success',
         paid_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        period_days INTEGER NOT NULL DEFAULT 30,
         period_months INTEGER NOT NULL DEFAULT 1
     )
     """,
-    # users
+    # users hardening
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
     "UPDATE users SET created_at = now() WHERE created_at IS NULL",
@@ -94,33 +95,37 @@ MIGRATION_SQL = [
     "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'",
     "ALTER TABLE users ALTER COLUMN created_at SET NOT NULL",
     "ALTER TABLE users ALTER COLUMN status SET NOT NULL",
-    # subscriptions
+    # subscriptions hardening
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS start_at TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS end_at TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS is_active BOOLEAN",
     "UPDATE subscriptions SET is_active = FALSE WHERE is_active IS NULL",
     "ALTER TABLE subscriptions ALTER COLUMN is_active SET DEFAULT FALSE",
     "ALTER TABLE subscriptions ALTER COLUMN is_active SET NOT NULL",
-    # payments
+    # payments compatibility (ВАЖНО: period_days)
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency VARCHAR(8)",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR(32)",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS period_days INTEGER",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS period_months INTEGER",
     "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL",
     "UPDATE payments SET provider = 'mock' WHERE provider IS NULL",
     "UPDATE payments SET status = 'success' WHERE status IS NULL",
     "UPDATE payments SET paid_at = now() WHERE paid_at IS NULL",
+    "UPDATE payments SET period_days = 30 WHERE period_days IS NULL",
     "UPDATE payments SET period_months = 1 WHERE period_months IS NULL",
     "ALTER TABLE payments ALTER COLUMN currency SET DEFAULT 'RUB'",
     "ALTER TABLE payments ALTER COLUMN provider SET DEFAULT 'mock'",
     "ALTER TABLE payments ALTER COLUMN status SET DEFAULT 'success'",
     "ALTER TABLE payments ALTER COLUMN paid_at SET DEFAULT now()",
+    "ALTER TABLE payments ALTER COLUMN period_days SET DEFAULT 30",
     "ALTER TABLE payments ALTER COLUMN period_months SET DEFAULT 1",
     "ALTER TABLE payments ALTER COLUMN currency SET NOT NULL",
     "ALTER TABLE payments ALTER COLUMN provider SET NOT NULL",
     "ALTER TABLE payments ALTER COLUMN status SET NOT NULL",
     "ALTER TABLE payments ALTER COLUMN paid_at SET NOT NULL",
+    "ALTER TABLE payments ALTER COLUMN period_days SET NOT NULL",
     "ALTER TABLE payments ALTER COLUMN period_months SET NOT NULL",
 ]
 
@@ -239,12 +244,13 @@ async def apply_success_payment(session: AsyncSession, tg_id: int):
         {"id": tg_id, "end_at": new_end},
     )
 
+    # ВАЖНО: пишем и period_days, и period_months
     await session.execute(
         text("""
-        INSERT INTO payments (tg_id, amount, currency, provider, status, paid_at, period_months)
-        VALUES (:id, :amount, 'RUB', 'mock', 'success', now(), :months)
+        INSERT INTO payments (tg_id, amount, currency, provider, status, paid_at, period_days, period_months)
+        VALUES (:id, :amount, 'RUB', 'mock', 'success', now(), :days, :months)
         """),
-        {"id": tg_id, "amount": PRICE_RUB, "months": PERIOD_MONTHS},
+        {"id": tg_id, "amount": PRICE_RUB, "days": PERIOD_DAYS, "months": PERIOD_MONTHS},
     )
 
     await session.commit()
@@ -270,7 +276,6 @@ async def main() -> None:
     engine = create_async_engine(make_async_db_url(database_url), pool_pre_ping=True)
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
-    # migrations before polling
     async with Session() as session:
         await run_migrations(session)
 
