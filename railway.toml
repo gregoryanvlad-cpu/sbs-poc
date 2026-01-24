@@ -1,1 +1,5 @@
-# Optional. Railway detects Dockerfile automatically.
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "bash start.sh"
