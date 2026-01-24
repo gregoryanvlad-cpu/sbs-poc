@@ -9,5 +9,4 @@ qrcode>=7.4.2
 Pillow>=10.0.0
 cryptography>=42.0.0
 asyncssh>=2.14.2
-alembic>=1.12
-asyncpg
+alembic>=1.12.0
