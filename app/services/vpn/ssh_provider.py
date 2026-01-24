@@ -1,19 +1,17 @@
-
 import asyncssh
-import asyncio
 import logging
 
 log = logging.getLogger(__name__)
 
 class WireGuardSSHProvider:
-    def __init__(self, host, port, user, password, interface="wg0"):
+    def __init__(self, host: str, port: int, user: str, password: str, interface: str = "wg0"):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.interface = interface
 
-    async def _run(self, cmd: str):
+    async def _run(self, cmd: str) -> str:
         async with asyncssh.connect(
             self.host,
             port=self.port,
@@ -21,15 +19,15 @@ class WireGuardSSHProvider:
             password=self.password,
             known_hosts=None,
         ) as conn:
-            result = await conn.run(cmd, check=True)
-            return result.stdout
+            res = await conn.run(cmd, check=True)
+            return res.stdout or ""
 
-    async def add_peer(self, public_key: str, client_ip: str):
+    async def add_peer(self, public_key: str, client_ip: str) -> None:
         cmd = f"wg set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
-        log.info("WG add peer %s %s", public_key, client_ip)
-        return await self._run(cmd)
+        log.info("WG add peer pub=%s ip=%s", public_key, client_ip)
+        await self._run(cmd)
 
-    async def remove_peer(self, public_key: str):
+    async def remove_peer(self, public_key: str) -> None:
         cmd = f"wg set {self.interface} peer {public_key} remove"
-        log.info("WG remove peer %s", public_key)
-        return await self._run(cmd)
+        log.info("WG remove peer pub=%s", public_key)
+        await self._run(cmd)
