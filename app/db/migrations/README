@@ -1,0 +1,5 @@
+Alembic migrations.
+
+Run locally:
+  export DATABASE_URL=...   # Railway Postgres
+  alembic upgrade head

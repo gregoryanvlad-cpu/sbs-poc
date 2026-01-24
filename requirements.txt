@@ -1,0 +1,8 @@
+aiogram==3.7.0
+SQLAlchemy==2.0.31
+asyncpg==0.29.0
+python-dateutil==2.9.0.post0
+qrcode==7.4.2
+Pillow==10.4.0
+cryptography==43.0.1
+alembic==1.13.2
