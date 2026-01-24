@@ -12,8 +12,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     FSInputFile,
     ReplyKeyboardRemove,
-    InputMediaPhoto,
-    InputMediaDocument,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -45,7 +43,7 @@ PERIOD_DAYS = 30  # legacy compatibility (your DB has NOT NULL period_days)
 
 MSK = timezone(timedelta(hours=3))
 
-VPN_MODE = os.getenv("VPN_MODE", "mock").strip().lower()  # mock now
+VPN_MODE = os.getenv("VPN_MODE", "mock").strip().lower()
 VPN_ENDPOINT = os.getenv("VPN_ENDPOINT", "1.2.3.4:51820")
 VPN_SERVER_PUBLIC_KEY = os.getenv("VPN_SERVER_PUBLIC_KEY", "REPLACE_ME")
 VPN_ALLOWED_IPS = os.getenv("VPN_ALLOWED_IPS", "0.0.0.0/0, ::/0")
@@ -134,41 +132,14 @@ MIGRATION_SQL = [
         rotation_reason VARCHAR(32) NULL
     )
     """,
-
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
-    "UPDATE users SET created_at = now() WHERE created_at IS NULL",
-    "UPDATE users SET status = 'active' WHERE status IS NULL",
-    "ALTER TABLE users ALTER COLUMN created_at SET DEFAULT now()",
-    "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'",
-
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS start_at TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS end_at TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS is_active BOOLEAN",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
-    "UPDATE subscriptions SET is_active = FALSE WHERE is_active IS NULL",
-    "UPDATE subscriptions SET status = 'active' WHERE status IS NULL",
-    "ALTER TABLE subscriptions ALTER COLUMN is_active SET DEFAULT FALSE",
-    "ALTER TABLE subscriptions ALTER COLUMN status SET DEFAULT 'active'",
-
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency VARCHAR(8)",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR(32)",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS period_days INTEGER",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS period_months INTEGER",
-    "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL",
-    "UPDATE payments SET provider = 'mock' WHERE provider IS NULL",
-    "UPDATE payments SET status = 'success' WHERE status IS NULL",
-    "UPDATE payments SET paid_at = now() WHERE paid_at IS NULL",
-    "UPDATE payments SET period_days = 30 WHERE period_days IS NULL",
-    "UPDATE payments SET period_months = 1 WHERE period_months IS NULL",
-    "ALTER TABLE payments ALTER COLUMN currency SET DEFAULT 'RUB'",
-    "ALTER TABLE payments ALTER COLUMN provider SET DEFAULT 'mock'",
-    "ALTER TABLE payments ALTER COLUMN status SET DEFAULT 'success'",
-    "ALTER TABLE payments ALTER COLUMN paid_at SET DEFAULT now()",
-    "ALTER TABLE payments ALTER COLUMN period_days SET DEFAULT 30",
-    "ALTER TABLE payments ALTER COLUMN period_months SET DEFAULT 1",
 ]
 
 
@@ -220,7 +191,7 @@ def kb_pay() -> InlineKeyboardMarkup:
 def kb_vpn() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
-    b.button(text="📥 Скачать конфиг + QR", callback_data="vpn:bundle")
+    b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
@@ -241,7 +212,7 @@ def fake_key_b64() -> str:
 
 
 def alloc_ip(tg_id: int) -> str:
-    # IP может оставаться тем же — это нормально; при реальном WG обычно фиксируют IP на юзера
+    # IP намеренно может оставаться одинаковым: в реальном WG обычно фиксируют IP за пользователем
     a = (tg_id % 250) + 2
     b = ((tg_id // 250) % 250) + 2
     return f"10.66.{b}.{a}/32"
@@ -261,12 +232,13 @@ def build_wg_config(private_key: str, client_ip: str) -> str:
     )
 
 
-async def send_conf_and_qr_as_album(
-    cb: CallbackQuery,
-    peer_id: int,
-    private_key: str,
-    client_ip: str,
-):
+async def send_conf_and_qr_linked(cb: CallbackQuery, peer_id: int, private_key: str, client_ip: str):
+    """
+    Telegram не позволяет смешать document+photo в одном media_group.
+    Поэтому отправляем:
+    1) QR фото
+    2) .conf документ reply на QR (чтобы выглядело единым блоком)
+    """
     tg_id = cb.from_user.id
     conf = build_wg_config(private_key, client_ip)
 
@@ -278,13 +250,19 @@ async def send_conf_and_qr_as_album(
     qr_path = f"/tmp/sbs-{tg_id}-qr.png"
     img.save(qr_path)
 
-    caption = f"📦 VPN пакет\nPeer #{peer_id}\nIP: {client_ip}\n\nИмпортируй .conf или QR в WireGuard."
+    caption = (
+        f"📦 VPN пакет\n"
+        f"Peer #{peer_id}\n"
+        f"IP: {client_ip}\n\n"
+        f"Сканируй QR или импортируй .conf ниже."
+    )
 
-    media = [
-        InputMediaDocument(media=FSInputFile(conf_path), caption=caption),
-        InputMediaPhoto(media=FSInputFile(qr_path)),
-    ]
-    await cb.message.answer_media_group(media)
+    qr_msg = await cb.message.answer_photo(FSInputFile(qr_path), caption=caption)
+    await cb.message.answer_document(
+        FSInputFile(conf_path),
+        caption="📥 Конфиг WireGuard (.conf)",
+        reply_to_message_id=qr_msg.message_id
+    )
 
 
 # ================== DB LOGIC ==================
@@ -422,7 +400,7 @@ async def apply_payment_add_month(session: AsyncSession, tg_id: int):
     return new_end
 
 
-# ================== SCREEN RENDERERS (edit_text only) ==================
+# ================== SCREENS (edit_text) ==================
 HOME_TEXT = "✅ PoC запущен!\n\nВыберите раздел:"
 
 
@@ -478,8 +456,7 @@ async def render_vpn(cb: CallbackQuery):
         text_msg = (
             "🌍 *VPN*\n\n"
             f"Peer: *#{peer_id}*\n"
-            "Конфиг готов. Он **не меняется при продлении**.\n"
-            "Кнопка ниже отправит **конфиг + QR вместе**.\n\n"
+            "Кнопка ниже отправит QR + .conf связанными сообщениями.\n"
             "Сброс VPN создаст новый peer (номер изменится)."
         )
 
@@ -509,12 +486,14 @@ async def render_faq(cb: CallbackQuery):
 
 
 async def render_support(cb: CallbackQuery):
-    text_msg = "🛠 Поддержка\n\nНапиши сюда и приложи скрин/описание проблемы."
-    await cb.message.edit_text(text_msg, reply_markup=kb_back_home())
+    await cb.message.edit_text(
+        "🛠 Поддержка\n\nНапиши сюда и приложи скрин/описание проблемы.",
+        reply_markup=kb_back_home(),
+    )
     await cb.answer()
 
 
-# ================== ACTION CALLBACKS ==================
+# ================== ACTIONS ==================
 async def action_pay_success(cb: CallbackQuery):
     tg_id = cb.from_user.id
     async with SessionLocal() as session:
@@ -522,12 +501,13 @@ async def action_pay_success(cb: CallbackQuery):
         new_end = await apply_payment_add_month(session, tg_id)
         await ensure_peer_for_active_sub(session, tg_id)
 
-    text_msg = (
+    await cb.message.edit_text(
         "✅ *Оплата успешна!*\n\n"
         f"🟦 СБС активен до: *{fmt_dt(new_end)}*\n"
-        "🌍 VPN работает — можете пользоваться."
+        "🌍 VPN работает — можете пользоваться.",
+        parse_mode="Markdown",
+        reply_markup=kb_main(),
     )
-    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_main())
     await cb.answer()
 
 
@@ -541,28 +521,30 @@ async def action_vpn_bundle(cb: CallbackQuery):
         return
 
     peer_id, priv, ip = peer
-    await send_conf_and_qr_as_album(cb, peer_id, priv, ip)
-    await cb.answer("Отправил конфиг + QR")
+    await send_conf_and_qr_linked(cb, peer_id, priv, ip)
+    await cb.answer("Отправил")
 
 
 async def action_vpn_guide(cb: CallbackQuery):
-    text_msg = (
+    await cb.message.edit_text(
         "📖 *Инструкция*\n\n"
         "1) Установи приложение WireGuard.\n"
         "2) Импортируй конфиг (.conf) или отсканируй QR.\n"
         "3) Включи туннель.\n\n"
-        "Если проблемы — попробуй ♻️ Сбросить VPN."
+        "Если проблемы — попробуй ♻️ Сбросить VPN.",
+        parse_mode="Markdown",
+        reply_markup=kb_vpn(),
     )
-    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn())
     await cb.answer()
 
 
 async def action_vpn_reset_confirm(cb: CallbackQuery):
-    text_msg = (
+    await cb.message.edit_text(
         "♻️ *Сбросить VPN?*\n\n"
-        "Старый доступ будет отключён, вы получите новый конфиг (новый peer)."
+        "Старый доступ будет отключён, вы получите новый конфиг (новый peer).",
+        parse_mode="Markdown",
+        reply_markup=kb_vpn_reset_confirm(),
     )
-    await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn_reset_confirm())
     await cb.answer()
 
 
@@ -584,15 +566,13 @@ async def action_vpn_reset_do(cb: CallbackQuery):
 
         peer_id, priv, ip = await create_peer(session, tg_id, "manual_reset")
 
-    # Обновляем экран VPN (одно сообщение)
     await cb.message.edit_text(
-        f"✅ *VPN сброшен.*\n\nСоздан новый peer: *#{peer_id}*\nСейчас отправлю конфиг + QR одним блоком.",
+        f"✅ *VPN сброшен.*\n\nСоздан новый peer: *#{peer_id}*\nСейчас отправлю QR и .conf связанными сообщениями.",
         parse_mode="Markdown",
         reply_markup=kb_vpn(),
     )
 
-    # Отправляем конфиг+QR вместе (альбомом)
-    await send_conf_and_qr_as_album(cb, peer_id, priv, ip)
+    await send_conf_and_qr_linked(cb, peer_id, priv, ip)
     await cb.answer()
 
 
@@ -659,7 +639,7 @@ async def main():
 
     @dp.message(CommandStart())
     async def start(msg: Message):
-        # ВАЖНО: убрать старую нижнюю ReplyKeyboard, если она была ранее
+        # убрать старую нижнюю ReplyKeyboard, если она была ранее
         await msg.answer("⏳", reply_markup=ReplyKeyboardRemove())
         async with SessionLocal() as session:
             await ensure_user(session, msg.from_user.id)
