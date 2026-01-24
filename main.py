@@ -1,35 +1,27 @@
-\
 import asyncio
 import base64
 import os
 import secrets
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
+    InlineKeyboardMarkup
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import text
 from dateutil.relativedelta import relativedelta
-from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Integer, String, Text,
-    ForeignKey, func, select, update, insert
-)
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+import qrcode
+from aiogram.types import FSInputFile
 
 
-# -----------------------------
-# Config
-# -----------------------------
-def env_bool(name: str, default: bool = False) -> bool:
+# ================== CONFIG ==================
+def env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
@@ -42,95 +34,159 @@ if not BOT_TOKEN:
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is missing (Railway should provide it after Postgres is attached).")
+    raise RuntimeError("DATABASE_URL is missing")
 
-TZ = os.getenv("TZ", "UTC")
-
-DEBUG = env_bool("DEBUG", False)
-
-VPN_MODE = os.getenv("VPN_MODE", "mock").strip().lower()  # mock|real (real later)
 SCHEDULER_ENABLED = env_bool("SCHEDULER_ENABLED", True)
 
+PRICE_RUB = 299
+PERIOD_MONTHS = 1
+PERIOD_DAYS = 30  # legacy compatibility (your DB has NOT NULL period_days)
+
+MSK = timezone(timedelta(hours=3))
+
+VPN_MODE = os.getenv("VPN_MODE", "mock").strip().lower()  # mock now
 VPN_ENDPOINT = os.getenv("VPN_ENDPOINT", "1.2.3.4:51820")
 VPN_SERVER_PUBLIC_KEY = os.getenv("VPN_SERVER_PUBLIC_KEY", "REPLACE_ME")
 VPN_ALLOWED_IPS = os.getenv("VPN_ALLOWED_IPS", "0.0.0.0/0, ::/0")
 VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1,8.8.8.8")
 
 
-# -----------------------------
-# DB models
-# -----------------------------
-class Base(DeclarativeBase):
-    pass
-
-
-class User(Base):
-    __tablename__ = "users"
-    tg_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), server_default="active", nullable=False)
-
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tg_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.tg_id"), index=True, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), server_default="active", nullable=False)  # active|expired
-    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
-class Payment(Base):
-    __tablename__ = "payments"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tg_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    amount: Mapped[int] = mapped_column(Integer, nullable=False)
-    currency: Mapped[str] = mapped_column(String(8), nullable=False, server_default="RUB")
-    provider: Mapped[str] = mapped_column(String(32), nullable=False, server_default="mock")
-    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="success")
-    paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    period_months: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
-    # legacy compatibility if table existed before:
-    period_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-
-
-class VpnPeer(Base):
-    __tablename__ = "vpn_peers"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tg_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    client_public_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    client_private_key_enc: Mapped[str] = mapped_column(Text, nullable=False)  # base64 for PoC
-    client_ip: Mapped[str] = mapped_column(String(64), nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    rotation_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-
-
-# -----------------------------
-# DB engine
-# -----------------------------
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+def make_async_db_url(url: str) -> str:
+    # Railway: postgres://... -> asyncpg needs postgresql+asyncpg://...
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgres://"):
+        return "postgresql+asyncpg://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + url[len("postgresql://"):]
+    raise RuntimeError("Unsupported DATABASE_URL format")
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def fmt_dt(dt: datetime) -> str:
-    # show UTC in PoC to avoid confusion; later we can render Moscow time.
-    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+def ensure_aware_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def days_left(end_at: datetime) -> int:
+def fmt_dt(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+
+
+def days_left(end_at: datetime | None) -> int:
+    if not end_at:
+        return 0
     delta = end_at - utcnow()
-    return max(0, (delta.days + (1 if delta.seconds > 0 else 0)))
+    return max(0, delta.days + (1 if delta.seconds > 0 else 0))
 
 
-# -----------------------------
-# Keyboards
-# -----------------------------
+# ================== DB ==================
+engine = create_async_engine(make_async_db_url(DATABASE_URL), pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+MIGRATION_SQL = [
+    # base tables (create if empty)
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        tg_id BIGINT PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        status VARCHAR(16) NOT NULL DEFAULT 'active'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        tg_id BIGINT PRIMARY KEY,
+        start_at TIMESTAMPTZ,
+        end_at TIMESTAMPTZ,
+        is_active BOOLEAN NOT NULL DEFAULT FALSE,
+        status VARCHAR(16) NOT NULL DEFAULT 'active'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS payments (
+        id SERIAL PRIMARY KEY,
+        tg_id BIGINT NOT NULL,
+        amount INTEGER NOT NULL,
+        currency VARCHAR(8) NOT NULL DEFAULT 'RUB',
+        provider VARCHAR(32) NOT NULL DEFAULT 'mock',
+        status VARCHAR(16) NOT NULL DEFAULT 'success',
+        paid_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        period_days INTEGER NOT NULL DEFAULT 30,
+        period_months INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS vpn_peers (
+        id SERIAL PRIMARY KEY,
+        tg_id BIGINT NOT NULL,
+        client_public_key VARCHAR(128) NOT NULL,
+        client_private_key_enc TEXT NOT NULL,
+        client_ip VARCHAR(64) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        revoked_at TIMESTAMPTZ NULL,
+        rotation_reason VARCHAR(32) NULL
+    )
+    """,
+
+    # patch existing schema (safe)
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
+    "UPDATE users SET created_at = now() WHERE created_at IS NULL",
+    "UPDATE users SET status = 'active' WHERE status IS NULL",
+    "ALTER TABLE users ALTER COLUMN created_at SET DEFAULT now()",
+    "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'",
+
+    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS start_at TIMESTAMPTZ",
+    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS end_at TIMESTAMPTZ",
+    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS is_active BOOLEAN",
+    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
+    "UPDATE subscriptions SET is_active = FALSE WHERE is_active IS NULL",
+    "UPDATE subscriptions SET status = 'active' WHERE status IS NULL",
+    "ALTER TABLE subscriptions ALTER COLUMN is_active SET DEFAULT FALSE",
+    "ALTER TABLE subscriptions ALTER COLUMN status SET DEFAULT 'active'",
+
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency VARCHAR(8)",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR(32)",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS period_days INTEGER",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS period_months INTEGER",
+    "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL",
+    "UPDATE payments SET provider = 'mock' WHERE provider IS NULL",
+    "UPDATE payments SET status = 'success' WHERE status IS NULL",
+    "UPDATE payments SET paid_at = now() WHERE paid_at IS NULL",
+    "UPDATE payments SET period_days = 30 WHERE period_days IS NULL",
+    "UPDATE payments SET period_months = 1 WHERE period_months IS NULL",
+    "ALTER TABLE payments ALTER COLUMN currency SET DEFAULT 'RUB'",
+    "ALTER TABLE payments ALTER COLUMN provider SET DEFAULT 'mock'",
+    "ALTER TABLE payments ALTER COLUMN status SET DEFAULT 'success'",
+    "ALTER TABLE payments ALTER COLUMN paid_at SET DEFAULT now()",
+    "ALTER TABLE payments ALTER COLUMN period_days SET DEFAULT 30",
+    "ALTER TABLE payments ALTER COLUMN period_months SET DEFAULT 1",
+]
+
+
+async def run_migrations():
+    async with SessionLocal() as session:
+        for stmt in MIGRATION_SQL:
+            try:
+                await session.execute(text(stmt))
+            except Exception as e:
+                # не валим бот миграциями — в логах будет видно, но бот будет жить
+                print("[MIGRATION WARN]", str(e)[:250], "||", stmt[:120])
+        await session.commit()
+
+
+# ================== UI ==================
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -146,7 +202,6 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 def cabinet_inline_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
-    b.adjust(1)
     return b.as_markup()
 
 
@@ -171,96 +226,26 @@ def vpn_reset_confirm_kb() -> InlineKeyboardMarkup:
 def payment_inline_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Тест-оплата 299 ₽ (успех)", callback_data="pay:mock:1m")
-    b.adjust(1)
     return b.as_markup()
 
 
-# -----------------------------
-# Business logic
-# -----------------------------
-async def ensure_user(session: AsyncSession, tg_id: int) -> None:
-    # Insert user if not exists (created_at is server_default)
-    # (unused) sqlite variant removed
-    return
-
-
-async def ensure_user_pg(session: AsyncSession, tg_id: int) -> None:
-    # PostgreSQL safe upsert
-    await session.execute(
-        pg_insert(User).values(tg_id=tg_id).on_conflict_do_nothing(index_elements=[User.tg_id])
-    )
-
-
-async def get_subscription(session: AsyncSession, tg_id: int) -> Optional[Subscription]:
-    res = await session.execute(
-        select(Subscription).where(Subscription.tg_id == tg_id).order_by(Subscription.id.desc()).limit(1)
-    )
-    return res.scalar_one_or_none()
-
-
-async def upsert_subscription_add_month(session: AsyncSession, tg_id: int, months: int = 1) -> Tuple[Subscription, datetime]:
-    sub = await get_subscription(session, tg_id)
-    now = utcnow()
-    if sub is None:
-        new_end = now + relativedelta(months=+months)
-        sub = Subscription(tg_id=tg_id, status="active", end_at=new_end)
-        session.add(sub)
-        return sub, new_end
-
-    # Important: end_at is timezone-aware; compare with utcnow (aware)
-    current_end = sub.end_at
-    base = current_end if (current_end and current_end > now) else now
-    new_end = base + relativedelta(months=+months)
-    sub.status = "active"
-    sub.end_at = new_end
-    return sub, new_end
-
-
-async def last_payment(session: AsyncSession, tg_id: int) -> Optional[Payment]:
-    res = await session.execute(
-        select(Payment).where(Payment.tg_id == tg_id).order_by(Payment.id.desc()).limit(1)
-    )
-    return res.scalar_one_or_none()
-
-
-def _fake_key() -> str:
+# ================== VPN MOCK ==================
+def fake_key_b64() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
 
 
-def _derive_public_from_private(priv_b64: str) -> str:
-    # PoC: not real WG math. We just generate another random value to look like a key.
-    # Real implementation will use `wg genkey | wg pubkey` on server.
-    return _fake_key()
-
-
-async def get_active_peer(session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
-    res = await session.execute(
-        select(VpnPeer)
-        .where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa
-        .order_by(VpnPeer.id.desc())
-        .limit(1)
-    )
-    return res.scalar_one_or_none()
-
-
-def _allocate_client_ip(tg_id: int) -> str:
-    # Simple deterministic pool: 10.66.0.0/16 -> 10.66.(tg_id % 250).(tg_id % 250 + 2)
+def alloc_ip(tg_id: int) -> str:
+    # 10.66.0.0/16 deterministic
     a = (tg_id % 250) + 2
     b = ((tg_id // 250) % 250) + 2
     return f"10.66.{b}.{a}/32"
 
 
-def build_wg_config(peer: VpnPeer) -> str:
-    priv = base64.b64decode(peer.client_private_key_enc.encode("ascii")).decode("ascii", errors="ignore")
-    # We stored base64 of bytes, but for PoC we can just keep as string; ensure displayable:
-    # if decode fails, fallback to stored b64.
-    if not priv.strip():
-        priv = peer.client_private_key_enc
-
+def build_wg_config(private_key: str, client_ip: str) -> str:
     return (
         "[Interface]\n"
-        f"PrivateKey = {priv}\n"
-        f"Address = {peer.client_ip}\n"
+        f"PrivateKey = {private_key}\n"
+        f"Address = {client_ip}\n"
         f"DNS = {VPN_DNS}\n\n"
         "[Peer]\n"
         f"PublicKey = {VPN_SERVER_PUBLIC_KEY}\n"
@@ -270,160 +255,249 @@ def build_wg_config(peer: VpnPeer) -> str:
     )
 
 
-async def ensure_peer_for_active_sub(session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
-    sub = await get_subscription(session, tg_id)
-    if not sub or sub.status != "active" or sub.end_at <= utcnow():
+# ================== DB LOGIC ==================
+async def ensure_user(session: AsyncSession, tg_id: int):
+    await session.execute(
+        text("""
+        INSERT INTO users (tg_id, created_at, status)
+        VALUES (:id, now(), 'active')
+        ON CONFLICT (tg_id) DO NOTHING
+        """),
+        {"id": tg_id},
+    )
+    await session.execute(
+        text("""
+        INSERT INTO subscriptions (tg_id, is_active, status)
+        VALUES (:id, FALSE, 'active')
+        ON CONFLICT (tg_id) DO NOTHING
+        """),
+        {"id": tg_id},
+    )
+    await session.commit()
+
+
+async def get_sub(session: AsyncSession, tg_id: int):
+    r = await session.execute(
+        text("SELECT start_at, end_at, is_active, status FROM subscriptions WHERE tg_id=:id"),
+        {"id": tg_id},
+    )
+    return r.first()
+
+
+async def last_payment(session: AsyncSession, tg_id: int):
+    r = await session.execute(
+        text("""
+        SELECT id, amount, currency, status, paid_at
+        FROM payments
+        WHERE tg_id=:id
+        ORDER BY id DESC
+        LIMIT 1
+        """),
+        {"id": tg_id},
+    )
+    return r.first()
+
+
+async def get_active_peer(session: AsyncSession, tg_id: int):
+    r = await session.execute(
+        text("""
+        SELECT id, client_private_key_enc, client_ip
+        FROM vpn_peers
+        WHERE tg_id=:id AND is_active=TRUE
+        ORDER BY id DESC
+        LIMIT 1
+        """),
+        {"id": tg_id},
+    )
+    return r.first()
+
+
+async def create_peer(session: AsyncSession, tg_id: int, reason: str | None):
+    private_key = fake_key_b64()
+    client_ip = alloc_ip(tg_id)
+    public_key = fake_key_b64()  # mock
+
+    await session.execute(
+        text("""
+        INSERT INTO vpn_peers (tg_id, client_public_key, client_private_key_enc, client_ip, is_active, rotation_reason)
+        VALUES (:id, :pub, :priv, :ip, TRUE, :reason)
+        """),
+        {"id": tg_id, "pub": public_key, "priv": private_key, "ip": client_ip, "reason": reason},
+    )
+    await session.commit()
+    return private_key, client_ip
+
+
+async def revoke_peer(session: AsyncSession, peer_id: int, reason: str):
+    await session.execute(
+        text("""
+        UPDATE vpn_peers
+        SET is_active=FALSE, revoked_at=now(), rotation_reason=:reason
+        WHERE id=:pid
+        """),
+        {"pid": peer_id, "reason": reason},
+    )
+    await session.commit()
+
+
+async def ensure_peer_for_active_sub(session: AsyncSession, tg_id: int):
+    sub = await get_sub(session, tg_id)
+    if not sub:
+        return None
+    _, end_at, _, status = sub
+    end_at_utc = ensure_aware_utc(end_at)
+    if not end_at_utc or status != "active" or end_at_utc <= utcnow():
         return None
 
     peer = await get_active_peer(session, tg_id)
     if peer:
         return peer
+    await create_peer(session, tg_id, reason=None)
+    return await get_active_peer(session, tg_id)
 
-    # Create new peer (MOCK)
-    priv = _fake_key()
-    pub = _derive_public_from_private(priv)
-    ip = _allocate_client_ip(tg_id)
-    peer = VpnPeer(
-        tg_id=tg_id,
-        client_public_key=pub,
-        client_private_key_enc=base64.b64encode(priv.encode("utf-8")).decode("ascii"),
-        client_ip=ip,
-        is_active=True,
-        rotation_reason=None,
+
+async def apply_payment_add_month(session: AsyncSession, tg_id: int):
+    sub = await get_sub(session, tg_id)
+    now = utcnow()
+
+    end_at = None
+    if sub:
+        end_at = ensure_aware_utc(sub[1])
+
+    base = end_at if (end_at and end_at > now) else now
+    new_end = base + relativedelta(months=+PERIOD_MONTHS)
+
+    await session.execute(
+        text("""
+        INSERT INTO subscriptions (tg_id, start_at, end_at, is_active, status)
+        VALUES (:id, now(), :end_at, TRUE, 'active')
+        ON CONFLICT (tg_id)
+        DO UPDATE SET end_at=:end_at, is_active=TRUE, status='active'
+        """),
+        {"id": tg_id, "end_at": new_end},
     )
-    session.add(peer)
-    return peer
 
-
-async def revoke_peer(session: AsyncSession, peer: VpnPeer, reason: str) -> None:
-    peer.is_active = False
-    peer.revoked_at = utcnow()
-    peer.rotation_reason = reason
-
-
-# -----------------------------
-# Handlers
-# -----------------------------
-async def show_cabinet(message: Message, session: AsyncSession) -> None:
-    tg_id = message.from_user.id
-    # ensure user
-    await ensure_user_pg(session, tg_id)
-
-    sub = await get_subscription(session, tg_id)
-    if not sub:
-        # create trial 1 month for PoC start
-        sub, _ = await upsert_subscription_add_month(session, tg_id, months=1)
-        session.add(Payment(tg_id=tg_id, amount=0, currency="RUB", provider="system", status="success", period_months=1))
-        await session.commit()
-    else:
-        await session.commit()
-
-    sub = await get_subscription(session, tg_id)
-    peer = await get_active_peer(session, tg_id)
-    pay = await last_payment(session, tg_id)
-
-    s_status = "Активен ✅" if sub and sub.status == "active" and sub.end_at > utcnow() else "Истёк ❌"
-    s_end = fmt_dt(sub.end_at) if sub else "—"
-    s_left = f"{days_left(sub.end_at)}" if sub else "0"
-
-    v_status = "Активен ✅" if peer and peer.is_active else "Отключён ❌"
-
-    p_line = "—"
-    if pay:
-        p_line = f"{fmt_dt(pay.paid_at)} / {pay.amount} {pay.currency} / {pay.status}"
-
-    text = (
-        "👤 *Личный кабинет*\n\n"
-        f"🧾 *СБС*: {s_status}\n"
-        f"📅 Окончание: *{s_end}*\n"
-        f"⏳ Осталось дней: *{s_left}*\n\n"
-        f"🌍 *VPN*: {v_status}\n\n"
-        f"💳 *Последний платёж*: {p_line}\n"
+    # IMPORTANT: fill BOTH period_days and period_months (your DB requires period_days NOT NULL)
+    await session.execute(
+        text("""
+        INSERT INTO payments (tg_id, amount, currency, provider, status, paid_at, period_days, period_months)
+        VALUES (:id, :amount, 'RUB', 'mock', 'success', now(), :days, :months)
+        """),
+        {"id": tg_id, "amount": PRICE_RUB, "days": PERIOD_DAYS, "months": PERIOD_MONTHS},
     )
-    await message.answer(text, reply_markup=cabinet_inline_kb(), parse_mode="Markdown")
 
-
-async def show_vpn(message: Message, session: AsyncSession) -> None:
-    tg_id = message.from_user.id
-    await ensure_user_pg(session, tg_id)
-    peer = await ensure_peer_for_active_sub(session, tg_id)
     await session.commit()
+    return new_end
+
+
+# ================== HANDLERS ==================
+def is_menu(message: Message, text_: str) -> bool:
+    return (message.text or "").strip() == text_
+
+
+async def show_cabinet(msg: Message):
+    async with SessionLocal() as session:
+        tg_id = msg.from_user.id
+        await ensure_user(session, tg_id)
+
+        sub = await get_sub(session, tg_id)
+        pay = await last_payment(session, tg_id)
+        peer = await get_active_peer(session, tg_id)
+
+    start_at, end_at, is_active, status = sub if sub else (None, None, False, "expired")
+    end_at_utc = ensure_aware_utc(end_at)
+    active = bool(end_at_utc and end_at_utc > utcnow() and status == "active" and is_active)
+
+    vpn_status = "Активен ✅" if (peer is not None) else "Отключён ❌"
+    pay_line = "—"
+    if pay:
+        pid, amount, currency, pstatus, paid_at = pay
+        pay_line = f"{fmt_dt(ensure_aware_utc(paid_at))} / {amount} {currency} / {pstatus} (#{pid})"
+
+    text_msg = (
+        "👤 *Личный кабинет*\n\n"
+        f"🧾 *СБС*: {'Активен ✅' if active else 'Истёк ❌'}\n"
+        f"📅 Окончание: *{fmt_dt(end_at_utc)}*\n"
+        f"⏳ Осталось дней: *{days_left(end_at_utc)}*\n\n"
+        f"🌍 *VPN*: {vpn_status}\n\n"
+        f"💳 *Последний платёж*: {pay_line}\n"
+    )
+    await msg.answer(text_msg, parse_mode="Markdown", reply_markup=cabinet_inline_kb())
+
+
+async def show_vpn(msg: Message):
+    async with SessionLocal() as session:
+        tg_id = msg.from_user.id
+        await ensure_user(session, tg_id)
+
+        peer = await ensure_peer_for_active_sub(session, tg_id)
 
     if not peer:
-        await message.answer(
-            "🌍 *VPN*\n\nЧтобы получить VPN — нужна активная подписка СБС.\nНажми *💳 Оплата* → тест-оплата.",
+        await msg.answer(
+            "🌍 *VPN*\n\nНужна активная подписка.\nОткрой *💳 Оплата* и нажми тест-оплату.",
             parse_mode="Markdown",
             reply_markup=vpn_inline_kb(),
         )
         return
 
-    await message.answer(
-        "🌍 *VPN*\n\n"
-        "Готово: у тебя есть конфиг (он не меняется при продлении).\n"
-        "Можно скачать конфиг или показать QR.",
+    await msg.answer(
+        "🌍 *VPN*\n\nКонфиг готов. Он **не меняется при продлении**.\nМожно скачать конфиг или показать QR.",
         parse_mode="Markdown",
         reply_markup=vpn_inline_kb(),
     )
 
 
-async def show_payment(message: Message) -> None:
-    await message.answer(
-        "💳 *Оплата*\n\nЭто PoC: кнопка ниже имитирует успешную оплату 299 ₽ и продлевает СБС на 1 календарный месяц.",
+async def show_pay(msg: Message):
+    await msg.answer(
+        "💳 *Оплата*\n\nPoC: кнопка ниже имитирует успешную оплату 299 ₽ и продлевает на 1 календарный месяц.",
         parse_mode="Markdown",
         reply_markup=payment_inline_kb(),
     )
 
 
-async def show_faq(message: Message) -> None:
-    await message.answer(
+async def show_faq(msg: Message):
+    await msg.answer(
         "❓ *FAQ*\n\n"
         "• СБС — единая подписка.\n"
         "• VPN-конфиг не меняется при продлении.\n"
-        "• По окончании СБС доступ отключается автоматически.\n\n"
-        "Если что-то не работает — напиши в поддержку.",
+        "• По окончании СБС доступ отключается автоматически.\n",
         parse_mode="Markdown",
     )
 
 
-async def show_support(message: Message) -> None:
-    await message.answer("🛠 Поддержка: напиши сюда и приложи скрин/описание проблемы.")
+async def show_support(msg: Message):
+    await msg.answer("🛠 Поддержка: напиши сюда и приложи скрин/описание проблемы.")
 
 
-# Callbacks
-async def pay_mock_success(cb: CallbackQuery, session: AsyncSession) -> None:
+# ================== CALLBACKS ==================
+async def cb_pay_success(cb: CallbackQuery):
     tg_id = cb.from_user.id
-    await ensure_user_pg(session, tg_id)
-
-    # record payment
-    session.add(Payment(tg_id=tg_id, amount=299, currency="RUB", provider="mock", status="success", period_months=1))
-    sub, new_end = await upsert_subscription_add_month(session, tg_id, months=1)
-
-    # ensure vpn peer exists (do not rotate on extend)
-    await ensure_peer_for_active_sub(session, tg_id)
-
-    await session.commit()
+    async with SessionLocal() as session:
+        await ensure_user(session, tg_id)
+        new_end = await apply_payment_add_month(session, tg_id)
+        await ensure_peer_for_active_sub(session, tg_id)
 
     await cb.message.edit_text(
         "✅ *Оплата успешна!*\n\n"
-        f"🧾 СБС активен до: *{fmt_dt(new_end)}*\n"
-        "🌍 VPN работает — можете пользоваться.\n\n"
-        "Открой *Личный кабинет* или *VPN* из меню.",
+        f"🟦 СБС активен до: *{fmt_dt(new_end)}*\n"
+        "🌍 VPN работает — можете пользоваться.",
         parse_mode="Markdown",
-        reply_markup=None,
     )
-    await cb.answer()  # close loading
+    await cb.answer()
 
 
-async def vpn_send_conf(cb: CallbackQuery, session: AsyncSession) -> None:
+async def cb_vpn_conf(cb: CallbackQuery):
     tg_id = cb.from_user.id
-    peer = await ensure_peer_for_active_sub(session, tg_id)
-    await session.commit()
+    async with SessionLocal() as session:
+        peer = await ensure_peer_for_active_sub(session, tg_id)
+
     if not peer:
         await cb.answer("Нужна активная подписка.", show_alert=True)
         return
 
-    conf = build_wg_config(peer)
-    # Save temp file
+    _, priv, ip = peer
+    conf = build_wg_config(priv, ip)
+
     path = f"/tmp/sbs-{tg_id}.conf"
     with open(path, "w", encoding="utf-8") as f:
         f.write(conf)
@@ -432,17 +506,18 @@ async def vpn_send_conf(cb: CallbackQuery, session: AsyncSession) -> None:
     await cb.answer()
 
 
-async def vpn_show_qr(cb: CallbackQuery, session: AsyncSession) -> None:
+async def cb_vpn_qr(cb: CallbackQuery):
     tg_id = cb.from_user.id
-    peer = await ensure_peer_for_active_sub(session, tg_id)
-    await session.commit()
+    async with SessionLocal() as session:
+        peer = await ensure_peer_for_active_sub(session, tg_id)
+
     if not peer:
         await cb.answer("Нужна активная подписка.", show_alert=True)
         return
 
-    conf = build_wg_config(peer)
+    _, priv, ip = peer
+    conf = build_wg_config(priv, ip)
 
-    import qrcode
     img = qrcode.make(conf)
     path = f"/tmp/sbs-{tg_id}-qr.png"
     img.save(path)
@@ -451,7 +526,7 @@ async def vpn_show_qr(cb: CallbackQuery, session: AsyncSession) -> None:
     await cb.answer()
 
 
-async def vpn_guide(cb: CallbackQuery) -> None:
+async def cb_vpn_guide(cb: CallbackQuery):
     await cb.message.answer(
         "📖 *Инструкция*\n\n"
         "1) Установи приложение WireGuard.\n"
@@ -463,7 +538,7 @@ async def vpn_guide(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-async def vpn_reset_confirm(cb: CallbackQuery) -> None:
+async def cb_vpn_reset_confirm(cb: CallbackQuery):
     await cb.message.answer(
         "♻️ *Сбросить VPN?*\n\nСтарый доступ будет отключён, вы получите новый конфиг.",
         parse_mode="Markdown",
@@ -472,57 +547,43 @@ async def vpn_reset_confirm(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-async def vpn_reset_do(cb: CallbackQuery, session: AsyncSession) -> None:
+async def cb_vpn_reset_do(cb: CallbackQuery):
     tg_id = cb.from_user.id
-    sub = await get_subscription(session, tg_id)
-    if not sub or sub.status != "active" or sub.end_at <= utcnow():
-        await cb.answer("Нужна активная подписка.", show_alert=True)
-        return
+    async with SessionLocal() as session:
+        sub = await get_sub(session, tg_id)
+        end_at_utc = ensure_aware_utc(sub[1]) if sub else None
+        status = sub[3] if sub else "expired"
+        if not end_at_utc or status != "active" or end_at_utc <= utcnow():
+            await cb.answer("Нужна активная подписка.", show_alert=True)
+            return
 
-    peer = await get_active_peer(session, tg_id)
-    if peer:
-        await revoke_peer(session, peer, reason="manual_reset")
+        peer = await get_active_peer(session, tg_id)
+        if peer:
+            peer_id = peer[0]
+            await revoke_peer(session, peer_id, "manual_reset")
 
-    # create new
-    priv = _fake_key()
-    pub = _derive_public_from_private(priv)
-    ip = _allocate_client_ip(tg_id)
-    new_peer = VpnPeer(
-        tg_id=tg_id,
-        client_public_key=pub,
-        client_private_key_enc=base64.b64encode(priv.encode("utf-8")).decode("ascii"),
-        client_ip=ip,
-        is_active=True,
-        rotation_reason="manual_reset",
-    )
-    session.add(new_peer)
-    await session.commit()
+        priv, ip = await create_peer(session, tg_id, "manual_reset")
 
-    await cb.message.answer("✅ VPN сброшен. Отправляю новый конфиг и QR…")
-    # send conf + qr
-    conf = build_wg_config(new_peer)
+    conf = build_wg_config(priv, ip)
     conf_path = f"/tmp/sbs-{tg_id}.conf"
     with open(conf_path, "w", encoding="utf-8") as f:
         f.write(conf)
 
-    await cb.message.answer_document(FSInputFile(conf_path), caption="📥 Новый WireGuard конфиг (.conf)")
-
-    import qrcode
     img = qrcode.make(conf)
     qr_path = f"/tmp/sbs-{tg_id}-qr.png"
     img.save(qr_path)
-    await cb.message.answer_photo(FSInputFile(qr_path), caption="🔁 Новый QR для WireGuard")
+
+    await cb.message.answer("✅ VPN сброшен. Отправляю новый конфиг и QR…")
+    await cb.message.answer_document(FSInputFile(conf_path), caption="📥 Новый конфиг (.conf)")
+    await cb.message.answer_photo(FSInputFile(qr_path), caption="🔁 Новый QR")
     await cb.answer()
 
 
-async def vpn_reset_cancel(cb: CallbackQuery) -> None:
+async def cb_vpn_reset_cancel(cb: CallbackQuery):
     await cb.answer("Ок, отменено.")
-    # no edit to keep history
 
 
-# -----------------------------
-# Scheduler
-# -----------------------------
+# ================== SCHEDULER 30s ==================
 async def scheduler_loop(bot: Bot):
     if not SCHEDULER_ENABLED:
         return
@@ -530,137 +591,110 @@ async def scheduler_loop(bot: Bot):
         try:
             async with SessionLocal() as session:
                 now = utcnow()
-                # Expire active subscriptions that ended
-                res = await session.execute(
-                    select(Subscription).where(Subscription.status == "active", Subscription.end_at <= now)
+                # expire subs
+                r = await session.execute(
+                    text("""
+                    SELECT tg_id FROM subscriptions
+                    WHERE status='active' AND end_at IS NOT NULL AND end_at <= :now
+                    """),
+                    {"now": now},
                 )
-                subs = res.scalars().all()
-
-                for sub in subs:
-                    sub.status = "expired"
-                    # disable vpn peer(s)
-                    res2 = await session.execute(
-                        select(VpnPeer).where(VpnPeer.tg_id == sub.tg_id, VpnPeer.is_active == True)  # noqa
+                tg_ids = [row[0] for row in r.fetchall()]
+                if tg_ids:
+                    await session.execute(
+                        text("""
+                        UPDATE subscriptions
+                        SET status='expired', is_active=FALSE
+                        WHERE tg_id = ANY(:ids)
+                        """),
+                        {"ids": tg_ids},
                     )
-                    peers = res2.scalars().all()
-                    for p in peers:
-                        await revoke_peer(session, p, reason="expired")
-
-                    # notify user (best-effort)
-                    try:
-                        await bot.send_message(
-                            sub.tg_id,
-                            "❌ СБС закончился. VPN отключён.\n\nНажмите «💳 Оплата», чтобы продлить.",
-                            reply_markup=main_menu_kb(),
-                        )
-                    except Exception:
-                        pass
-
-                if subs:
+                    await session.execute(
+                        text("""
+                        UPDATE vpn_peers
+                        SET is_active=FALSE, revoked_at=now(), rotation_reason='expired'
+                        WHERE tg_id = ANY(:ids) AND is_active=TRUE
+                        """),
+                        {"ids": tg_ids},
+                    )
                     await session.commit()
-        except Exception:
-            # never crash the bot because of scheduler
-            pass
+
+                    for tg_id in tg_ids:
+                        try:
+                            await bot.send_message(
+                                tg_id,
+                                "❌ СБС закончился. VPN отключён.\n\nНажмите «💳 Оплата», чтобы продлить.",
+                                reply_markup=main_menu_kb(),
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            print("[SCHEDULER WARN]", str(e)[:200])
 
         await asyncio.sleep(30)
 
 
-# -----------------------------
-# App bootstrap
-# -----------------------------
-async def on_startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
-def _is_text(message: Message, text: str) -> bool:
-    return (message.text or "").strip() == text
-
-
+# ================== BOOT ==================
 async def main():
-    await on_startup()
+    await run_migrations()
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
 
-    # Messages
     @dp.message(CommandStart())
-    async def cmd_start(message: Message):
+    async def start(msg: Message):
         async with SessionLocal() as session:
-            await ensure_user_pg(session, message.from_user.id)
-            # For PoC: create subscription if missing (1 month)
-            sub = await get_subscription(session, message.from_user.id)
-            if not sub:
-                await upsert_subscription_add_month(session, message.from_user.id, months=1)
-                session.add(Payment(tg_id=message.from_user.id, amount=0, currency="RUB", provider="system", status="success", period_months=1))
-                await ensure_peer_for_active_sub(session, message.from_user.id)
-            await session.commit()
-
-        await message.answer(
-            "✅ PoC запущен!\n\n"
-            "Это тестовая версия СБС.\n"
-            "Дальше подключим: подписки / VPN / Yandex Monitor.",
-            reply_markup=main_menu_kb(),
-        )
+            await ensure_user(session, msg.from_user.id)
+        await msg.answer("✅ PoC запущен!\n\nВыбирай раздел:", reply_markup=main_menu_kb())
 
     @dp.message(F.text)
-    async def menu_router(message: Message):
-        async with SessionLocal() as session:
-            if _is_text(message, "👤 Личный кабинет"):
-                await show_cabinet(message, session)
-                return
-            if _is_text(message, "🌍 VPN"):
-                await show_vpn(message, session)
-                return
-            if _is_text(message, "💳 Оплата"):
-                await show_payment(message)
-                return
-            if _is_text(message, "❓ FAQ"):
-                await show_faq(message)
-                return
-            if _is_text(message, "🛠 Поддержка"):
-                await show_support(message)
-                return
+    async def router(msg: Message):
+        if is_menu(msg, "👤 Личный кабинет"):
+            await show_cabinet(msg)
+            return
+        if is_menu(msg, "🌍 VPN"):
+            await show_vpn(msg)
+            return
+        if is_menu(msg, "💳 Оплата"):
+            await show_pay(msg)
+            return
+        if is_menu(msg, "❓ FAQ"):
+            await show_faq(msg)
+            return
+        if is_menu(msg, "🛠 Поддержка"):
+            await show_support(msg)
+            return
+        await msg.answer("Выберите пункт меню 👇", reply_markup=main_menu_kb())
 
-        # fallback
-        await message.answer("Выберите пункт меню 👇", reply_markup=main_menu_kb())
-
-    # Callbacks
     @dp.callback_query(F.data == "pay:mock:1m")
     async def _pay(cb: CallbackQuery):
-        async with SessionLocal() as session:
-            await pay_mock_success(cb, session)
+        await cb_pay_success(cb)
 
     @dp.callback_query(F.data == "vpn:conf")
-    async def _vpn_conf(cb: CallbackQuery):
-        async with SessionLocal() as session:
-            await vpn_send_conf(cb, session)
+    async def _conf(cb: CallbackQuery):
+        await cb_vpn_conf(cb)
 
     @dp.callback_query(F.data == "vpn:qr")
-    async def _vpn_qr(cb: CallbackQuery):
-        async with SessionLocal() as session:
-            await vpn_show_qr(cb, session)
+    async def _qr(cb: CallbackQuery):
+        await cb_vpn_qr(cb)
 
     @dp.callback_query(F.data == "vpn:guide")
-    async def _vpn_guide(cb: CallbackQuery):
-        await vpn_guide(cb)
+    async def _guide(cb: CallbackQuery):
+        await cb_vpn_guide(cb)
 
     @dp.callback_query(F.data == "vpn:reset:confirm")
-    async def _vpn_reset_confirm(cb: CallbackQuery):
-        await vpn_reset_confirm(cb)
+    async def _reset_confirm(cb: CallbackQuery):
+        await cb_vpn_reset_confirm(cb)
 
     @dp.callback_query(F.data == "vpn:reset:do")
-    async def _vpn_reset_do(cb: CallbackQuery):
-        async with SessionLocal() as session:
-            await vpn_reset_do(cb, session)
+    async def _reset_do(cb: CallbackQuery):
+        await cb_vpn_reset_do(cb)
 
     @dp.callback_query(F.data == "vpn:reset:cancel")
-    async def _vpn_reset_cancel(cb: CallbackQuery):
-        await vpn_reset_cancel(cb)
+    async def _reset_cancel(cb: CallbackQuery):
+        await cb_vpn_reset_cancel(cb)
 
-    # Scheduler task
     asyncio.create_task(scheduler_loop(bot))
-
     await dp.start_polling(bot)
 
 
