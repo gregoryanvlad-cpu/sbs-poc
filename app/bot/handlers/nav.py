@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 from datetime import datetime, timezone
 
 import qrcode
@@ -23,6 +24,7 @@ from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription
 from app.services.vpn.service import vpn_service
 
+log = logging.getLogger(__name__)
 router = Router()
 
 
@@ -111,7 +113,6 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub.end_at = new_end
         sub.is_active = True
         sub.status = "active"
-
         await session.commit()
 
     await cb.answer("Оплата успешна")
@@ -145,66 +146,90 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "vpn:reset")
 async def on_vpn_reset(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
+    await cb.answer("⏳ Сбрасываю VPN…")  # важно: быстро ответить Telegram
 
-    async with session_scope() as session:
-        await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
-        await session.commit()
+    async def _do_reset() -> None:
+        try:
+            async with session_scope() as session:
+                await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
+                await session.commit()
+            await cb.message.answer("♻️ VPN сброшен. Нажми «Отправить конфиг + QR» чтобы получить новый.")
+        except Exception:
+            log.exception("vpn reset failed tg_id=%s", tg_id)
+            await cb.message.answer("❌ Ошибка VPN сервера при сбросе. Попробуй позже.")
 
-    await cb.answer("VPN сброшен")
-    await cb.message.edit_text(
-        "♻️ VPN сброшен. Получи новый конфиг в разделе VPN.",
-        reply_markup=kb_vpn(),
-    )
+    asyncio.create_task(_do_reset())
 
 
 @router.callback_query(lambda c: c.data == "vpn:bundle")
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
+    # 1) СРАЗУ отвечаем Telegram (иначе callback может быть убит)
+    await cb.answer("⏳ Готовлю конфиг…")
+
+    # 2) Быстро проверяем подписку
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна", show_alert=True)
+            await cb.message.answer("⛔ Подписка не активна. Оплати, чтобы получить VPN.")
             return
 
+    # 3) Сообщаем пользователю, что работаем (это уже обычное сообщение, не callback)
+    status_msg = await cb.message.answer("⏳ Подключаюсь к VPN-серверу и генерирую конфиг…")
+
+    async def _do_vpn_bundle() -> None:
         try:
-            peer = await vpn_service.ensure_peer(session, tg_id)
-            await session.commit()
-        except Exception:
-            await cb.answer("❌ Ошибка VPN сервера", show_alert=True)
-            raise
+            async with session_scope() as session:
+                peer = await vpn_service.ensure_peer(session, tg_id)
+                await session.commit()
 
-    conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+            conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
 
-    qr_img = qrcode.make(conf_text)
-    buf = io.BytesIO()
-    qr_img.save(buf, format="PNG")
-    buf.seek(0)
+            # QR
+            qr_img = qrcode.make(conf_text)
+            buf = io.BytesIO()
+            qr_img.save(buf, format="PNG")
+            buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode("utf-8"), filename="wg.conf")
-    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+            conf_file = BufferedInputFile(conf_text.encode("utf-8"), filename="wg.conf")
+            qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
-    msg_conf = await cb.message.answer_document(
-        conf_file,
-        caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
-    )
-    msg_qr = await cb.message.answer_photo(
-        qr_file,
-        caption="QR для WireGuard",
-    )
+            msg_conf = await cb.message.answer_document(
+                conf_file,
+                caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
+            )
+            msg_qr = await cb.message.answer_photo(
+                qr_file,
+                caption=f"QR для WireGuard. Будет удалён через {settings.auto_delete_seconds} сек.",
+            )
 
-    await cb.answer()
-
-    async def _cleanup() -> None:
-        await asyncio.sleep(settings.auto_delete_seconds)
-        for m in (msg_conf, msg_qr):
+            # убираем статус
             try:
-                await m.delete()
+                await status_msg.delete()
             except Exception:
                 pass
-        try:
-            await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
-        except Exception:
-            pass
 
-    asyncio.create_task(_cleanup())
+            # авто-удаление
+            async def _cleanup() -> None:
+                await asyncio.sleep(settings.auto_delete_seconds)
+                for m in (msg_conf, msg_qr):
+                    try:
+                        await m.delete()
+                    except Exception:
+                        pass
+                try:
+                    await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+                except Exception:
+                    pass
+
+            asyncio.create_task(_cleanup())
+
+        except Exception:
+            log.exception("vpn bundle failed tg_id=%s", tg_id)
+            try:
+                await status_msg.edit_text("❌ Ошибка VPN сервера. Попробуй позже.")
+            except Exception:
+                await cb.message.answer("❌ Ошибка VPN сервера. Попробуй позже.")
+
+    asyncio.create_task(_do_vpn_bundle())
