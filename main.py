@@ -2,6 +2,9 @@ import asyncio
 import base64
 import os
 import secrets
+import hashlib
+import re
+import subprocess
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 
@@ -18,6 +21,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import text
 from dateutil.relativedelta import relativedelta
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 
 # ================== CONFIG ==================
@@ -49,6 +56,17 @@ VPN_ENDPOINT = os.getenv("VPN_ENDPOINT", "1.2.3.4:51820")
 VPN_SERVER_PUBLIC_KEY = os.getenv("VPN_SERVER_PUBLIC_KEY", "REPLACE_ME")
 VPN_ALLOWED_IPS = os.getenv("VPN_ALLOWED_IPS", "0.0.0.0/0, ::/0")
 VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1,8.8.8.8")
+
+# WireGuard provisioner over SSH (for a future VPS)
+VPN_INTERFACE = os.getenv("VPN_INTERFACE", "wg0")
+WG_SSH_HOST = os.getenv("WG_SSH_HOST", "").strip()
+WG_SSH_PORT = int(os.getenv("WG_SSH_PORT", "22"))
+WG_SSH_USER = os.getenv("WG_SSH_USER", "").strip()
+WG_SSH_PRIVATE_KEY = os.getenv("WG_SSH_PRIVATE_KEY", "").strip()  # path to key file inside container
+WG_SSH_SUDO = env_bool("WG_SSH_SUDO", True)
+
+# Encryption for storing client private keys in DB
+VPN_KEY_ENC_SECRET = os.getenv("VPN_KEY_ENC_SECRET", "").strip()
 
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "60"))
 
@@ -210,8 +228,48 @@ def kb_vpn_reset_confirm() -> InlineKeyboardMarkup:
 
 
 # ================== VPN MOCK HELPERS ==================
-def fake_key_b64() -> str:
-    return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+_FERNET_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{43}=$")
+
+
+def _fernet() -> Fernet:
+    """Fernet key comes from VPN_KEY_ENC_SECRET.
+
+    - If it's already a valid Fernet key (44 chars urlsafe b64) -> use directly.
+    - Otherwise derive it as sha256(secret) -> urlsafe_b64.
+    """
+    if not VPN_KEY_ENC_SECRET:
+        # Backward compatible fallback (NOT recommended). Keeps PoC running if env isn't set yet.
+        derived = hashlib.sha256(b"dev-insecure-key").digest()
+        return Fernet(base64.urlsafe_b64encode(derived))
+
+    if _FERNET_KEY_RE.match(VPN_KEY_ENC_SECRET):
+        return Fernet(VPN_KEY_ENC_SECRET.encode("ascii"))
+
+    derived = hashlib.sha256(VPN_KEY_ENC_SECRET.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(derived))
+
+
+def encrypt_private_key(private_key_b64: str) -> str:
+    return _fernet().encrypt(private_key_b64.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_private_key(private_key_enc: str) -> str:
+    return _fernet().decrypt(private_key_enc.encode("utf-8")).decode("utf-8")
+
+
+def wg_keypair_b64() -> tuple[str, str]:
+    """Generate WireGuard-compatible X25519 keypair as base64 strings."""
+    priv = X25519PrivateKey.generate()
+    priv_raw = priv.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_raw = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.b64encode(priv_raw).decode("ascii"), base64.b64encode(pub_raw).decode("ascii")
 
 
 def alloc_ip(tg_id: int) -> str:
@@ -219,6 +277,104 @@ def alloc_ip(tg_id: int) -> str:
     a = (tg_id % 250) + 2
     b = ((tg_id // 250) % 250) + 2
     return f"10.66.{b}.{a}/32"
+
+
+async def _retry(coro_fn, attempts: int = 3, delay: float = 0.7):
+    last = None
+    for i in range(attempts):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                await asyncio.sleep(delay * (i + 1))
+    raise last
+
+
+async def wg_set_peer(pubkey_b64: str, client_ip_cidr: str):
+    """Provision peer on the WireGuard server.
+
+    Modes:
+      - mock: do nothing
+      - ssh: run `wg set` remotely via SSH
+    """
+    if VPN_MODE == "mock":
+        return
+
+    if VPN_MODE != "ssh":
+        raise RuntimeError(f"Unsupported VPN_MODE={VPN_MODE}")
+
+    if not (WG_SSH_HOST and WG_SSH_USER and WG_SSH_PRIVATE_KEY):
+        raise RuntimeError("WG_SSH_HOST/WG_SSH_USER/WG_SSH_PRIVATE_KEY must be set for VPN_MODE=ssh")
+
+    sudo = "sudo " if WG_SSH_SUDO else ""
+    remote_cmd = f"{sudo}wg set {VPN_INTERFACE} peer {pubkey_b64} allowed-ips {client_ip_cidr}"
+    ssh_cmd = [
+        "ssh",
+        "-i",
+        WG_SSH_PRIVATE_KEY,
+        "-p",
+        str(WG_SSH_PORT),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"{WG_SSH_USER}@{WG_SSH_HOST}",
+        remote_cmd,
+    ]
+
+    async def _run():
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ssh wg set failed rc={proc.returncode}: {err.decode('utf-8', 'ignore')[:500]}")
+        return out
+
+    await _retry(_run, attempts=3)
+
+
+async def wg_remove_peer(pubkey_b64: str):
+    if VPN_MODE == "mock":
+        return
+
+    if VPN_MODE != "ssh":
+        raise RuntimeError(f"Unsupported VPN_MODE={VPN_MODE}")
+
+    if not (WG_SSH_HOST and WG_SSH_USER and WG_SSH_PRIVATE_KEY):
+        raise RuntimeError("WG_SSH_HOST/WG_SSH_USER/WG_SSH_PRIVATE_KEY must be set for VPN_MODE=ssh")
+
+    sudo = "sudo " if WG_SSH_SUDO else ""
+    remote_cmd = f"{sudo}wg set {VPN_INTERFACE} peer {pubkey_b64} remove"
+    ssh_cmd = [
+        "ssh",
+        "-i",
+        WG_SSH_PRIVATE_KEY,
+        "-p",
+        str(WG_SSH_PORT),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"{WG_SSH_USER}@{WG_SSH_HOST}",
+        remote_cmd,
+    ]
+
+    async def _run():
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ssh wg remove failed rc={proc.returncode}: {err.decode('utf-8', 'ignore')[:500]}")
+        return out
+
+    await _retry(_run, attempts=3)
 
 
 def build_wg_config(private_key: str, client_ip: str) -> str:
@@ -362,9 +518,16 @@ async def get_active_peer(session: AsyncSession, tg_id: int):
 
 
 async def create_peer(session: AsyncSession, tg_id: int, reason: str | None):
-    private_key = fake_key_b64()
     client_ip = alloc_ip(tg_id)
-    public_key = fake_key_b64()  # mock
+    client_ip_cidr = client_ip  # already has /32
+
+    # Generate a real WG keypair (X25519) regardless of provisioner mode.
+    private_key, public_key = wg_keypair_b64()
+    private_key_enc = encrypt_private_key(private_key)
+
+    # Provision on the WG server (best-effort; DB write should be atomic with success in prod,
+    # but for PoC we provision first and then persist).
+    await wg_set_peer(public_key, client_ip_cidr)
 
     r = await session.execute(
         text("""
@@ -372,7 +535,7 @@ async def create_peer(session: AsyncSession, tg_id: int, reason: str | None):
         VALUES (:id, :pub, :priv, :ip, TRUE, :reason)
         RETURNING id
         """),
-        {"id": tg_id, "pub": public_key, "priv": private_key, "ip": client_ip, "reason": reason},
+        {"id": tg_id, "pub": public_key, "priv": private_key_enc, "ip": client_ip, "reason": reason},
     )
     peer_id = r.scalar_one()
     await session.commit()
@@ -380,6 +543,14 @@ async def create_peer(session: AsyncSession, tg_id: int, reason: str | None):
 
 
 async def revoke_peer(session: AsyncSession, peer_id: int, reason: str):
+    # Fetch pubkey to remove it on the server
+    r = await session.execute(
+        text("SELECT client_public_key FROM vpn_peers WHERE id=:pid"),
+        {"pid": peer_id},
+    )
+    row = r.first()
+    pub = row[0] if row else None
+
     await session.execute(
         text("""
         UPDATE vpn_peers
@@ -389,6 +560,13 @@ async def revoke_peer(session: AsyncSession, peer_id: int, reason: str):
         {"pid": peer_id, "reason": reason},
     )
     await session.commit()
+
+    if pub:
+        # best-effort
+        try:
+            await wg_remove_peer(pub)
+        except Exception:
+            pass
 
 
 async def ensure_peer_for_active_sub(session: AsyncSession, tg_id: int):
@@ -403,10 +581,24 @@ async def ensure_peer_for_active_sub(session: AsyncSession, tg_id: int):
 
     peer = await get_active_peer(session, tg_id)
     if peer:
-        return peer
+        pid, priv_enc, ip = peer
+        try:
+            priv = decrypt_private_key(priv_enc)
+        except Exception:
+            # Backward compatibility: earlier PoC stored plaintext
+            priv = priv_enc
+        return pid, priv, ip
 
     await create_peer(session, tg_id, reason=None)
-    return await get_active_peer(session, tg_id)
+    peer = await get_active_peer(session, tg_id)
+    if not peer:
+        return None
+    pid, priv_enc, ip = peer
+    try:
+        priv = decrypt_private_key(priv_enc)
+    except Exception:
+        priv = priv_enc
+    return pid, priv, ip
 
 
 async def apply_payment_add_month(session: AsyncSession, tg_id: int):
