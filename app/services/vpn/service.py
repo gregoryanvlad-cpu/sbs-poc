@@ -60,4 +60,52 @@ class VPNService:
 
     async def ensure_peer(self, session, user_id: int):
         """
-        Если peer уже есть —
+        Если peer уже есть — вернуть его
+        Если нет — создать
+        """
+        # ⚠️ В MVP просто создаём каждый раз новый peer
+        client_ip = self._alloc_ip(user_id)
+        peer = await self.create_peer(user_id, client_ip)
+        return peer
+
+    async def rotate_peer(self, session, user_id: int, reason: str = "manual"):
+        """
+        Для MVP: просто создаём новый peer
+        (старый будет неиспользуем)
+        """
+        client_ip = self._alloc_ip(user_id)
+        peer = await self.create_peer(user_id, client_ip)
+        return peer
+
+    async def create_peer(self, user_id: int, client_ip: str):
+        priv, pub = gen_keys()
+
+        # добавляем peer на сервер
+        await self.provider.add_peer(pub, client_ip)
+
+        enc_priv = encrypt(self.enc_secret, priv)
+
+        return {
+            "public_key": pub,
+            "private_key_enc": enc_priv,
+            "private_key": priv,
+            "client_ip": client_ip,
+        }
+
+    def build_wg_conf(self, peer: dict, user_label: Optional[str] = None) -> str:
+        return f"""[Interface]
+PrivateKey = {peer["private_key"]}
+Address = {peer["client_ip"]}/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = {self.server_pub}
+Endpoint = {self.endpoint}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+"""
+
+
+# ✅ ВОТ ЭТА СТРОКА — САМОЕ ГЛАВНОЕ
+# singleton, который импортируется в nav.py
+vpn_service = VPNService()
