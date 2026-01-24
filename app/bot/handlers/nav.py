@@ -20,14 +20,15 @@ from app.bot.keyboards import (
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription
+from app.repo import get_subscription, extend_subscription
 from app.services.vpn.service import vpn_service
 
 router = Router()
 
 
-# ===== helpers =====
-
+# -----------------------------
+# helpers
+# -----------------------------
 def _is_sub_active(sub_end_at: datetime | None) -> bool:
     if not sub_end_at:
         return False
@@ -36,8 +37,9 @@ def _is_sub_active(sub_end_at: datetime | None) -> bool:
     return sub_end_at > utcnow()
 
 
-# ===== navigation =====
-
+# -----------------------------
+# navigation
+# -----------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("nav:"))
 async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
@@ -75,18 +77,18 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "faq":
-        await cb.message.edit_text(
+        text = (
             "❓ FAQ\n\n"
             "— Как оплатить? В разделе «Оплата»\n"
-            "— Как получить VPN? Раздел «VPN»",
-            reply_markup=kb_back_home(),
+            "— Как получить VPN? Раздел «VPN»"
         )
+        await cb.message.edit_text(text, reply_markup=kb_back_home())
         await cb.answer()
         return
 
     if where == "support":
         await cb.message.edit_text(
-            "🛠 Поддержка\n\nНапиши сюда: @support",
+            "🛠 Поддержка\n\nНапиши сюда: @support (заглушка)",
             reply_markup=kb_back_home(),
         )
         await cb.answer()
@@ -95,9 +97,10 @@ async def on_nav(cb: CallbackQuery) -> None:
     await cb.answer("Неизвестный раздел")
 
 
-# ===== payment (mock) =====
-
-@router.callback_query(lambda c: c.data and c.data.startswith("pay:mock:"))
+# -----------------------------
+# mock payment
+# -----------------------------
+@router.callback_query(lambda c: c.data and c.data.startswith("pay:mock"))
 async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
@@ -105,6 +108,7 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub = await get_subscription(session, tg_id)
         now = utcnow()
         base = sub.end_at if sub.end_at and sub.end_at > now else now
+
         new_end = base + relativedelta(months=settings.period_months)
 
         await extend_subscription(
@@ -127,17 +131,18 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
     )
 
 
-# ===== VPN =====
-
+# -----------------------------
+# VPN
+# -----------------------------
 @router.callback_query(lambda c: c.data == "vpn:guide")
 async def on_vpn_guide(cb: CallbackQuery) -> None:
-    await cb.message.edit_text(
+    text = (
         "📖 Инструкция\n\n"
         "1) Нажми «Отправить конфиг + QR»\n"
         "2) Импортируй в WireGuard\n"
-        f"3) Конфиг удалится через {settings.auto_delete_seconds} сек.",
-        reply_markup=kb_vpn(),
+        f"3) Конфиг удалится через {settings.auto_delete_seconds} сек."
     )
+    await cb.message.edit_text(text, reply_markup=kb_vpn())
     await cb.answer()
 
 
@@ -158,15 +163,16 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
         await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
         await session.commit()
 
-    await cb.answer("VPN сброшен")
+    await cb.answer("Сброшено")
     await cb.message.edit_text(
-        "♻️ VPN сброшен. Получи новый конфиг.",
+        "♻️ VPN сброшен. Получи новый конфиг в разделе VPN.",
         reply_markup=kb_vpn(),
     )
 
 
-# ===== VPN CONFIG (ВАЖНОЕ МЕСТО) =====
-
+# -----------------------------
+# VPN bundle (CONFIG + QR)
+# -----------------------------
 @router.callback_query(lambda c: c.data == "vpn:bundle")
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
@@ -181,23 +187,12 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
             peer = await vpn_service.ensure_peer(session, tg_id)
             await session.commit()
         except Exception:
-            # SSH может упасть — мы НЕ ломаем UX
             await cb.answer(
                 "⚠️ VPN сервер временно недоступен.\n"
-                "Конфиг сгенерирован, попробуй подключиться позже.",
+                "Попробуй ещё раз через минуту.",
                 show_alert=True,
             )
-
-            peer = {
-                "client_private_key_plain": vpn_service.gen_keys()[0]
-                if hasattr(vpn_service, "gen_keys")
-                else None,
-                "client_ip": vpn_service._alloc_ip(tg_id),
-            }
-
-    if not peer.get("client_private_key_plain"):
-        await cb.answer("❌ Не удалось сгенерировать ключ", show_alert=True)
-        return
+            return
 
     conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
 
@@ -211,7 +206,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
 
     msg_conf = await cb.message.answer_document(
         document=conf_file,
-        caption=f"WireGuard конфиг. Удалится через {settings.auto_delete_seconds} сек.",
+        caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
     )
     msg_qr = await cb.message.answer_photo(
         photo=qr_file,
