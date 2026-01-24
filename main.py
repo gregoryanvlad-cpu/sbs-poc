@@ -23,6 +23,15 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_aware_utc(dt: datetime | None) -> datetime | None:
+    """Bring datetime to tz-aware UTC (works for values returned by Postgres too)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def fmt_dt(dt: datetime | None) -> str:
     if not dt:
         return "—"
@@ -33,6 +42,7 @@ def days_left(end_at: datetime | None) -> int:
     if not end_at:
         return 0
     delta = end_at - utcnow()
+    # округляем вверх до дней, если осталось хоть что-то
     return max(0, delta.days + (1 if delta.seconds > 0 else 0))
 
 
@@ -48,7 +58,6 @@ def make_async_db_url(url: str) -> str:
 
 # ================== DB: SAFE AUTO-MIGRATION ==================
 MIGRATION_SQL = [
-    # --- Create tables if not exists (for fresh DB) ---
     """
     CREATE TABLE IF NOT EXISTS users (
         tg_id BIGINT PRIMARY KEY,
@@ -76,8 +85,6 @@ MIGRATION_SQL = [
         period_months INTEGER NOT NULL DEFAULT 1
     )
     """,
-
-    # --- Patch existing schema (your case) ---
     # users
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
@@ -85,10 +92,8 @@ MIGRATION_SQL = [
     "UPDATE users SET status = 'active' WHERE status IS NULL",
     "ALTER TABLE users ALTER COLUMN created_at SET DEFAULT now()",
     "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'",
-    # Try to enforce NOT NULL safely (if it fails, we still survive because we set values above)
     "ALTER TABLE users ALTER COLUMN created_at SET NOT NULL",
     "ALTER TABLE users ALTER COLUMN status SET NOT NULL",
-
     # subscriptions
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS start_at TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS end_at TIMESTAMPTZ",
@@ -96,7 +101,6 @@ MIGRATION_SQL = [
     "UPDATE subscriptions SET is_active = FALSE WHERE is_active IS NULL",
     "ALTER TABLE subscriptions ALTER COLUMN is_active SET DEFAULT FALSE",
     "ALTER TABLE subscriptions ALTER COLUMN is_active SET NOT NULL",
-
     # payments
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency VARCHAR(8)",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR(32)",
@@ -113,7 +117,6 @@ MIGRATION_SQL = [
     "ALTER TABLE payments ALTER COLUMN status SET DEFAULT 'success'",
     "ALTER TABLE payments ALTER COLUMN paid_at SET DEFAULT now()",
     "ALTER TABLE payments ALTER COLUMN period_months SET DEFAULT 1",
-    # Again, enforce safely
     "ALTER TABLE payments ALTER COLUMN currency SET NOT NULL",
     "ALTER TABLE payments ALTER COLUMN provider SET NOT NULL",
     "ALTER TABLE payments ALTER COLUMN status SET NOT NULL",
@@ -123,15 +126,11 @@ MIGRATION_SQL = [
 
 
 async def run_migrations(session: AsyncSession) -> None:
-    # Выполняем последовательно; если какой-то ALTER упадёт на редком кейсе — логика дальше всё равно будет работать,
-    # потому что INSERT/UPDATE мы делаем с явными значениями.
     for stmt in MIGRATION_SQL:
         try:
             await session.execute(text(stmt))
         except Exception as e:
-            # Не валим бот миграцией — лучше продолжить и жить.
-            # Railway логи покажут проблему, но UX не умрёт.
-            print(f"[MIGRATION WARN] {e} :: {stmt[:120]}")
+            print(f"[MIGRATION WARN] {e} :: {stmt[:140]}")
     await session.commit()
 
 
@@ -176,7 +175,6 @@ def vpn_kb():
 
 # ================== DB HELPERS ==================
 async def ensure_user(session: AsyncSession, tg_id: int) -> None:
-    # ВАЖНО: вставляем created_at/status явно, чтобы не зависеть от default в старой схеме
     await session.execute(
         text("""
         INSERT INTO users (tg_id, created_at, status)
@@ -185,7 +183,6 @@ async def ensure_user(session: AsyncSession, tg_id: int) -> None:
         """),
         {"id": tg_id},
     )
-    # ensure subscription row exists
     await session.execute(
         text("""
         INSERT INTO subscriptions (tg_id, is_active)
@@ -220,23 +217,18 @@ async def get_last_payment(session: AsyncSession, tg_id: int):
 
 
 async def apply_success_payment(session: AsyncSession, tg_id: int):
-    now = utcnow().replace(tzinfo=None)  # для SQL now() можно не мучать tz, postgres сам хранит timestamptz
+    now = utcnow()
+
     row = await session.execute(
         text("SELECT end_at FROM subscriptions WHERE tg_id=:id"),
         {"id": tg_id},
     )
     r = row.first()
-    current_end = r[0] if r and r[0] else None
+    current_end = ensure_aware_utc(r[0]) if r and r[0] else None
 
-    # base = max(now, current_end)
-    if current_end and current_end > datetime.utcnow():
-        base = current_end
-    else:
-        base = datetime.utcnow()
-
+    base = current_end if (current_end and current_end > now) else now
     new_end = base + relativedelta(months=+PERIOD_MONTHS)
 
-    # upsert subscription
     await session.execute(
         text("""
         INSERT INTO subscriptions (tg_id, start_at, end_at, is_active)
@@ -247,7 +239,6 @@ async def apply_success_payment(session: AsyncSession, tg_id: int):
         {"id": tg_id, "end_at": new_end},
     )
 
-    # insert payment (explicit columns so no schema defaults needed)
     await session.execute(
         text("""
         INSERT INTO payments (tg_id, amount, currency, provider, status, paid_at, period_months)
@@ -258,8 +249,10 @@ async def apply_success_payment(session: AsyncSession, tg_id: int):
 
     await session.commit()
 
-    # fetch new payment id
-    p = await session.execute(text("SELECT id FROM payments WHERE tg_id=:id ORDER BY id DESC LIMIT 1"), {"id": tg_id})
+    p = await session.execute(
+        text("SELECT id FROM payments WHERE tg_id=:id ORDER BY id DESC LIMIT 1"),
+        {"id": tg_id},
+    )
     payment_id = p.scalar_one()
     return payment_id, new_end
 
@@ -277,7 +270,7 @@ async def main() -> None:
     engine = create_async_engine(make_async_db_url(database_url), pool_pre_ping=True)
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
-    # run migrations BEFORE polling
+    # migrations before polling
     async with Session() as session:
         await run_migrations(session)
 
@@ -304,16 +297,14 @@ async def main() -> None:
             last_pay = await get_last_payment(session, cb.from_user.id)
 
         start_at, end_at, is_active = sub if sub else (None, None, False)
-        active = bool(end_at and end_at.replace(tzinfo=timezone.utc) > utcnow() and is_active)
+        end_at_utc = ensure_aware_utc(end_at)
+        active = bool(end_at_utc and end_at_utc > utcnow() and is_active)
 
         last_pay_str = "—"
         if last_pay:
             pid, amount, currency, status, paid_at = last_pay
-            # paid_at может быть naive datetime из PG — считаем как UTC
-            paid_at_utc = paid_at.replace(tzinfo=timezone.utc) if paid_at else None
+            paid_at_utc = ensure_aware_utc(paid_at)
             last_pay_str = f"{fmt_dt(paid_at_utc)} / {amount} {currency} / {status} (#{pid})"
-
-        end_at_utc = end_at.replace(tzinfo=timezone.utc) if end_at else None
 
         text_msg = (
             "👤 *Личный кабинет*\n\n"
@@ -349,7 +340,7 @@ async def main() -> None:
             await ensure_user(session, cb.from_user.id)
             payment_id, new_end = await apply_success_payment(session, cb.from_user.id)
 
-        new_end_utc = new_end.replace(tzinfo=timezone.utc)
+        new_end_utc = ensure_aware_utc(new_end)
         await cb.message.edit_text(
             "✅ Оплата прошла успешно.\n\n"
             f"🧾 Платёж №{payment_id}\n"
