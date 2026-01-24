@@ -1,0 +1,13 @@
+# PATCH: fix aiogram v3 SendDocument validation error by using BufferedInputFile.
+# Apply manually to app/bot/handlers/nav.py:
+#
+# 1) Add import:
+#    from aiogram.types import BufferedInputFile
+#
+# 2) Replace answer_document call that passes ('wg.conf', bytes) with:
+#    conf_file = BufferedInputFile(conf_bytes, filename="wg.conf")
+#    await cb.message.answer_document(conf_file, caption="WireGuard конфиг (удалится через 60 сек)")
+#
+# If you also send QR bytes, use:
+#    qr_file = BufferedInputFile(qr_png_bytes, filename="wg.png")
+#    await cb.message.answer_photo(qr_file, caption="QR для WireGuard (удалится через 60 сек)")
