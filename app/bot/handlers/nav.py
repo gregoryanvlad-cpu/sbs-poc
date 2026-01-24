@@ -136,41 +136,32 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна", show_alert=True)
             return
 
-        try:
+    # ✅ МГНОВЕННЫЙ ответ Telegram
+    await cb.answer("⏳ Генерирую конфиг, подожди…")
+
+    # ✅ Вся тяжёлая логика — в фоне
+    asyncio.create_task(_generate_and_send_vpn(cb, tg_id))
+
+async def _generate_and_send_vpn(cb: CallbackQuery, tg_id: int):
+    try:
+        async with session_scope() as session:
             peer = await vpn_service.ensure_peer(session, tg_id)
             await session.commit()
-        except Exception as e:
-            await cb.answer("❌ Ошибка VPN сервера. Попробуй позже.", show_alert=True)
-            raise  # чтобы ошибка была в логах Railway
 
-    # ⚠️ ВАЖНО: конфиг строим ИЗ dict, БЕЗ БД
-    conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+        conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
 
-    qr_img = qrcode.make(conf_text)
-    buf = io.BytesIO()
-    qr_img.save(buf, format="PNG")
-    buf.seek(0)
+        conf_file = BufferedInputFile(
+            conf_text.encode("utf-8"),
+            filename="wg.conf",
+        )
 
-    conf_file = BufferedInputFile(conf_text.encode(), filename="wg.conf")
-    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+        await cb.message.answer_document(
+            document=conf_file,
+            caption="✅ WireGuard конфиг",
+        )
 
-    msg_conf = await cb.message.answer_document(
-        document=conf_file,
-        caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
-    )
-    msg_qr = await cb.message.answer_photo(
-        photo=qr_file,
-        caption="QR для WireGuard",
-    )
-    await cb.answer()
+    except Exception as e:
+        await cb.message.answer(
+            f"❌ Ошибка при создании VPN:\n{type(e).__name__}: {e}"
+        )
 
-    async def _cleanup():
-        await asyncio.sleep(settings.auto_delete_seconds)
-        for m in (msg_conf, msg_qr):
-            try:
-                await m.delete()
-            except Exception:
-                pass
-        await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
-
-    asyncio.create_task(_cleanup())
