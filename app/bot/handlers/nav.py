@@ -120,49 +120,39 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
-    async with session_scope() as session:
-        sub = await get_subscription(session, tg_id)
-        if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна", show_alert=True)
-            return
+    # ⚠️ СРАЗУ отвечаем Telegram
+    await cb.answer("⏳ Генерирую конфиг, подожди пару секунд...")
 
-        try:
+    async def _job():
+        async with session_scope() as session:
+            sub = await get_subscription(session, tg_id)
+            if not _is_sub_active(sub.end_at):
+                await cb.message.answer("❌ Подписка не активна")
+                return
+
             peer = await vpn_service.ensure_peer(session, tg_id)
             await session.commit()
-        except Exception:
-            await cb.answer("❌ Ошибка VPN сервера. Попробуй позже.", show_alert=True)
-            raise  # важно: чтобы ошибка была в логах Railway
 
-    # ⚠️ КЛЮЧЕВОЙ МОМЕНТ
-    # конфиг строим ИЗ peer (dict), а не из БД
-    conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+        conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
 
-    # QR
-    qr_img = qrcode.make(conf_text)
-    buf = io.BytesIO()
-    qr_img.save(buf, format="PNG")
-    buf.seek(0)
+        qr_img = qrcode.make(conf_text)
+        buf = io.BytesIO()
+        qr_img.save(buf, format="PNG")
+        buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode("utf-8"), filename="wg.conf")
-    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+        await cb.message.answer_document(
+            BufferedInputFile(conf_text.encode(), "wg.conf"),
+            caption="🔐 WireGuard конфиг",
+        )
 
-    msg_conf = await cb.message.answer_document(
-        document=conf_file,
-        caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
-    )
-    msg_qr = await cb.message.answer_photo(
-        photo=qr_file,
-        caption="QR для WireGuard",
-    )
-    await cb.answer()
+        await cb.message.answer_photo(
+            BufferedInputFile(buf.getvalue(), "wg.png"),
+            caption="📱 QR для WireGuard",
+        )
 
-    async def _cleanup():
-        await asyncio.sleep(settings.auto_delete_seconds)
-        for m in (msg_conf, msg_qr):
-            try:
-                await m.delete()
-            except Exception:
-                pass
+    # 🚀 запускаем в фоне
+    asyncio.create_task(_job())
+
         await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
 
     asyncio.create_task(_cleanup())
