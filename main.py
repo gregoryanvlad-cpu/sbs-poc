@@ -11,6 +11,9 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup,
     FSInputFile,
+    ReplyKeyboardRemove,
+    InputMediaPhoto,
+    InputMediaDocument,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -50,7 +53,6 @@ VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1,8.8.8.8")
 
 
 def make_async_db_url(url: str) -> str:
-    # Railway: postgres://... -> asyncpg needs postgresql+asyncpg://...
     if url.startswith("postgresql+asyncpg://"):
         return url
     if url.startswith("postgres://"):
@@ -90,7 +92,6 @@ engine = create_async_engine(make_async_db_url(DATABASE_URL), pool_pre_ping=True
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 MIGRATION_SQL = [
-    # base tables (create if empty)
     """
     CREATE TABLE IF NOT EXISTS users (
         tg_id BIGINT PRIMARY KEY,
@@ -134,7 +135,6 @@ MIGRATION_SQL = [
     )
     """,
 
-    # patch existing schema (safe)
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(16)",
     "UPDATE users SET created_at = now() WHERE created_at IS NULL",
@@ -178,7 +178,6 @@ async def run_migrations():
             try:
                 await session.execute(text(stmt))
             except Exception as e:
-                # миграции не должны ронять бот
                 print("[MIGRATION WARN]", str(e)[:220], "||", stmt[:120])
         await session.commit()
 
@@ -221,8 +220,7 @@ def kb_pay() -> InlineKeyboardMarkup:
 def kb_vpn() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
-    b.button(text="📥 Скачать мой конфиг", callback_data="vpn:conf")
-    b.button(text="🔁 Показать QR", callback_data="vpn:qr")
+    b.button(text="📥 Скачать конфиг + QR", callback_data="vpn:bundle")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
@@ -243,6 +241,7 @@ def fake_key_b64() -> str:
 
 
 def alloc_ip(tg_id: int) -> str:
+    # IP может оставаться тем же — это нормально; при реальном WG обычно фиксируют IP на юзера
     a = (tg_id % 250) + 2
     b = ((tg_id // 250) % 250) + 2
     return f"10.66.{b}.{a}/32"
@@ -260,6 +259,32 @@ def build_wg_config(private_key: str, client_ip: str) -> str:
         f"Endpoint = {VPN_ENDPOINT}\n"
         "PersistentKeepalive = 25\n"
     )
+
+
+async def send_conf_and_qr_as_album(
+    cb: CallbackQuery,
+    peer_id: int,
+    private_key: str,
+    client_ip: str,
+):
+    tg_id = cb.from_user.id
+    conf = build_wg_config(private_key, client_ip)
+
+    conf_path = f"/tmp/sbs-{tg_id}.conf"
+    with open(conf_path, "w", encoding="utf-8") as f:
+        f.write(conf)
+
+    img = qrcode.make(conf)
+    qr_path = f"/tmp/sbs-{tg_id}-qr.png"
+    img.save(qr_path)
+
+    caption = f"📦 VPN пакет\nPeer #{peer_id}\nIP: {client_ip}\n\nИмпортируй .conf или QR в WireGuard."
+
+    media = [
+        InputMediaDocument(media=FSInputFile(conf_path), caption=caption),
+        InputMediaPhoto(media=FSInputFile(qr_path)),
+    ]
+    await cb.message.answer_media_group(media)
 
 
 # ================== DB LOGIC ==================
@@ -324,15 +349,17 @@ async def create_peer(session: AsyncSession, tg_id: int, reason: str | None):
     client_ip = alloc_ip(tg_id)
     public_key = fake_key_b64()  # mock
 
-    await session.execute(
+    r = await session.execute(
         text("""
         INSERT INTO vpn_peers (tg_id, client_public_key, client_private_key_enc, client_ip, is_active, rotation_reason)
         VALUES (:id, :pub, :priv, :ip, TRUE, :reason)
+        RETURNING id
         """),
         {"id": tg_id, "pub": public_key, "priv": private_key, "ip": client_ip, "reason": reason},
     )
+    peer_id = r.scalar_one()
     await session.commit()
-    return private_key, client_ip
+    return peer_id, private_key, client_ip
 
 
 async def revoke_peer(session: AsyncSession, peer_id: int, reason: str):
@@ -447,11 +474,13 @@ async def render_vpn(cb: CallbackQuery):
             "Открой *💳 Оплата* и нажми тест-оплату."
         )
     else:
+        peer_id = peer[0]
         text_msg = (
             "🌍 *VPN*\n\n"
+            f"Peer: *#{peer_id}*\n"
             "Конфиг готов. Он **не меняется при продлении**.\n"
-            "Можно скачать конфиг или показать QR.\n\n"
-            "Сброс VPN создаст новый конфиг."
+            "Кнопка ниже отправит **конфиг + QR вместе**.\n\n"
+            "Сброс VPN создаст новый peer (номер изменится)."
         )
 
     await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn())
@@ -502,7 +531,7 @@ async def action_pay_success(cb: CallbackQuery):
     await cb.answer()
 
 
-async def action_vpn_send_conf(cb: CallbackQuery):
+async def action_vpn_bundle(cb: CallbackQuery):
     tg_id = cb.from_user.id
     async with SessionLocal() as session:
         peer = await ensure_peer_for_active_sub(session, tg_id)
@@ -511,35 +540,9 @@ async def action_vpn_send_conf(cb: CallbackQuery):
         await cb.answer("Нужна активная подписка.", show_alert=True)
         return
 
-    _, priv, ip = peer
-    conf = build_wg_config(priv, ip)
-
-    path = f"/tmp/sbs-{tg_id}.conf"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(conf)
-
-    await cb.message.answer_document(FSInputFile(path), caption="📥 Ваш WireGuard конфиг (.conf)")
-    await cb.answer("Конфиг отправлен")
-
-
-async def action_vpn_show_qr(cb: CallbackQuery):
-    tg_id = cb.from_user.id
-    async with SessionLocal() as session:
-        peer = await ensure_peer_for_active_sub(session, tg_id)
-
-    if not peer:
-        await cb.answer("Нужна активная подписка.", show_alert=True)
-        return
-
-    _, priv, ip = peer
-    conf = build_wg_config(priv, ip)
-
-    img = qrcode.make(conf)
-    path = f"/tmp/sbs-{tg_id}-qr.png"
-    img.save(path)
-
-    await cb.message.answer_photo(FSInputFile(path), caption="🔁 QR для импорта в WireGuard")
-    await cb.answer("QR отправлен")
+    peer_id, priv, ip = peer
+    await send_conf_and_qr_as_album(cb, peer_id, priv, ip)
+    await cb.answer("Отправил конфиг + QR")
 
 
 async def action_vpn_guide(cb: CallbackQuery):
@@ -557,7 +560,7 @@ async def action_vpn_guide(cb: CallbackQuery):
 async def action_vpn_reset_confirm(cb: CallbackQuery):
     text_msg = (
         "♻️ *Сбросить VPN?*\n\n"
-        "Старый доступ будет отключён, вы получите новый конфиг."
+        "Старый доступ будет отключён, вы получите новый конфиг (новый peer)."
     )
     await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn_reset_confirm())
     await cb.answer()
@@ -579,31 +582,21 @@ async def action_vpn_reset_do(cb: CallbackQuery):
         if peer:
             await revoke_peer(session, peer[0], "manual_reset")
 
-        priv, ip = await create_peer(session, tg_id, "manual_reset")
+        peer_id, priv, ip = await create_peer(session, tg_id, "manual_reset")
 
-    conf = build_wg_config(priv, ip)
-    conf_path = f"/tmp/sbs-{tg_id}.conf"
-    with open(conf_path, "w", encoding="utf-8") as f:
-        f.write(conf)
-
-    img = qrcode.make(conf)
-    qr_path = f"/tmp/sbs-{tg_id}-qr.png"
-    img.save(qr_path)
-
-    # обновляем экран VPN (одним сообщением)
+    # Обновляем экран VPN (одно сообщение)
     await cb.message.edit_text(
-        "✅ *VPN сброшен.*\n\nНиже отправил новый конфиг и QR.",
+        f"✅ *VPN сброшен.*\n\nСоздан новый peer: *#{peer_id}*\nСейчас отправлю конфиг + QR одним блоком.",
         parse_mode="Markdown",
         reply_markup=kb_vpn(),
     )
-    # файлы отдельными сообщениями (так устроен Telegram)
-    await cb.message.answer_document(FSInputFile(conf_path), caption="📥 Новый конфиг (.conf)")
-    await cb.message.answer_photo(FSInputFile(qr_path), caption="🔁 Новый QR")
+
+    # Отправляем конфиг+QR вместе (альбомом)
+    await send_conf_and_qr_as_album(cb, peer_id, priv, ip)
     await cb.answer()
 
 
 async def action_vpn_reset_cancel(cb: CallbackQuery):
-    # возвращаемся на экран VPN без создания новых сообщений
     await render_vpn(cb)
 
 
@@ -666,12 +659,15 @@ async def main():
 
     @dp.message(CommandStart())
     async def start(msg: Message):
+        # ВАЖНО: убрать старую нижнюю ReplyKeyboard, если она была ранее
+        await msg.answer("⏳", reply_markup=ReplyKeyboardRemove())
         async with SessionLocal() as session:
             await ensure_user(session, msg.from_user.id)
         await msg.answer(HOME_TEXT, reply_markup=kb_main())
 
     @dp.message(Command("menu"))
     async def menu_cmd(msg: Message):
+        await msg.answer("⏳", reply_markup=ReplyKeyboardRemove())
         async with SessionLocal() as session:
             await ensure_user(session, msg.from_user.id)
         await msg.answer(HOME_TEXT, reply_markup=kb_main())
@@ -706,13 +702,9 @@ async def main():
     async def _pay_success(cb: CallbackQuery):
         await action_pay_success(cb)
 
-    @dp.callback_query(F.data == "vpn:conf")
-    async def _vpn_conf(cb: CallbackQuery):
-        await action_vpn_send_conf(cb)
-
-    @dp.callback_query(F.data == "vpn:qr")
-    async def _vpn_qr(cb: CallbackQuery):
-        await action_vpn_show_qr(cb)
+    @dp.callback_query(F.data == "vpn:bundle")
+    async def _vpn_bundle(cb: CallbackQuery):
+        await action_vpn_bundle(cb)
 
     @dp.callback_query(F.data == "vpn:guide")
     async def _vpn_guide(cb: CallbackQuery):
