@@ -3,6 +3,7 @@ import base64
 import os
 import secrets
 from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple
 
 import qrcode
 from aiogram import Bot, Dispatcher, F
@@ -48,6 +49,8 @@ VPN_ENDPOINT = os.getenv("VPN_ENDPOINT", "1.2.3.4:51820")
 VPN_SERVER_PUBLIC_KEY = os.getenv("VPN_SERVER_PUBLIC_KEY", "REPLACE_ME")
 VPN_ALLOWED_IPS = os.getenv("VPN_ALLOWED_IPS", "0.0.0.0/0, ::/0")
 VPN_DNS = os.getenv("VPN_DNS", "1.1.1.1,8.8.8.8")
+
+AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "60"))
 
 
 def make_async_db_url(url: str) -> str:
@@ -212,7 +215,7 @@ def fake_key_b64() -> str:
 
 
 def alloc_ip(tg_id: int) -> str:
-    # IP намеренно может оставаться одинаковым: в реальном WG обычно фиксируют IP за пользователем
+    # IP может оставаться одинаковым: в реальном WG обычно фиксируют IP за пользователем
     a = (tg_id % 250) + 2
     b = ((tg_id // 250) % 250) + 2
     return f"10.66.{b}.{a}/32"
@@ -232,12 +235,46 @@ def build_wg_config(private_key: str, client_ip: str) -> str:
     )
 
 
-async def send_conf_and_qr_linked(cb: CallbackQuery, peer_id: int, private_key: str, client_ip: str):
+async def schedule_cleanup_and_return_home(
+    bot: Bot,
+    chat_id: int,
+    home_message_id: int,
+    delete_message_ids: list[int],
+    delay_seconds: int,
+):
+    await asyncio.sleep(delay_seconds)
+
+    # 1) delete sensitive messages (best-effort)
+    for mid in delete_message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+    # 2) return UI to main menu (best-effort)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=home_message_id,
+            text=HOME_TEXT,
+            reply_markup=kb_main(),
+        )
+    except Exception:
+        pass
+
+
+async def send_conf_and_qr_linked(
+    cb: CallbackQuery,
+    peer_id: int,
+    private_key: str,
+    client_ip: str,
+) -> Tuple[int, int]:
     """
     Telegram не позволяет смешать document+photo в одном media_group.
     Поэтому отправляем:
     1) QR фото
     2) .conf документ reply на QR (чтобы выглядело единым блоком)
+    Возвращаем message_id обоих сообщений, чтобы потом удалить.
     """
     tg_id = cb.from_user.id
     conf = build_wg_config(private_key, client_ip)
@@ -254,15 +291,17 @@ async def send_conf_and_qr_linked(cb: CallbackQuery, peer_id: int, private_key: 
         f"📦 VPN пакет\n"
         f"Peer #{peer_id}\n"
         f"IP: {client_ip}\n\n"
-        f"Сканируй QR или импортируй .conf ниже."
+        f"Сканируй QR или импортируй .conf ниже.\n"
+        f"⏳ Через {AUTO_DELETE_SECONDS} сек сообщения удалятся."
     )
 
     qr_msg = await cb.message.answer_photo(FSInputFile(qr_path), caption=caption)
-    await cb.message.answer_document(
+    doc_msg = await cb.message.answer_document(
         FSInputFile(conf_path),
         caption="📥 Конфиг WireGuard (.conf)",
-        reply_to_message_id=qr_msg.message_id
+        reply_to_message_id=qr_msg.message_id,
     )
+    return qr_msg.message_id, doc_msg.message_id
 
 
 # ================== DB LOGIC ==================
@@ -456,8 +495,8 @@ async def render_vpn(cb: CallbackQuery):
         text_msg = (
             "🌍 *VPN*\n\n"
             f"Peer: *#{peer_id}*\n"
-            "Кнопка ниже отправит QR + .conf связанными сообщениями.\n"
-            "Сброс VPN создаст новый peer (номер изменится)."
+            "Кнопка ниже отправит QR + .conf.\n"
+            f"⏳ Через {AUTO_DELETE_SECONDS} сек сообщения удалятся автоматически."
         )
 
     await cb.message.edit_text(text_msg, parse_mode="Markdown", reply_markup=kb_vpn())
@@ -521,7 +560,23 @@ async def action_vpn_bundle(cb: CallbackQuery):
         return
 
     peer_id, priv, ip = peer
-    await send_conf_and_qr_linked(cb, peer_id, priv, ip)
+
+    # отправляем QR+conf
+    qr_mid, doc_mid = await send_conf_and_qr_linked(cb, peer_id, priv, ip)
+
+    # планируем удаление через 60 сек + возврат в главное меню (редактированием текущего экрана)
+    chat_id = cb.message.chat.id
+    home_message_id = cb.message.message_id
+    asyncio.create_task(
+        schedule_cleanup_and_return_home(
+            bot=cb.bot,
+            chat_id=chat_id,
+            home_message_id=home_message_id,
+            delete_message_ids=[qr_mid, doc_mid],
+            delay_seconds=AUTO_DELETE_SECONDS,
+        )
+    )
+
     await cb.answer("Отправил")
 
 
@@ -567,12 +622,27 @@ async def action_vpn_reset_do(cb: CallbackQuery):
         peer_id, priv, ip = await create_peer(session, tg_id, "manual_reset")
 
     await cb.message.edit_text(
-        f"✅ *VPN сброшен.*\n\nСоздан новый peer: *#{peer_id}*\nСейчас отправлю QR и .conf связанными сообщениями.",
+        f"✅ *VPN сброшен.*\n\nСоздан новый peer: *#{peer_id}*\n"
+        f"Сейчас отправлю QR и .conf.\n"
+        f"⏳ Через {AUTO_DELETE_SECONDS} сек сообщения удалятся, а меню вернётся.",
         parse_mode="Markdown",
         reply_markup=kb_vpn(),
     )
 
-    await send_conf_and_qr_linked(cb, peer_id, priv, ip)
+    qr_mid, doc_mid = await send_conf_and_qr_linked(cb, peer_id, priv, ip)
+
+    chat_id = cb.message.chat.id
+    home_message_id = cb.message.message_id
+    asyncio.create_task(
+        schedule_cleanup_and_return_home(
+            bot=cb.bot,
+            chat_id=chat_id,
+            home_message_id=home_message_id,
+            delete_message_ids=[qr_mid, doc_mid],
+            delay_seconds=AUTO_DELETE_SECONDS,
+        )
+    )
+
     await cb.answer()
 
 
@@ -639,7 +709,7 @@ async def main():
 
     @dp.message(CommandStart())
     async def start(msg: Message):
-        # убрать старую нижнюю ReplyKeyboard, если она была ранее
+        # Убираем старую нижнюю ReplyKeyboard, если она была когда-то
         await msg.answer("⏳", reply_markup=ReplyKeyboardRemove())
         async with SessionLocal() as session:
             await ensure_user(session, msg.from_user.id)
