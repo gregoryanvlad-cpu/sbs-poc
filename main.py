@@ -7,20 +7,20 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from sqlalchemy import BigInteger, DateTime, String, Boolean, Integer, ForeignKey
+from sqlalchemy import BigInteger, DateTime, String, Boolean, Integer, ForeignKey, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from dateutil.relativedelta import relativedelta
 
 
-# ====== CONFIG ======
+# ================== CONFIG ==================
 PRICE_RUB = 299
 PERIOD_MONTHS = 1
 MSK = timezone(timedelta(hours=3))
 
 
-def utcnow() -> datetime:
+def utcnow():
     return datetime.now(timezone.utc)
 
 
@@ -34,20 +34,20 @@ def make_async_db_url(url: str) -> str:
     raise ValueError("Unsupported DATABASE_URL format")
 
 
-def fmt_dt(dt: datetime | None) -> str:
+def fmt_dt(dt):
     if not dt:
         return "—"
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
-def days_left(end_at: datetime | None) -> int:
+def days_left(end_at):
     if not end_at:
         return 0
     delta = end_at - utcnow()
     return max(0, delta.days + (1 if delta.seconds > 0 else 0))
 
 
-# ====== DB MODELS ======
+# ================== DB ==================
 class Base(DeclarativeBase):
     pass
 
@@ -56,76 +56,68 @@ class User(Base):
     __tablename__ = "users"
     tg_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    status: Mapped[str] = mapped_column(String(16), default="active")  # active|expired|blocked
 
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
     tg_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.tg_id"), primary_key=True)
-    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Payment(Base):
     __tablename__ = "payments"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tg_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.tg_id"))
+    tg_id: Mapped[int] = mapped_column(BigInteger)
     amount: Mapped[int] = mapped_column(Integer)
-    currency: Mapped[str] = mapped_column(String(8), default="RUB")
-    provider: Mapped[str] = mapped_column(String(32), default="mock")
-    status: Mapped[str] = mapped_column(String(16), default="success")
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-async def init_db(engine) -> None:
+async def init_db(engine):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
-async def ensure_user_and_sub(session: AsyncSession, tg_id: int) -> Subscription:
-    user = await session.get(User, tg_id)
-    if user is None:
-        session.add(User(tg_id=tg_id))
-        await session.commit()
+# ================== CORE LOGIC ==================
+async def get_subscription(session: AsyncSession, tg_id: int) -> Subscription:
+    result = await session.execute(
+        select(Subscription).where(Subscription.tg_id == tg_id)
+    )
+    sub = result.scalar_one_or_none()
 
-    sub = await session.get(Subscription, tg_id)
-    if sub is None:
-        sub = Subscription(tg_id=tg_id, start_at=None, end_at=None, is_active=False)
+    if not sub:
+        sub = Subscription(tg_id=tg_id)
         session.add(sub)
         await session.commit()
+        await session.refresh(sub)
 
     return sub
 
 
-async def apply_success_payment(session: AsyncSession, tg_id: int) -> tuple[int, datetime, int]:
-    """
-    Возвращает: (payment_id, new_end, left_days)
-    Продление на 1 календарный месяц.
-    Если подписка активна -> от end_at (не режем дни).
-    Если истекла -> от now.
-    """
-    sub = await ensure_user_and_sub(session, tg_id)
+async def apply_payment(session: AsyncSession, tg_id: int) -> Subscription:
+    sub = await get_subscription(session, tg_id)
 
     now = utcnow()
     base = sub.end_at if sub.end_at and sub.end_at > now else now
     new_end = base + relativedelta(months=+PERIOD_MONTHS)
 
-    if sub.start_at is None:
+    if not sub.start_at:
         sub.start_at = now
+
     sub.end_at = new_end
     sub.is_active = True
 
-    payment = Payment(tg_id=tg_id, amount=PRICE_RUB, currency="RUB", provider="mock", status="success")
-    session.add(payment)
+    session.add(Payment(tg_id=tg_id, amount=PRICE_RUB))
+    await session.flush()
     await session.commit()
-    await session.refresh(payment)
+    await session.refresh(sub)  # 🔥 КЛЮЧЕВОЙ МОМЕНТ
 
-    return payment.id, new_end, days_left(new_end)
+    return sub
 
 
-# ====== KEYBOARDS ======
-def main_menu_kb():
+# ================== KEYBOARDS ==================
+def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="👤 Личный кабинет", callback_data="cabinet")
     kb.button(text="🌍 VPN", callback_data="vpn")
@@ -146,155 +138,68 @@ def cabinet_kb():
 
 def pay_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"✅ Оплатить {PRICE_RUB} ₽ / 1 месяц", callback_data="pay_mock_success")
+    kb.button(text=f"✅ Оплатить {PRICE_RUB} ₽ / 1 месяц", callback_data="pay_success")
     kb.button(text="⬅️ Назад", callback_data="home")
     kb.adjust(1)
     return kb.as_markup()
 
 
-def vpn_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📖 Инструкция", callback_data="vpn_help")
-    kb.button(text="📥 Скачать мой конфиг", callback_data="vpn_config")
-    kb.button(text="🔁 Показать QR", callback_data="vpn_qr")
-    kb.button(text="♻️ Сбросить VPN", callback_data="vpn_reset")
-    kb.button(text="⬅️ Назад", callback_data="home")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-# ====== RENDERERS ======
-async def render_cabinet(session: AsyncSession, tg_id: int) -> str:
-    sub = await ensure_user_and_sub(session, tg_id)
-    active = bool(sub.end_at and sub.end_at > utcnow() and sub.is_active)
-
-    return (
-        "👤 *Личный кабинет*\n\n"
-        f"🟦 *СБС*: {'Активен ✅' if active else 'Истёк ❌'}\n"
-        f"📅 Окончание: {fmt_dt(sub.end_at)}\n"
-        f"⏳ Осталось дней: *{days_left(sub.end_at)}*\n\n"
-        "🌍 *VPN*: (PoC / mock)\n"
-        "🎁 *Яндекс*: (подключим следующим шагом)\n"
-    )
-
-
-# ====== BOT ======
-async def main() -> None:
-    bot_token = os.environ["BOT_TOKEN"]
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("DATABASE_URL is missing.")
-
-    engine = create_async_engine(make_async_db_url(database_url), pool_pre_ping=True)
+# ================== BOT ==================
+async def main():
+    bot = Bot(token=os.environ["BOT_TOKEN"])
+    engine = create_async_engine(make_async_db_url(os.environ["DATABASE_URL"]))
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     await init_db(engine)
-
-    bot = Bot(token=bot_token)
     dp = Dispatcher()
 
     @dp.message(CommandStart())
-    async def start(message: Message):
-        async with Session() as session:
-            await ensure_user_and_sub(session, message.from_user.id)
-
-        await message.answer("✅ PoC СБС запущен.\nВыбирай раздел:", reply_markup=main_menu_kb())
+    async def start(msg: Message):
+        await msg.answer("Выбирай раздел:", reply_markup=main_menu())
 
     @dp.callback_query(F.data == "home")
     async def home(cb: CallbackQuery):
         await cb.answer()
-        await cb.message.edit_text("Выбирай раздел:", reply_markup=main_menu_kb())
+        await cb.message.edit_text("Выбирай раздел:", reply_markup=main_menu())
 
     @dp.callback_query(F.data == "cabinet")
     async def cabinet(cb: CallbackQuery):
         await cb.answer()
         async with Session() as session:
-            text = await render_cabinet(session, cb.from_user.id)
-        await cb.message.edit_text(text, reply_markup=cabinet_kb(), parse_mode="Markdown")
+            sub = await get_subscription(session, cb.from_user.id)
+
+        await cb.message.edit_text(
+            "👤 *Личный кабинет*\n\n"
+            f"📅 Окончание: {fmt_dt(sub.end_at)}\n"
+            f"⏳ Осталось дней: *{days_left(sub.end_at)}*",
+            reply_markup=cabinet_kb(),
+            parse_mode="Markdown",
+        )
 
     @dp.callback_query(F.data == "pay")
     async def pay(cb: CallbackQuery):
         await cb.answer()
         await cb.message.edit_text(
-            "💳 *Оплата (PoC)*\n\n"
-            "Сейчас вместо реального провайдера — тестовая кнопка.\n"
-            "Нажатие продлевает СБС на **1 календарный месяц**.",
+            "💳 Оплата\n\nПродление на **1 календарный месяц**.",
             reply_markup=pay_kb(),
             parse_mode="Markdown",
         )
 
-    @dp.callback_query(F.data == "pay_mock_success")
-    async def pay_mock_success(cb: CallbackQuery):
-        await cb.answer()  # без текста => без всплывашки
-
+    @dp.callback_query(F.data == "pay_success")
+    async def pay_success(cb: CallbackQuery):
+        await cb.answer()
         async with Session() as session:
-            payment_id, new_end, left = await apply_success_payment(session, cb.from_user.id)
+            sub = await apply_payment(session, cb.from_user.id)
 
-        # ВАЖНО: текст гарантированно отличается каждый раз (payment_id и новая дата),
-        # поэтому Telegram точно применит edit_text и пользователь увидит результат.
         await cb.message.edit_text(
-            "✅ Оплата прошла успешно.\n\n"
-            f"🧾 Платёж №{payment_id}\n"
-            f"🟦 СБС активен до: {fmt_dt(new_end)}\n"
-            f"⏳ Осталось дней: {left}\n\n"
-            "🌍 VPN (mock): активирован.\n"
-            "🎁 Яндекс: подключим следующим шагом.",
-            reply_markup=main_menu_kb(),
-        )
-
-    @dp.callback_query(F.data == "vpn")
-    async def vpn(cb: CallbackQuery):
-        await cb.answer()
-        await cb.message.edit_text(
-            "🌍 *VPN (PoC / mock)*\n\n"
-            "Сейчас VPN в режиме mock: мы проверяем бизнес-логику.\n"
-            "Реальный WireGuard подключим позже.",
-            reply_markup=vpn_kb(),
-            parse_mode="Markdown",
-        )
-
-    @dp.callback_query(F.data.in_({"vpn_help", "vpn_config", "vpn_qr", "vpn_reset"}))
-    async def vpn_stub(cb: CallbackQuery):
-        await cb.answer()
-        await cb.message.edit_text(
-            "🌍 *VPN (PoC / mock)*\n\n"
-            "Эти кнопки пока заглушки. VPN подключим после Яндекса.\n",
-            reply_markup=vpn_kb(),
-            parse_mode="Markdown",
-        )
-
-    @dp.callback_query(F.data == "faq")
-    async def faq(cb: CallbackQuery):
-        await cb.answer()
-        await cb.message.edit_text(
-            "❓ *FAQ (PoC)*\n\n"
-            "— СБС = VPN + бонус Яндекс Плюс.\n"
-            "— Тариф: 299 ₽ / 1 календарный месяц.\n"
-            "— Продление не режет дни: месяц прибавляется к текущему сроку.\n",
-            reply_markup=main_menu_kb(),
-            parse_mode="Markdown",
-        )
-
-    @dp.callback_query(F.data == "support")
-    async def support(cb: CallbackQuery):
-        await cb.answer()
-        await cb.message.edit_text(
-            "🛠 Поддержка (PoC)\n\n"
-            "Напиши сюда: @your_support_username\n"
-            "(потом заменим на реальный канал/чат)",
-            reply_markup=main_menu_kb(),
+            "✅ Оплата прошла успешно!\n\n"
+            f"📅 Новый срок: {fmt_dt(sub.end_at)}\n"
+            f"⏳ Осталось дней: {days_left(sub.end_at)}",
+            reply_markup=main_menu(),
         )
 
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-
-    # удерживаем контейнер живым для Railway (чтобы он не гасил worker)
-    import time
-    while True:
-        time.sleep(3600)
+    asyncio.run(main())
