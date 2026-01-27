@@ -44,20 +44,25 @@ def gen_keys() -> tuple[str, str]:
 
 class VPNService:
     def __init__(self) -> None:
+        # IMPORTANT: password is OPTIONAL
+        pwd = os.environ.get("WG_SSH_PASSWORD")
+        if pwd is not None and pwd.strip() == "":
+            pwd = None
+
         self.provider = WireGuardSSHProvider(
             host=os.environ["WG_SSH_HOST"],
             port=int(os.environ.get("WG_SSH_PORT", "22")),
             user=os.environ["WG_SSH_USER"],
-            password=os.environ.get("WG_SSH_PASSWORD"),
+            password=pwd,
             interface=os.environ.get("VPN_INTERFACE", "wg0"),
         )
+
         self.server_pub = os.environ["VPN_SERVER_PUBLIC_KEY"]
         self.endpoint = os.environ["VPN_ENDPOINT"]
         self.dns = os.environ.get("VPN_DNS", "1.1.1.1")
 
     def _alloc_ip(self, tg_id: int) -> str:
-        # Deterministic allocation: stable IP per tg_id until rotate.
-        # Reserve first addresses in subnet (network + 0/1 are special; start from +2).
+        # Stable IP per tg_id until rotate (manual reset).
         host = (tg_id % 65000) + 2
         return str(VPN_NET.network_address + host)
 
@@ -94,7 +99,6 @@ class VPNService:
 
         last = await self._get_last_peer(session, tg_id)
         if last and not last.is_active:
-            # Reactivate the SAME peer (same keys/IP) by re-applying on server
             log.info("vpn_restore_peer tg_id=%s peer_id=%s", tg_id, last.id)
             await self.provider.add_peer(last.client_public_key, last.client_ip)
             last.is_active = True
@@ -137,7 +141,6 @@ class VPNService:
             try:
                 await self.provider.remove_peer(active.client_public_key)
             except Exception:
-                # Best-effort remove: even if SSH hiccups, we still continue to create new peer
                 log.exception("vpn_remove_old_peer_failed tg_id=%s peer_id=%s", tg_id, active.id)
 
             active.is_active = False
