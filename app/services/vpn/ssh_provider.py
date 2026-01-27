@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import asyncssh
 import logging
 import os
@@ -21,15 +22,28 @@ class WireGuardSSHProvider:
         self.retries = int(os.environ.get("WG_SSH_RETRIES", "3"))
 
         self._key_obj = None
-        key_text = os.environ.get("WG_SSH_PRIVATE_KEY")
-        if key_text:
-            key_text = key_text.strip()
+
+        # Preferred: base64 one-line key (Railway-safe)
+        key_b64 = os.environ.get("WG_SSH_PRIVATE_KEY_B64")
+        if key_b64:
             try:
-                self._key_obj = asyncssh.import_private_key(key_text)
-                log.info("SSH private key loaded from WG_SSH_PRIVATE_KEY (import_private_key ok)")
+                key_text = base64.b64decode(key_b64.encode("utf-8")).decode("utf-8")
+                self._key_obj = asyncssh.import_private_key(key_text.strip())
+                log.info("SSH private key loaded from WG_SSH_PRIVATE_KEY_B64 (ok)")
             except Exception:
-                log.exception("Failed to import WG_SSH_PRIVATE_KEY - check formatting/newlines")
+                log.exception("Failed to load WG_SSH_PRIVATE_KEY_B64 (base64 decode/import failed)")
                 self._key_obj = None
+
+        # Fallback: raw multiline key (less reliable in Railway UI)
+        if self._key_obj is None:
+            key_text = os.environ.get("WG_SSH_PRIVATE_KEY")
+            if key_text:
+                try:
+                    self._key_obj = asyncssh.import_private_key(key_text.strip())
+                    log.info("SSH private key loaded from WG_SSH_PRIVATE_KEY (ok)")
+                except Exception:
+                    log.exception("Failed to import WG_SSH_PRIVATE_KEY - check formatting/newlines")
+                    self._key_obj = None
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
         if self._key_obj is not None:
@@ -47,7 +61,7 @@ class WireGuardSSHProvider:
 
         if not self.password:
             raise RuntimeError(
-                "No SSH auth configured: WG_SSH_PRIVATE_KEY is missing/invalid and WG_SSH_PASSWORD is empty/missing"
+                "No SSH auth configured: set WG_SSH_PRIVATE_KEY_B64 (preferred) or WG_SSH_PRIVATE_KEY or WG_SSH_PASSWORD"
             )
 
         return await asyncssh.connect(
