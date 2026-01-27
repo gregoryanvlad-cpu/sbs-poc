@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import datetime, timezone
-import logging
 
 import qrcode
 from aiogram import Router
@@ -18,25 +17,15 @@ from app.bot.keyboards import (
     kb_pay,
     kb_vpn,
 )
+from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
 from app.db.session import session_scope
-from app.repo import (
-    add_mock_payment,
-    days_left,
-    ensure_user,
-    fmt_dt,
-    get_subscription,
-    utcnow,
-)
+from app.repo import get_subscription, extend_subscription
 from app.services.vpn.service import vpn_service
 
 router = Router()
-log = logging.getLogger(__name__)
 
 
-# -----------------------------
-# helpers
-# -----------------------------
 def _is_sub_active(sub_end_at: datetime | None) -> bool:
     if not sub_end_at:
         return False
@@ -45,9 +34,6 @@ def _is_sub_active(sub_end_at: datetime | None) -> bool:
     return sub_end_at > utcnow()
 
 
-# -----------------------------
-# navigation
-# -----------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("nav:"))
 async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
@@ -73,17 +59,14 @@ async def on_nav(cb: CallbackQuery) -> None:
 
     if where == "pay":
         await cb.message.edit_text(
-            "💳 Оплата\n\nДля MVP доступна mock-оплата.",
+            f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
             reply_markup=kb_pay(),
         )
         await cb.answer()
         return
 
     if where == "vpn":
-        await cb.message.edit_text(
-            "🔐 VPN\n\nПолучить конфиг и QR.",
-            reply_markup=kb_vpn(),
-        )
+        await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
         await cb.answer()
         return
 
@@ -108,25 +91,49 @@ async def on_nav(cb: CallbackQuery) -> None:
     await cb.answer("Неизвестный раздел")
 
 
-# -----------------------------
-# mock payment
-# -----------------------------
 @router.callback_query(lambda c: c.data and c.data.startswith("pay:mock"))
 async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
     async with session_scope() as session:
-        await ensure_user(session, tg_id, cb.from_user.username)
-        await add_mock_payment(session, tg_id, days=30)
+        sub = await get_subscription(session, tg_id)
+        now = utcnow()
+        base = sub.end_at if sub.end_at and sub.end_at > now else now
+
+        new_end = base + relativedelta(months=settings.period_months)
+
+        await extend_subscription(
+            session,
+            tg_id,
+            months=settings.period_months,
+            days_legacy=settings.period_days,
+        )
+
+        sub.end_at = new_end
+        sub.is_active = True
+        sub.status = "active"
+
         await session.commit()
 
-    await cb.answer("Оплачено")
-    await cb.message.edit_text("✅ Оплата прошла (mock).", reply_markup=kb_main())
+    await cb.answer("Оплата успешна")
+    await cb.message.edit_text(
+        f"✅ Оплата успешна\n\nПодписка до: {fmt_dt(new_end)}",
+        reply_markup=kb_main(),
+    )
 
 
-# -----------------------------
-# VPN reset (confirm)
-# -----------------------------
+@router.callback_query(lambda c: c.data == "vpn:guide")
+async def on_vpn_guide(cb: CallbackQuery) -> None:
+    text = (
+        "📖 Инструкция\n\n"
+        "1) Нажми «Отправить конфиг + QR»\n"
+        "2) Импортируй в WireGuard\n"
+        f"3) Конфиг удалится через {settings.auto_delete_seconds} сек."
+    )
+    await cb.message.edit_text(text, reply_markup=kb_vpn())
+    await cb.answer()
+
+
 @router.callback_query(lambda c: c.data == "vpn:reset:confirm")
 async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
     await cb.message.edit_text(
@@ -139,10 +146,9 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "vpn:reset")
 async def on_vpn_reset(cb: CallbackQuery) -> None:
     """
-    Manual VPN reset.
-
-    IMPORTANT: do not block Telegram callback with SSH/WG operations.
-    We answer immediately and do the heavy work in a background task.
+    ВАЖНО: не держим callback на SSH.
+    Сразу отвечаем пользователю, а WG операции делаем в фоне.
+    После сброса — присылаем новый конфиг + QR.
     """
     tg_id = cb.from_user.id
     chat_id = cb.message.chat.id
@@ -154,7 +160,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
         reply_markup=kb_vpn(),
     )
 
-    async def _do_reset_and_send() -> None:
+    async def _do_reset_and_send():
         try:
             async with session_scope() as session:
                 peer = await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
@@ -181,7 +187,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
                 caption="QR для WireGuard (после сброса)",
             )
 
-            async def _cleanup() -> None:
+            async def _cleanup():
                 await asyncio.sleep(settings.auto_delete_seconds)
                 for m in (msg_conf, msg_qr):
                     try:
@@ -192,11 +198,11 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
             asyncio.create_task(_cleanup())
 
         except Exception:
-            log.exception("vpn_reset_failed tg_id=%s", tg_id)
+            # Не валим бота, просто сообщаем пользователю
             try:
                 await cb.bot.send_message(
                     chat_id=chat_id,
-                    text="⚠️ Не удалось сбросить VPN из-за временной ошибки сервера. Попробуй ещё раз через минуту.",
+                    text="⚠️ Не удалось сбросить VPN из-за временной ошибки. Попробуй ещё раз через минуту.",
                 )
             except Exception:
                 pass
@@ -204,9 +210,6 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
     asyncio.create_task(_do_reset_and_send())
 
 
-# -----------------------------
-# VPN bundle (CONFIG + QR)
-# -----------------------------
 @router.callback_query(lambda c: c.data == "vpn:bundle")
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
