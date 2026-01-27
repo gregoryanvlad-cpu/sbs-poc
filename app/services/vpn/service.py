@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import VpnPeer
+from app.db.models.vpn_peer import VpnPeer
 from app.repo import utcnow
 from app.services.vpn import crypto
 from app.services.vpn.ssh_provider import WireGuardSSHProvider
@@ -26,7 +26,7 @@ def _b64encode_raw(b: bytes) -> str:
 
 
 def gen_keys() -> tuple[str, str]:
-    """Generate WireGuard (X25519) keypair in base64 (Raw)."""
+    """Generate WireGuard keypair (X25519) in base64 Raw format."""
     priv = x25519.X25519PrivateKey.generate()
     pub = priv.public_key()
 
@@ -43,19 +43,6 @@ def gen_keys() -> tuple[str, str]:
 
 
 class VPNService:
-    """
-    DB-backed WireGuard peers:
-
-    ensure_peer():
-      - если есть active peer -> отдаём его (без SSH)
-      - если был peer, но не active -> восстанавливаем тот же peer на сервере (wg set) и делаем active
-      - если вообще не было -> создаём новый, wg set, сохраняем в БД
-
-    rotate_peer(): (manual reset)
-      - удаляем активный peer с сервера (wg remove) + помечаем revoked в БД
-      - создаём новый peer и сохраняем
-    """
-
     def __init__(self) -> None:
         self.provider = WireGuardSSHProvider(
             host=os.environ["WG_SSH_HOST"],
@@ -69,11 +56,12 @@ class VPNService:
         self.dns = os.environ.get("VPN_DNS", "1.1.1.1")
 
     def _alloc_ip(self, tg_id: int) -> str:
-        # deterministic allocation (как было): один и тот же tg_id -> один и тот же IP
+        # Deterministic allocation: stable IP per tg_id until rotate.
+        # Reserve first addresses in subnet (network + 0/1 are special; start from +2).
         host = (tg_id % 65000) + 2
         return str(VPN_NET.network_address + host)
 
-    async def _get_active_peer_row(self, session: AsyncSession, tg_id: int) -> VpnPeer | None:
+    async def _get_active_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
         q = (
             select(VpnPeer)
             .where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
@@ -83,12 +71,12 @@ class VPNService:
         res = await session.execute(q)
         return res.scalar_one_or_none()
 
-    async def _get_last_peer_row(self, session: AsyncSession, tg_id: int) -> VpnPeer | None:
+    async def _get_last_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
         q = select(VpnPeer).where(VpnPeer.tg_id == tg_id).order_by(VpnPeer.id.desc()).limit(1)
         res = await session.execute(q)
         return res.scalar_one_or_none()
 
-    def _peer_row_to_dict(self, row: VpnPeer) -> Dict[str, Any]:
+    def _row_to_peer_dict(self, row: VpnPeer) -> Dict[str, Any]:
         priv_plain = crypto.decrypt(row.client_private_key_enc)
         return {
             "tg_id": row.tg_id,
@@ -99,24 +87,21 @@ class VPNService:
         }
 
     async def ensure_peer(self, session: AsyncSession, tg_id: int) -> Dict[str, Any]:
-        """
-        - есть active -> вернуть (без SSH)
-        - есть последний peer, но он inactive -> восстановить (wg set) и вернуть
-        - иначе создать новый (wg set + insert)
-        """
-        active = await self._get_active_peer_row(session, tg_id)
+        """Return existing active peer or create/apply a new one."""
+        active = await self._get_active_peer(session, tg_id)
         if active:
-            return self._peer_row_to_dict(active)
+            return self._row_to_peer_dict(active)
 
-        last = await self._get_last_peer_row(session, tg_id)
+        last = await self._get_last_peer(session, tg_id)
         if last and not last.is_active:
+            # Reactivate the SAME peer (same keys/IP) by re-applying on server
             log.info("vpn_restore_peer tg_id=%s peer_id=%s", tg_id, last.id)
             await self.provider.add_peer(last.client_public_key, last.client_ip)
             last.is_active = True
             last.revoked_at = None
             last.rotation_reason = None
             await session.flush()
-            return self._peer_row_to_dict(last)
+            return self._row_to_peer_dict(last)
 
         client_ip = self._alloc_ip(tg_id)
         client_priv, client_pub = gen_keys()
@@ -145,12 +130,14 @@ class VPNService:
         }
 
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
-        """Manual reset: wg remove старого + новый peer."""
-        active = await self._get_active_peer_row(session, tg_id)
+        """Manual reset: best-effort remove old peer then create/apply new peer."""
+        active = await self._get_active_peer(session, tg_id)
+
         if active:
             try:
                 await self.provider.remove_peer(active.client_public_key)
             except Exception:
+                # Best-effort remove: even if SSH hiccups, we still continue to create new peer
                 log.exception("vpn_remove_old_peer_failed tg_id=%s peer_id=%s", tg_id, active.id)
 
             active.is_active = False
@@ -161,6 +148,7 @@ class VPNService:
         client_ip = self._alloc_ip(tg_id)
         client_priv, client_pub = gen_keys()
 
+        log.info("vpn_rotate_create_peer tg_id=%s ip=%s", tg_id, client_ip)
         await self.provider.add_peer(client_pub, client_ip)
 
         row = VpnPeer(
