@@ -15,28 +15,24 @@ class WireGuardSSHProvider:
         self.password = password
         self.interface = interface
 
-        # Timeouts / retries (can be overridden via env)
         self.connect_timeout = int(os.environ.get("WG_SSH_CONNECT_TIMEOUT", "15"))
         self.login_timeout = int(os.environ.get("WG_SSH_LOGIN_TIMEOUT", "15"))
         self.cmd_timeout = int(os.environ.get("WG_SSH_CMD_TIMEOUT", "15"))
         self.retries = int(os.environ.get("WG_SSH_RETRIES", "3"))
 
-        # Railway stores the key as multiline text in env. asyncssh treats plain strings in client_keys
-        # as *filenames*, so we import the key into an object.
         self._key_obj = None
         key_text = os.environ.get("WG_SSH_PRIVATE_KEY")
         if key_text:
             key_text = key_text.strip()
             try:
                 self._key_obj = asyncssh.import_private_key(key_text)
-                log.info("SSH private key loaded from env (import_private_key)")
-            except Exception as e:
-                log.exception("Failed to import WG_SSH_PRIVATE_KEY from env: %s", e)
+                log.info("SSH private key loaded from WG_SSH_PRIVATE_KEY (import_private_key ok)")
+            except Exception:
+                log.exception("Failed to import WG_SSH_PRIVATE_KEY - check formatting/newlines")
                 self._key_obj = None
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
         if self._key_obj is not None:
-            log.info("SSH auth via private key (env)")
             return await asyncssh.connect(
                 self.host,
                 port=self.port,
@@ -49,7 +45,11 @@ class WireGuardSSHProvider:
                 keepalive_count_max=2,
             )
 
-        log.info("SSH auth via password")
+        if not self.password:
+            raise RuntimeError(
+                "No SSH auth configured: WG_SSH_PRIVATE_KEY is missing/invalid and WG_SSH_PASSWORD is empty/missing"
+            )
+
         return await asyncssh.connect(
             self.host,
             port=self.port,
@@ -74,7 +74,6 @@ class WireGuardSSHProvider:
             except Exception as e:
                 last_exc = e
                 log.warning("SSH cmd failed attempt=%s/%s cmd=%s err=%r", attempt, self.retries, cmd, e)
-                # small exponential backoff
                 await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
         assert last_exc is not None
         raise last_exc
