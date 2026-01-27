@@ -16,14 +16,13 @@ class WireGuardSSHProvider:
         self.password = password
         self.interface = interface
 
-        self.connect_timeout = int(os.environ.get("WG_SSH_CONNECT_TIMEOUT", "15"))
-        self.login_timeout = int(os.environ.get("WG_SSH_LOGIN_TIMEOUT", "15"))
-        self.cmd_timeout = int(os.environ.get("WG_SSH_CMD_TIMEOUT", "15"))
+        self.connect_timeout = int(os.environ.get("WG_SSH_CONNECT_TIMEOUT", "20"))
+        self.login_timeout = int(os.environ.get("WG_SSH_LOGIN_TIMEOUT", "20"))
+        self.cmd_timeout = int(os.environ.get("WG_SSH_CMD_TIMEOUT", "20"))
         self.retries = int(os.environ.get("WG_SSH_RETRIES", "3"))
 
         self._key_obj = None
 
-        # Preferred: base64 one-line key (Railway-safe)
         key_b64 = os.environ.get("WG_SSH_PRIVATE_KEY_B64")
         if key_b64:
             try:
@@ -31,10 +30,9 @@ class WireGuardSSHProvider:
                 self._key_obj = asyncssh.import_private_key(key_text.strip())
                 log.info("SSH private key loaded from WG_SSH_PRIVATE_KEY_B64 (ok)")
             except Exception:
-                log.exception("Failed to load WG_SSH_PRIVATE_KEY_B64 (base64 decode/import failed)")
+                log.exception("Failed to load WG_SSH_PRIVATE_KEY_B64")
                 self._key_obj = None
 
-        # Fallback: raw multiline key (less reliable in Railway UI)
         if self._key_obj is None:
             key_text = os.environ.get("WG_SSH_PRIVATE_KEY")
             if key_text:
@@ -42,7 +40,7 @@ class WireGuardSSHProvider:
                     self._key_obj = asyncssh.import_private_key(key_text.strip())
                     log.info("SSH private key loaded from WG_SSH_PRIVATE_KEY (ok)")
                 except Exception:
-                    log.exception("Failed to import WG_SSH_PRIVATE_KEY - check formatting/newlines")
+                    log.exception("Failed to import WG_SSH_PRIVATE_KEY")
                     self._key_obj = None
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
@@ -60,9 +58,7 @@ class WireGuardSSHProvider:
             )
 
         if not self.password:
-            raise RuntimeError(
-                "No SSH auth configured: set WG_SSH_PRIVATE_KEY_B64 (preferred) or WG_SSH_PRIVATE_KEY or WG_SSH_PASSWORD"
-            )
+            raise RuntimeError("No SSH auth configured")
 
         return await asyncssh.connect(
             self.host,
@@ -72,8 +68,6 @@ class WireGuardSSHProvider:
             known_hosts=None,
             connect_timeout=self.connect_timeout,
             login_timeout=self.login_timeout,
-            keepalive_interval=15,
-            keepalive_count_max=2,
         )
 
     async def _run(self, cmd: str) -> str:
@@ -81,9 +75,10 @@ class WireGuardSSHProvider:
         for attempt in range(1, self.retries + 1):
             try:
                 async with await self._connect() as conn:
-                    res = await conn.run(cmd, check=True, timeout=self.cmd_timeout)
-                    if res.stderr:
-                        log.info("SSH stderr cmd=%s stderr=%s", cmd, res.stderr.strip())
+                    res = await conn.run(cmd, check=False, timeout=self.cmd_timeout)
+                    log.info("SSH cmd=%s exit=%s stdout=%r stderr=%r", cmd, res.exit_status, res.stdout, res.stderr)
+                    if res.exit_status != 0:
+                        raise RuntimeError(f"SSH command failed exit={res.exit_status} stderr={res.stderr!r}")
                     return res.stdout or ""
             except Exception as e:
                 last_exc = e
@@ -93,11 +88,9 @@ class WireGuardSSHProvider:
         raise last_exc
 
     async def add_peer(self, public_key: str, client_ip: str) -> None:
-        cmd = f"wg set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
-        log.info("WG add peer pub=%s ip=%s", public_key, client_ip)
-        await self._run(cmd)
+        await self._run(f"wg set {self.interface} peer {public_key} allowed-ips {client_ip}/32")
+        await self._run(f"wg show {self.interface}")
 
     async def remove_peer(self, public_key: str) -> None:
-        cmd = f"wg set {self.interface} peer {public_key} remove"
-        log.info("WG remove peer pub=%s", public_key)
-        await self._run(cmd)
+        await self._run(f"wg set {self.interface} peer {public_key} remove")
+        await self._run(f"wg show {self.interface}")
