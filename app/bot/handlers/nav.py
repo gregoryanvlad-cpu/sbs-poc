@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import datetime, timezone
+import logging
 
 import qrcode
 from aiogram import Router
@@ -17,13 +18,20 @@ from app.bot.keyboards import (
     kb_pay,
     kb_vpn,
 )
-from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
 from app.db.session import session_scope
-from app.repo import get_subscription, extend_subscription
+from app.repo import (
+    add_mock_payment,
+    days_left,
+    ensure_user,
+    fmt_dt,
+    get_subscription,
+    utcnow,
+)
 from app.services.vpn.service import vpn_service
 
 router = Router()
+log = logging.getLogger(__name__)
 
 
 # -----------------------------
@@ -65,14 +73,17 @@ async def on_nav(cb: CallbackQuery) -> None:
 
     if where == "pay":
         await cb.message.edit_text(
-            f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
+            "💳 Оплата\n\nДля MVP доступна mock-оплата.",
             reply_markup=kb_pay(),
         )
         await cb.answer()
         return
 
     if where == "vpn":
-        await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
+        await cb.message.edit_text(
+            "🔐 VPN\n\nПолучить конфиг и QR.",
+            reply_markup=kb_vpn(),
+        )
         await cb.answer()
         return
 
@@ -105,47 +116,17 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
     async with session_scope() as session:
-        sub = await get_subscription(session, tg_id)
-        now = utcnow()
-        base = sub.end_at if sub.end_at and sub.end_at > now else now
-
-        new_end = base + relativedelta(months=settings.period_months)
-
-        await extend_subscription(
-            session,
-            tg_id,
-            months=settings.period_months,
-            days_legacy=settings.period_days,
-        )
-
-        sub.end_at = new_end
-        sub.is_active = True
-        sub.status = "active"
-
+        await ensure_user(session, tg_id, cb.from_user.username)
+        await add_mock_payment(session, tg_id, days=30)
         await session.commit()
 
-    await cb.answer("Оплата успешна")
-    await cb.message.edit_text(
-        f"✅ Оплата успешна\n\nПодписка до: {fmt_dt(new_end)}",
-        reply_markup=kb_main(),
-    )
+    await cb.answer("Оплачено")
+    await cb.message.edit_text("✅ Оплата прошла (mock).", reply_markup=kb_main())
 
 
 # -----------------------------
-# VPN
+# VPN reset (confirm)
 # -----------------------------
-@router.callback_query(lambda c: c.data == "vpn:guide")
-async def on_vpn_guide(cb: CallbackQuery) -> None:
-    text = (
-        "📖 Инструкция\n\n"
-        "1) Нажми «Отправить конфиг + QR»\n"
-        "2) Импортируй в WireGuard\n"
-        f"3) Конфиг удалится через {settings.auto_delete_seconds} сек."
-    )
-    await cb.message.edit_text(text, reply_markup=kb_vpn())
-    await cb.answer()
-
-
 @router.callback_query(lambda c: c.data == "vpn:reset:confirm")
 async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
     await cb.message.edit_text(
@@ -157,17 +138,70 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:reset")
 async def on_vpn_reset(cb: CallbackQuery) -> None:
+    """
+    Manual VPN reset.
+
+    IMPORTANT: do not block Telegram callback with SSH/WG operations.
+    We answer immediately and do the heavy work in a background task.
+    """
     tg_id = cb.from_user.id
+    chat_id = cb.message.chat.id
 
-    async with session_scope() as session:
-        await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
-        await session.commit()
-
-    await cb.answer("Сброшено")
+    await cb.answer("Сбрасываю…")
     await cb.message.edit_text(
-        "♻️ VPN сброшен. Получи новый конфиг в разделе VPN.",
+        "🔄 Сбрасываю VPN и готовлю новый конфиг…\n"
+        "Это займёт несколько секунд.",
         reply_markup=kb_vpn(),
     )
+
+    async def _do_reset_and_send() -> None:
+        try:
+            async with session_scope() as session:
+                peer = await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
+                await session.commit()
+
+            conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+
+            qr_img = qrcode.make(conf_text)
+            buf = io.BytesIO()
+            qr_img.save(buf, format="PNG")
+            buf.seek(0)
+
+            conf_file = BufferedInputFile(conf_text.encode(), filename="wg.conf")
+            qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+
+            msg_conf = await cb.bot.send_document(
+                chat_id=chat_id,
+                document=conf_file,
+                caption=f"WireGuard конфиг (после сброса). Будет удалён через {settings.auto_delete_seconds} сек.",
+            )
+            msg_qr = await cb.bot.send_photo(
+                chat_id=chat_id,
+                photo=qr_file,
+                caption="QR для WireGuard (после сброса)",
+            )
+
+            async def _cleanup() -> None:
+                await asyncio.sleep(settings.auto_delete_seconds)
+                for m in (msg_conf, msg_qr):
+                    try:
+                        await cb.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
+                    except Exception:
+                        pass
+
+            asyncio.create_task(_cleanup())
+
+        except Exception:
+            log.exception("vpn_reset_failed tg_id=%s", tg_id)
+            try:
+                await cb.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Не удалось сбросить VPN из-за временной ошибки сервера. Попробуй ещё раз через минуту.",
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_do_reset_and_send())
 
 
 # -----------------------------
