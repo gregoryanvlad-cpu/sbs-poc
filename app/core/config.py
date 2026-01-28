@@ -38,6 +38,14 @@ class Settings:
     vpn_server_public_key: str = "REPLACE_ME"
     vpn_allowed_ips: str = "0.0.0.0/0, ::/0"
     vpn_dns: str = "1.1.1.1,8.8.8.8"
+    
+    # Yandex
+    yandex_enabled: bool = True
+    yandex_worker_period_seconds: int = 10
+    yandex_pending_ttl_seconds: int = 600  # 10 минут
+    yandex_reinvite_max: int = 1
+    yandex_max_strikes: int = 2
+    yandex_provider: str = "mock"  # mock | playwright (позже)
 
 
 def _load_settings() -> Settings:
@@ -59,6 +67,14 @@ def _load_settings() -> Settings:
         vpn_server_public_key=os.getenv("VPN_SERVER_PUBLIC_KEY", "REPLACE_ME").strip(),
         vpn_allowed_ips=os.getenv("VPN_ALLOWED_IPS", "0.0.0.0/0, ::/0").strip(),
         vpn_dns=os.getenv("VPN_DNS", "1.1.1.1,8.8.8.8").strip(),
+                # Yandex
+        yandex_enabled=_env_bool("YANDEX_ENABLED", True),
+        yandex_worker_period_seconds=int(os.getenv("YANDEX_WORKER_PERIOD_SECONDS", "10")),
+        yandex_pending_ttl_seconds=int(os.getenv("YANDEX_PENDING_TTL_SECONDS", "600")),
+        yandex_reinvite_max=int(os.getenv("YANDEX_REINVITE_MAX", "1")),
+        yandex_max_strikes=int(os.getenv("YANDEX_MAX_STRIKES", "2")),
+        yandex_provider=os.getenv("YANDEX_PROVIDER", "mock").strip().lower(),
+
     )
 
 
