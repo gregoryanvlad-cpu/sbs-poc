@@ -116,21 +116,22 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 
         await session.commit()
 
-    await cb.answer("Оплата успешна")
-    async with session_scope() as session:
-        user = await session.get(User, tg_id)
-        if user:
-            user.flow_state = "await_yandex_login"
-            user.flow_data = None
-            await session.commit()
+await cb.answer("Оплата успешна")
 
-    await cb.message.edit_text(
-        "✅ Оплата успешна
+async with session_scope() as session:
+    user = await session.get(User, tg_id)
+    if user:
+        user.flow_state = "await_yandex_login"
+        user.flow_data = None
+        await session.commit()
 
-"
-        "🟡 Введите логин Яндекса (как в профиле):",
-        reply_markup=kb_back_home(),
-    )
+await message.answer(
+    "✅ Оплата успешна\n"
+    "📦 Подписка активирована\n"
+    "⏳ Действует до ...\n\n"
+    "🟡 Введите логин Яндекса (как в профиле):",
+    reply_markup=kb_back_home(),
+)
 
 
 @router.callback_query(lambda c: c.data == "vpn:guide")
