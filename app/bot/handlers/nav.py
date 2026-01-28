@@ -20,6 +20,7 @@ from app.bot.keyboards import (
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
 from app.db.session import session_scope
+from app.db.models.user import User
 from app.repo import get_subscription, extend_subscription
 from app.services.vpn.service import vpn_service
 
@@ -116,9 +117,19 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         await session.commit()
 
     await cb.answer("Оплата успешна")
+    async with session_scope() as session:
+        user = await session.get(User, tg_id)
+        if user:
+            user.flow_state = "await_yandex_login"
+            user.flow_data = None
+            await session.commit()
+
     await cb.message.edit_text(
-        f"✅ Оплата успешна\n\nПодписка до: {fmt_dt(new_end)}",
-        reply_markup=kb_main(),
+        "✅ Оплата успешна
+
+"
+        "🟡 Введите логин Яндекса (как в профиле):",
+        reply_markup=kb_back_home(),
     )
 
 
