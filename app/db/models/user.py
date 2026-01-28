@@ -13,7 +13,6 @@ class User(Base):
 
     tg_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
-    # состояние флоу (например: await_yandex_login)
     flow_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     flow_data: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -22,4 +21,3 @@ class User(Base):
         server_default=func.now(),
         nullable=False,
     )
-    status: Mapped[str] = mapped_column(String(16), server_default="active", nullable=False)
