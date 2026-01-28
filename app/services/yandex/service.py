@@ -1,90 +1,87 @@
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from datetime import timedelta
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.db.models import Subscription
+from app.db.models.yandex_membership import YandexMembership
 from app.services.yandex.provider import MockYandexProvider
 from app.services.yandex.repo import pick_account
-from app.db.models.yandex_membership import YandexMembership
-from app.core.config import settings
-from app.utils.time import utcnow
+from app.repo import utcnow
 
 
+@dataclass
 class EnsureResult:
-    def __init__(self, status: str, message: str, invite_link: str | None = None):
-        self.status = status
-        self.message = message
-        self.invite_link = invite_link
+    status: str
+    message: str
+    invite_link: str | None = None
 
 
 class YandexService:
-    def __init__(self):
+    def __init__(self) -> None:
         self.provider = MockYandexProvider()
 
-    async def ensure_membership_after_payment(self, session, tg_id: int, yandex_login: str) -> EnsureResult:
-        """
-        Вызывается после успешной оплаты (или продления).
-        НЕ выдаёт новую ссылку, если пользователь уже active/scheduled_switch.
-        """
-        # получаем подписку пользователя
-        sub = await session.get_subscription(tg_id)
+    async def ensure_membership_after_payment(self, session: AsyncSession, tg_id: int, yandex_login: str) -> EnsureResult:
+        # subscription must exist
+        sub = await session.get(Subscription, tg_id)
         if not sub or not sub.end_at:
-            return EnsureResult("error", "Подписка не активна.")
+            return EnsureResult(status="error", message="Подписка не активна.")
 
-        # ищем существующий membership
-        q = await session.execute(
-            YandexMembership.__table__
-            .select()
-            .where(YandexMembership.tg_id == tg_id)
-            .order_by(YandexMembership.id.desc())
-            .limit(1)
-        )
-        membership = q.fetchone()
+        # last membership (if any)
+        q = select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
+        res = await session.execute(q)
+        m = res.scalar_one_or_none()
+
+        # If user already active or scheduled_switch: do NOT issue new invite on renewal.
+        if m and m.status in ("active", "scheduled_switch"):
+            # coverage_end_at should represent promised coverage for user; keep it at least subscriptions.end_at
+            if not m.coverage_end_at or m.coverage_end_at < sub.end_at:
+                m.coverage_end_at = sub.end_at
+            await session.flush()
+            return EnsureResult(status=m.status, message="Продление учтено. Новая ссылка будет выдана при необходимости.")
+
+        # If pending exists, keep existing link
+        if m and m.status == "pending" and m.invite_link:
+            return EnsureResult(status="pending", message="У вас уже есть активное приглашение.", invite_link=m.invite_link)
+
+        # Create new pending if we have an account that covers full period
+        acc = await pick_account(session, need_cover_until=sub.end_at)
+        if not acc:
+            # No suitable accounts right now; user will wait
+            nm = YandexMembership(
+                tg_id=tg_id,
+                yandex_account_id=None,
+                yandex_login=yandex_login,
+                status="waiting_for_account",
+                coverage_end_at=sub.end_at,
+            )
+            session.add(nm)
+            await session.flush()
+            return EnsureResult(status="waiting_for_account", message="Сейчас нет подходящих аккаунтов Яндекс. Приглашение будет выдано автоматически.")
+
+        link = await self.provider.create_invite_link(credentials_ref=acc.credentials_ref)
         now = utcnow()
 
-        # если уже активен — ничего не делаем
-        if membership and membership.status in ("active", "scheduled_switch"):
-            return EnsureResult(
-                membership.status,
-                "Продление учтено. Новая ссылка будет выдана при необходимости.",
-            )
-
-        # если уже есть pending
-        if membership and membership.status == "pending":
-            return EnsureResult(
-                "pending",
-                "У вас уже есть активное приглашение.",
-                membership.invite_link,
-            )
-
-        # подбираем аккаунт Яндекса, который покрывает весь период
-        account = await pick_account(session, need_cover_until=sub.end_at)
-        if not account:
-            return EnsureResult(
-                "waiting",
-                "Сейчас нет доступных аккаунтов Яндекс. Приглашение будет выдано автоматически.",
-            )
-
-        invite_link = await self.provider.create_invite_link(
-            credentials_ref=account.credentials_ref
-        )
-
-        membership = YandexMembership(
+        nm = YandexMembership(
             tg_id=tg_id,
-            yandex_account_id=account.id,
+            yandex_account_id=acc.id,
             yandex_login=yandex_login,
             status="pending",
-            invite_link=invite_link,
+            invite_link=link,
             invite_issued_at=now,
             invite_expires_at=now + timedelta(seconds=settings.yandex_pending_ttl_seconds),
+            reinvite_used=0,
             coverage_end_at=sub.end_at,
         )
-
-        session.add(membership)
-        account.used_slots += 1
-
-        return EnsureResult(
-            "pending",
-            "Приглашение готово.",
-            invite_link,
-        )
+        session.add(nm)
+        acc.used_slots = (acc.used_slots or 0) + 1
+        await session.flush()
+        return EnsureResult(status="pending", message="Приглашение готово.", invite_link=link)
 
 
 yandex_service = YandexService()
