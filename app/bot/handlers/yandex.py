@@ -37,11 +37,10 @@ async def yandex_login_input(message: Message):
             await message.answer("❌ Подписка не активна.", reply_markup=kb_main())
             return
 
-        # удалить картинку-подсказку
+        # удалить временные сообщения
         try:
             data = json.loads(user.flow_data or "{}")
-            msg_id = data.get("hint_msg_id")
-            if msg_id:
+            for msg_id in data.get("hint_msg_ids", []):
                 try:
                     await message.bot.delete_message(message.chat.id, msg_id)
                 except Exception:
@@ -49,7 +48,6 @@ async def yandex_login_input(message: Message):
         except Exception:
             pass
 
-        # Переходим на подтверждение
         user.flow_state = "await_yandex_login_confirm"
         user.flow_data = json.dumps({"login": login})
         await session.commit()
@@ -77,7 +75,7 @@ async def yandex_login_confirm(cb: CallbackQuery):
             user.flow_state = "await_yandex_login"
             user.flow_data = None
             await session.commit()
-            await cb.message.edit_text("Ок. Введите логин ещё раз сообщением ниже.")
+            await cb.message.edit_text("Введите логин ещё раз сообщением ниже.")
             await cb.answer()
             return
 
@@ -93,7 +91,6 @@ async def yandex_login_confirm(cb: CallbackQuery):
             await cb.message.answer("Главное меню:", reply_markup=kb_main())
             return
 
-        # ВАЖНО: логин фиксируем НЕ в User, а в yandex_memberships внутри сервиса
         user.flow_state = None
         user.flow_data = None
 
@@ -109,9 +106,9 @@ async def yandex_login_confirm(cb: CallbackQuery):
 
     if getattr(res, "invite_link", None):
         await cb.message.answer(
-            "🟡 *Yandex Plus*\n\nПриглашение готово 👇\n"
-            f"{res.invite_link}\n\n"
-            "⚠️ Ссылка ограничена по времени.",
+            "🟡 *Yandex Plus*\n\n"
+            "Приглашение готово 👇\n"
+            f"{res.invite_link}",
             parse_mode="Markdown",
         )
     else:
