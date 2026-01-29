@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.bot.handlers.start import router as start_router
 from app.bot.handlers.nav import router as nav_router
 from app.bot.handlers.yandex import router as yandex_router
-from app.bot.handlers.admin import router as admin_router
+from app.bot.admin import router as admin_router
 from app.bot.middlewares import CorrelationIdMiddleware, RateLimitMiddleware
 
 log = logging.getLogger(__name__)
