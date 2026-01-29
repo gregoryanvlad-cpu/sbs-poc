@@ -1,11 +1,10 @@
 import json
 
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
 from app.bot.keyboards import kb_main
-from app.core.config import settings
 from app.db.models.user import User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
@@ -25,7 +24,12 @@ async def yandex_login_input(message: Message):
             return
 
         # если логин уже зафиксирован — не даём менять
-        q = select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
+        q = (
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
         res = await session.execute(q)
         ym = res.scalar_one_or_none()
         if ym and ym.yandex_login:
@@ -60,7 +64,8 @@ async def yandex_login_input(message: Message):
         )
         await session.commit()
 
-    if res.invite_link:
+    # ✅ УСПЕХ: даём кнопку-ссылку и меню в одном сообщении
+    if getattr(res, "invite_link", None):
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔗 Открыть приглашение", url=res.invite_link)],
@@ -73,34 +78,7 @@ async def yandex_login_input(message: Message):
             reply_markup=kb,
             parse_mode="Markdown",
         )
-    else:
-        await message.answer(res.message, reply_markup=kb_main())
+        return
 
-    await message.answer("Главное меню:", reply_markup=kb_main())
-
-
-@router.callback_query(lambda c: c.data == "yandex:reinvite")
-async def yandex_reinvite(cb: CallbackQuery):
-    tg_id = cb.from_user.id
-
-    async with session_scope() as session:
-        res = await yandex_service.reinvite(session, tg_id)
-        await session.commit()
-
-    if res.invite_link:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔗 Открыть приглашение", url=res.invite_link)],
-                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-            ]
-        )
-        await cb.message.edit_text(
-            "🟡 *Yandex Plus*\n\n"
-            "Новое приглашение готово 👇",
-            reply_markup=kb,
-            parse_mode="Markdown",
-        )
-    else:
-        await cb.answer(res.message, show_alert=True)
-
-    await cb.answer()
+    # ✅ ОШИБКА: одно сообщение (без второго “Главное меню”)
+    await message.answer(getattr(res, "message", "⚠️ Не удалось выдать приглашение."), reply_markup=kb_main())
