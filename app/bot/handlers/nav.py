@@ -56,22 +56,17 @@ async def _get_yandex_membership(session, tg_id: int) -> YandexMembership | None
     return res.scalar_one_or_none()
 
 
-async def _cleanup_flow_messages(cb: CallbackQuery) -> None:
-    """
-    Удаляем временные сообщения (картинка/промпт) которые мы отправляем в flow ввода логина.
-    Вызываем при nav:home и при успешном вводе логина в yandex.py (там отдельно).
-    """
+async def _cleanup_flow_messages_for_user(bot, chat_id: int, tg_id: int) -> None:
     async with session_scope() as session:
-        user = await session.get(User, cb.from_user.id)
+        user = await session.get(User, tg_id)
         if not user or not user.flow_data:
             return
 
         try:
             data = json.loads(user.flow_data)
-            msg_ids = data.get("hint_msg_ids", [])
-            for msg_id in msg_ids:
+            for msg_id in data.get("hint_msg_ids", []):
                 try:
-                    await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=msg_id)
+                    await bot.delete_message(chat_id, msg_id)
                 except Exception:
                     pass
         except Exception:
@@ -86,14 +81,12 @@ async def _cleanup_flow_messages(cb: CallbackQuery) -> None:
 async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
 
-    # ---------------- HOME ----------------
     if where == "home":
-        await _cleanup_flow_messages(cb)
+        await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
         await cb.answer()
         return
 
-    # ---------------- CABINET ----------------
     if where == "cabinet":
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
@@ -115,27 +108,25 @@ async def on_nav(cb: CallbackQuery) -> None:
         pay_text = "\n".join(pay_lines) if pay_lines else "• оплат пока нет"
 
         text = (
-            "👤 *Личный кабинет*\n\n"
-            f"🆔 ID: `{cb.from_user.id}`\n\n"
+            "👤 <b>Личный кабинет</b>\n\n"
+            f"🆔 ID: <code>{cb.from_user.id}</code>\n\n"
             f"💳 Подписка: {'активна ✅' if _is_sub_active(sub.end_at) else 'не активна ❌'}\n"
             f"📅 До: {fmt_dt(sub.end_at)}\n"
             f"⏳ Осталось: {days_left(sub.end_at)} дн.\n\n"
-            "🟡 *Yandex Plus*\n"
-            f"— Статус: *{y_status}*\n"
-            f"— Логин: `{y_login}`\n\n"
-            "🧾 *Последние оплаты*\n"
+            "🟡 <b>Yandex Plus</b>\n"
+            f"— Статус: <b>{y_status}</b>\n"
+            f"— Логин: <code>{y_login}</code>\n\n"
+            "🧾 <b>Последние оплаты</b>\n"
             f"{pay_text}"
         )
-
         await cb.message.edit_text(
             text,
             reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         await cb.answer()
         return
 
-    # ---------------- PAY ----------------
     if where == "pay":
         await cb.message.edit_text(
             f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
@@ -144,15 +135,12 @@ async def on_nav(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
-    # ---------------- VPN ----------------
     if where == "vpn":
         await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
         await cb.answer()
         return
 
-    # ---------------- YANDEX ----------------
     if where == "yandex":
-        # 1) доступ только при активной подписке
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
@@ -161,25 +149,23 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        # 2) если логин уже сохранён — не даём менять
+        # если уже подтверждён логин — показываем экран статуса (без возможности изменить)
         if ym and ym.yandex_login:
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-                ]
+                inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
             )
             await cb.message.edit_text(
-                "🟡 *Yandex Plus*\n\n"
-                f"Ваш логин: `{ym.yandex_login}`\n"
-                f"Статус: *{ym.status}*\n\n"
+                "🟡 <b>Yandex Plus</b>\n\n"
+                f"Ваш логин: <code>{ym.yandex_login}</code>\n"
+                f"Статус: <b>{ym.status}</b>\n\n"
                 "Логин подтверждён и не может быть изменён.",
                 reply_markup=kb,
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             await cb.answer()
             return
 
-        # 3) ставим флоу ожидания логина
+        # переходим в режим ожидания логина
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
             if user:
@@ -187,7 +173,6 @@ async def on_nav(cb: CallbackQuery) -> None:
                 user.flow_data = None
                 await session.commit()
 
-        # 4) основной экран Yandex Plus (это сообщение “останется”, его редактируем)
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
@@ -196,15 +181,14 @@ async def on_nav(cb: CallbackQuery) -> None:
         )
 
         await cb.message.edit_text(
-            "🟡 *Yandex Plus*\n\n"
-            "Введите ваш логин *Yandex ID*.\n"
+            "🟡 <b>Yandex Plus</b>\n\n"
+            "Введите ваш логин Yandex ID.\n"
             "⚠️ После подтверждения изменить логин нельзя.",
             reply_markup=kb,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         await cb.answer()
 
-        # 5) картинка + промпт (сохраняем message_id, чтобы удалять при nav:home и при вводе логина)
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
         hint_msg = await cb.message.answer_photo(photo=photo)
         prompt_msg = await cb.message.answer("👇 Введите логин сообщением ниже")
@@ -217,7 +201,6 @@ async def on_nav(cb: CallbackQuery) -> None:
 
         return
 
-    # ---------------- FAQ ----------------
     if where == "faq":
         text = (
             "❓ FAQ\n\n"
@@ -228,7 +211,6 @@ async def on_nav(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
-    # ---------------- SUPPORT ----------------
     if where == "support":
         await cb.message.edit_text(
             "🛠 Поддержка\n\nНапиши сюда: @support (заглушка)",
@@ -240,7 +222,6 @@ async def on_nav(cb: CallbackQuery) -> None:
     await cb.answer("Неизвестный раздел")
 
 
-# ---------------- MOCK PAY ----------------
 @router.callback_query(lambda c: c.data and c.data.startswith("pay:mock"))
 async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
@@ -265,25 +246,22 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 
     await cb.answer("Оплата успешна")
 
-    # редактируем текущее сообщение оплаты (чтобы кнопка не висела)
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
     )
 
     await cb.message.edit_text(
-        "✅ *Оплата прошла успешно!*\n\n"
+        "✅ <b>Оплата прошла успешно!</b>\n\n"
         "Для подключения перейдите в разделы:\n"
-        "— 🟡 *Yandex Plus*\n"
-        "— 🌍 *VPN*\n\n"
+        "— 🟡 <b>Yandex Plus</b>\n"
+        "— 🌍 <b>VPN</b>\n\n"
         "Спасибо, что выбрали наш сервис 💛",
         reply_markup=kb,
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
+    return
 
 
-# ---------------- VPN ----------------
 @router.callback_query(lambda c: c.data == "vpn:guide")
 async def on_vpn_guide(cb: CallbackQuery) -> None:
     text = (
