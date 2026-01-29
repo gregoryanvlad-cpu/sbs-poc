@@ -5,8 +5,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def kb_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
+    b.button(text="🟡 Yandex Plus", callback_data="nav:yandex")
     b.button(text="🌍 VPN", callback_data="nav:vpn")
-    b.button(text="🟡 Yandex Plus", callback_data="nav:yandex") 
     b.button(text="💳 Оплата", callback_data="nav:pay")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
@@ -16,7 +16,7 @@ def kb_main() -> InlineKeyboardMarkup:
 
 def kb_back_home() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.button(text="⬅️ В меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
 
@@ -24,6 +24,7 @@ def kb_back_home() -> InlineKeyboardMarkup:
 def kb_cabinet() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
+    b.button(text="⚖️ Правовая информация", callback_data="nav:legal")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
@@ -51,5 +52,21 @@ def kb_confirm_reset() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, сбросить", callback_data="vpn:reset")
     b.button(text="⬅️ Назад", callback_data="nav:vpn")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_yandex_login_confirm() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, подтвердить", callback_data="yandex:login:confirm")
+    b.button(text="✏️ Ввести заново", callback_data="yandex:login:retry")
+    b.button(text="⬅️ В меню", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_legal() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="nav:cabinet")
     b.adjust(1)
     return b.as_markup()
