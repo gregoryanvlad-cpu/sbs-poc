@@ -71,6 +71,44 @@ async def on_nav(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
+        if where == "yandex":
+        # 1) проверяем активную подписку
+        async with session_scope() as session:
+            sub = await get_subscription(session, cb.from_user.id)
+
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Подписка не активна. Оплатите доступ в разделе «Оплата».", show_alert=True)
+            return
+
+        # 2) ставим ожидание логина
+        async with session_scope() as session:
+            user = await session.get(User, cb.from_user.id)
+            if user:
+                user.flow_state = "await_yandex_login"
+                user.flow_data = None
+                await session.commit()
+
+        # 3) сообщение + кнопки
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:home")],
+        ])
+
+        await cb.message.edit_text(
+            "🟡 Yandex Plus\n\n"
+            "Введите ваш логин Yandex ID.\n"
+            "После подтверждения изменить нельзя.",
+            reply_markup=kb,
+        )
+        await cb.answer()
+
+        # 4) картинка-подсказка
+        from aiogram.types import FSInputFile
+        photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
+        await cb.message.answer_photo(photo=photo)
+        return
+
     if where == "faq":
         text = (
             "❓ FAQ\n\n"
