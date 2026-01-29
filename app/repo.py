@@ -17,25 +17,23 @@ def utcnow() -> datetime:
 
 async def ensure_user(session: AsyncSession, tg_id: int) -> User:
     """
-    Ensures User row exists and also ensures an empty Subscription row exists.
+    Ensures User exists and also ensures Subscription exists.
 
     IMPORTANT:
-    Subscription.tg_id has FK -> users.tg_id, so we MUST insert User first.
-    Also, we must flush ONLY the User object, not the whole session, to avoid
-    SQLAlchemy flushing Subscription before User in some situations.
+    Subscription.tg_id has FK -> users.tg_id
+    So we MUST flush User first, then create Subscription.
     """
     user = await session.get(User, tg_id)
     if not user:
         user = User(tg_id=tg_id)
         session.add(user)
-        # flush ONLY user to guarantee it exists before any FK inserts
-        await session.flush([user])
+        await session.flush()  # ✅ user row exists now
 
     sub = await session.get(Subscription, tg_id)
     if not sub:
         sub = Subscription(tg_id=tg_id)
         session.add(sub)
-        await session.flush([sub])
+        await session.flush()
 
     return user
 
@@ -43,33 +41,29 @@ async def ensure_user(session: AsyncSession, tg_id: int) -> User:
 async def get_subscription(session: AsyncSession, tg_id: int) -> Subscription:
     sub = await session.get(Subscription, tg_id)
     if not sub:
-        # Ensure user+subscription exist in correct order
         await ensure_user(session, tg_id)
         sub = await session.get(Subscription, tg_id)
-
-    # ultra-defensive fallback (should never happen)
-    if not sub:
-        sub = Subscription(tg_id=tg_id)
-        session.add(sub)
-        await session.flush([sub])
-
+        if not sub:
+            sub = Subscription(tg_id=tg_id)
+            session.add(sub)
+            await session.flush()
     return sub
 
 
 async def extend_subscription(session: AsyncSession, tg_id: int, *, months: int, days_legacy: int) -> Subscription:
-    """Extends subscription end_at by calendar months.
-    Caller is responsible for computing end_at and setting sub.end_at.
+    """
+    Marks subscription active and writes Payment row.
+    Caller is responsible for calculating and setting sub.end_at.
     """
     await ensure_user(session, tg_id)
 
     sub = await get_subscription(session, tg_id)
     sub.is_active = True
     sub.status = "active"
-
     if not sub.start_at:
         sub.start_at = utcnow()
 
-    await session.flush([sub])
+    await session.flush()
 
     payment = Payment(
         tg_id=tg_id,
@@ -81,8 +75,7 @@ async def extend_subscription(session: AsyncSession, tg_id: int, *, months: int,
         period_months=months,
     )
     session.add(payment)
-    await session.flush([payment])
-
+    await session.flush()
     return sub
 
 
@@ -120,4 +113,4 @@ async def set_subscription_expired(session: AsyncSession, tg_id: int) -> None:
     sub = await get_subscription(session, tg_id)
     sub.is_active = False
     sub.status = "expired"
-    await session.flush([sub])
+    await session.flush()
