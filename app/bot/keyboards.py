@@ -16,15 +16,16 @@ def kb_main() -> InlineKeyboardMarkup:
 
 def kb_back_home() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="⬅️ В меню", callback_data="nav:home")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
 
 
-def kb_cabinet() -> InlineKeyboardMarkup:
+def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
-    b.button(text="⚖️ Правовая информация", callback_data="nav:legal")
+    if is_owner:
+        b.button(text="🛠 Админка", callback_data="admin:menu")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
@@ -56,17 +57,10 @@ def kb_confirm_reset() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_yandex_login_confirm() -> InlineKeyboardMarkup:
+def kb_admin_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Да, подтвердить", callback_data="yandex:login:confirm")
-    b.button(text="✏️ Ввести заново", callback_data="yandex:login:retry")
-    b.button(text="⬅️ В меню", callback_data="nav:home")
-    b.adjust(1)
-    return b.as_markup()
-
-
-def kb_legal() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Назад", callback_data="nav:cabinet")
+    b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
+    b.button(text="📋 Список аккаунтов", callback_data="admin:yandex:list")
+    b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
