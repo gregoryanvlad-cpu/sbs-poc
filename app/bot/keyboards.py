@@ -6,6 +6,7 @@ def kb_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
     b.button(text="🌍 VPN", callback_data="nav:vpn")
+    b.button(text="🟡 Yandex Plus", callback_data="nav:yandex") 
     b.button(text="💳 Оплата", callback_data="nav:pay")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
