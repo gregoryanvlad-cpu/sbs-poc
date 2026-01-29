@@ -2,13 +2,12 @@ import json
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
 
 from app.bot.keyboards import kb_main, kb_yandex_login_confirm
+from app.bot.ui import utcnow
 from app.db.models import Subscription, User
 from app.db.session import session_scope
 from app.services.yandex.service import yandex_service
-from app.bot.ui import utcnow
 
 router = Router()
 
@@ -16,10 +15,7 @@ router = Router()
 def _is_sub_active(sub_end_at):
     if not sub_end_at:
         return False
-    try:
-        return sub_end_at > utcnow()
-    except Exception:
-        return False
+    return sub_end_at > utcnow()
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -29,43 +25,33 @@ async def yandex_login_input(message: Message):
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
+        sub = await session.get(Subscription, tg_id)
+
         if not user or user.flow_state != "await_yandex_login":
             return
 
-        # защита: если подписка не активна — не принимаем логин
-        sub = await session.get(Subscription, tg_id)
         if not sub or not _is_sub_active(sub.end_at):
             user.flow_state = None
             user.flow_data = None
             await session.commit()
-            await message.answer(
-                "❌ Подписка не активна.\n\nОплатите доступ в разделе «Оплата».",
-                reply_markup=kb_main(),
-            )
+            await message.answer("❌ Подписка не активна.", reply_markup=kb_main())
             return
 
-        # удаляем картинку-подсказку, если она была
+        # удаляем картинку
         try:
-            if user.flow_data:
-                data = json.loads(user.flow_data)
-                msg_id = data.get("yandex_hint_msg_id")
-                if msg_id:
-                    try:
-                        await message.bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
-                    except Exception:
-                        pass
+            data = json.loads(user.flow_data or "{}")
+            msg_id = data.get("hint_msg_id")
+            if msg_id:
+                await message.bot.delete_message(message.chat.id, msg_id)
         except Exception:
             pass
 
-        # сохраняем введённый логин во временное состояние (для подтверждения)
         user.flow_state = "await_yandex_login_confirm"
-        user.flow_data = json.dumps({"pending_yandex_login": login})
+        user.flow_data = json.dumps({"login": login})
         await session.commit()
 
     await message.answer(
-        "🟡 *Yandex Plus*\n\n"
-        f"Вы ввели логин: `{login}`\n\n"
-        "Подтверждаете?",
+        f"🟡 *Yandex Plus*\n\nВы ввели логин: `{login}`\n\nПодтверждаете?",
         reply_markup=kb_yandex_login_confirm(),
         parse_mode="Markdown",
     )
@@ -74,63 +60,39 @@ async def yandex_login_input(message: Message):
 @router.callback_query(lambda c: c.data in ("yandex:login:confirm", "yandex:login:retry"))
 async def yandex_login_confirm(cb: CallbackQuery):
     tg_id = cb.from_user.id
-    action = cb.data
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
-        if not user or user.flow_state not in ("await_yandex_login_confirm", "await_yandex_login"):
-            await cb.answer("Нет активного шага.", show_alert=True)
-            return
-
-        # retry: снова ждём ввод логина
-        if action == "yandex:login:retry":
-            user.flow_state = "await_yandex_login"
-            # flow_data очищаем, чтобы не мешало
-            user.flow_data = None
-            await session.commit()
-            await cb.message.edit_text(
-                "🟡 *Yandex Plus*\n\n"
-                "Ок. Введите логин *Yandex ID* ещё раз сообщением ниже.",
-                parse_mode="Markdown",
-            )
-            await cb.answer()
-            return
-
-        # confirm: достаем pending login
-        try:
-            data = json.loads(user.flow_data or "{}")
-            login = data.get("pending_yandex_login")
-        except Exception:
-            login = None
-
-        if not login:
-            user.flow_state = "await_yandex_login"
-            user.flow_data = None
-            await session.commit()
-            await cb.message.edit_text("⚠️ Не удалось прочитать логин. Введите его ещё раз.")
-            await cb.answer()
-            return
-
-        # проверяем подписку ещё раз
         sub = await session.get(Subscription, tg_id)
-        if not sub or not _is_sub_active(sub.end_at):
+
+        if not user or user.flow_state != "await_yandex_login_confirm":
+            await cb.answer()
+            return
+
+        if cb.data == "yandex:login:retry":
+            user.flow_state = "await_yandex_login"
+            user.flow_data = None
+            await session.commit()
+            await cb.message.edit_text("Введите логин ещё раз:")
+            await cb.answer()
+            return
+
+        data = json.loads(user.flow_data or "{}")
+        login = data.get("login")
+
+        if not login or not sub or not _is_sub_active(sub.end_at):
             user.flow_state = None
             user.flow_data = None
             await session.commit()
-            await cb.message.edit_text("❌ Подписка не активна. Оплатите доступ в разделе «Оплата».")
+            await cb.message.edit_text("❌ Ошибка. Попробуйте снова.")
             await cb.answer()
-            await cb.message.answer("Главное меню:", reply_markup=kb_main())
             return
 
-        # фиксируем логин (теперь он окончательный для пользователя)
-        # (если в модели User есть поле yandex_login — запишем. Если нет — пропустим.)
-        if hasattr(user, "yandex_login"):
-            setattr(user, "yandex_login", login)
-
+        # 🔒 ФИКСИРУЕМ ЛОГИН НАВСЕГДА
+        user.yandex_login = login
         user.flow_state = None
         user.flow_data = None
 
-        # запускаем бизнес-логику выдачи инвайта/создания membership
         res = await yandex_service.ensure_membership_after_payment(
             session=session,
             tg_id=tg_id,
@@ -138,26 +100,15 @@ async def yandex_login_confirm(cb: CallbackQuery):
         )
         await session.commit()
 
-    # UI: сначала подтверждение, затем результат, затем меню
-    try:
-        await cb.message.edit_text(
-            f"✅ Логин подтверждён: `{login}`",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
-
+    await cb.message.edit_text(f"✅ Логин подтверждён: `{login}`", parse_mode="Markdown")
     await cb.answer()
 
-    if getattr(res, "invite_link", None):
+    if res.invite_link:
         await cb.message.answer(
-            "🟡 *Yandex Plus*\n\n"
-            "Приглашение готово 👇\n"
-            f"{res.invite_link}\n\n"
-            "⚠️ Ссылка ограничена по времени.",
+            f"🟡 *Yandex Plus*\n\nПриглашение:\n{res.invite_link}",
             parse_mode="Markdown",
         )
     else:
-        await cb.message.answer(getattr(res, "message", "⚠️ Не удалось выдать приглашение."))
+        await cb.message.answer(res.message)
 
     await cb.message.answer("Главное меню:", reply_markup=kb_main())
