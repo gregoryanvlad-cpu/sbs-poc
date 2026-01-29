@@ -76,9 +76,7 @@ async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
 
     if where == "home":
-        # 🧹 чистим временные сообщения флоу (если были)
         await _cleanup_flow_messages(cb)
-
         await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
         await cb.answer()
         return
@@ -88,7 +86,6 @@ async def on_nav(cb: CallbackQuery) -> None:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
 
-            # последние 5 оплат
             q = (
                 select(Payment)
                 .where(Payment.tg_id == cb.from_user.id)
@@ -101,10 +98,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         y_status = ym.status if ym else "не подключено"
         y_login = ym.yandex_login if ym else "—"
 
-        pay_lines = []
-        for p in payments:
-            pay_lines.append(f"• {p.amount} {p.currency} / {p.provider} / {p.status}")
-
+        pay_lines = [f"• {p.amount} {p.currency} / {p.provider} / {p.status}" for p in payments]
         pay_text = "\n".join(pay_lines) if pay_lines else "• оплат пока нет"
 
         text = (
@@ -137,7 +131,6 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "yandex":
-        # доступ только при активной подписке
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
@@ -146,11 +139,10 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        # ✅ если логин уже есть — НЕ даём менять
         if ym and ym.yandex_login:
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:home")],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
                 ]
             )
             await cb.message.edit_text(
@@ -164,7 +156,6 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer()
             return
 
-        # ставим ожидание логина
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
             if user:
@@ -175,7 +166,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
-                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:home")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
             ]
         )
 
@@ -188,7 +179,6 @@ async def on_nav(cb: CallbackQuery) -> None:
         )
         await cb.answer()
 
-        # картинка + подсказка (и сохраняем msg_id чтобы удалить)
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
         hint_msg = await cb.message.answer_photo(photo=photo)
         prompt_msg = await cb.message.answer("👇 Введите логин сообщением ниже")
@@ -230,6 +220,7 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub = await get_subscription(session, tg_id)
         now = utcnow()
         base = sub.end_at if sub.end_at and sub.end_at > now else now
+
         new_end = base + relativedelta(months=settings.period_months)
 
         await extend_subscription(
@@ -246,15 +237,23 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 
     await cb.answer("Оплата успешна")
 
-    await cb.message.answer(
+    # ✅ ВАЖНО: редактируем текущее сообщение оплаты, чтобы кнопка оплаты больше не висела
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+    await cb.message.edit_text(
         "✅ *Оплата прошла успешно!*\n\n"
         "Для подключения перейдите в разделы:\n"
         "— 🟡 *Yandex Plus*\n"
         "— 🌍 *VPN*\n\n"
         "Спасибо, что выбрали наш сервис 💛",
-        reply_markup=kb_back_home(),
+        reply_markup=kb,
         parse_mode="Markdown",
     )
+    return
 
 
 @router.callback_query(lambda c: c.data == "vpn:guide")
