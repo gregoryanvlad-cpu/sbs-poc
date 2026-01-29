@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from aiogram import Router, F
@@ -11,6 +12,8 @@ from app.db.session import session_scope
 from app.services.yandex.service import yandex_service
 
 router = Router()
+
+ERROR_AUTO_DELETE_SECONDS = 30
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -64,7 +67,7 @@ async def yandex_login_input(message: Message):
         )
         await session.commit()
 
-    # ✅ УСПЕХ: даём кнопку-ссылку и меню в одном сообщении
+    # ✅ УСПЕХ: ссылка + кнопка "Главное меню" (инлайн)
     if getattr(res, "invite_link", None):
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -80,5 +83,17 @@ async def yandex_login_input(message: Message):
         )
         return
 
-    # ✅ ОШИБКА: одно сообщение (без второго “Главное меню”)
-    await message.answer(getattr(res, "message", "⚠️ Не удалось выдать приглашение."), reply_markup=kb_main())
+    # ✅ ОШИБКА: одно сообщение + меню, и авто-удаление через 30 сек
+    err_msg = await message.answer(
+        getattr(res, "message", "⚠️ Не удалось выдать приглашение."),
+        reply_markup=kb_main(),
+    )
+
+    async def _auto_delete():
+        await asyncio.sleep(ERROR_AUTO_DELETE_SECONDS)
+        try:
+            await message.bot.delete_message(chat_id=err_msg.chat.id, message_id=err_msg.message_id)
+        except Exception:
+            pass
+
+    asyncio.create_task(_auto_delete())
