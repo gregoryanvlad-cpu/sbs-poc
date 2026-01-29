@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 from dateutil.relativedelta import relativedelta
+from sqlalchemy import select
 
 from app.bot.keyboards import (
     kb_back_home,
@@ -26,7 +27,8 @@ from app.bot.keyboards import (
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
-from app.db.models import User
+from app.db.models import Payment, User
+from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription
 from app.services.vpn.service import vpn_service
@@ -42,50 +44,40 @@ def _is_sub_active(sub_end_at: datetime | None) -> bool:
     return sub_end_at > utcnow()
 
 
-async def _get_yandex_membership_safe(session, tg_id: int):
-    for mod_path, cls_name in (
-        ("app.db.models", "YandexMembership"),
-        ("app.db.models.yandex_membership", "YandexMembership"),
-        ("app.db.models.yandex", "YandexMembership"),
-    ):
+async def _get_yandex_membership(session, tg_id: int) -> YandexMembership | None:
+    q = select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
+    res = await session.execute(q)
+    return res.scalar_one_or_none()
+
+
+async def _cleanup_flow_messages(cb: CallbackQuery) -> None:
+    async with session_scope() as session:
+        user = await session.get(User, cb.from_user.id)
+        if not user or not user.flow_data:
+            return
+
         try:
-            module = __import__(mod_path, fromlist=[cls_name])
-            YM = getattr(module, cls_name)
-            col = getattr(YM, "user_id", None) or getattr(YM, "tg_id", None)
-            if not col:
-                continue
-            q = YM.__table__.select().where(col == tg_id).order_by(YM.id.desc()).limit(1)
-            res = await session.execute(q)
-            row = res.first()
-            return row[0] if row else None
+            data = json.loads(user.flow_data)
+            for msg_id in data.get("hint_msg_ids", []):
+                try:
+                    await cb.bot.delete_message(cb.message.chat.id, msg_id)
+                except Exception:
+                    pass
         except Exception:
-            continue
-    return None
+            pass
+
+        user.flow_state = None
+        user.flow_data = None
+        await session.commit()
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("nav:"))
 async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
 
-    # =========================
-    # 🧹 ГЛАВНОЕ МЕНЮ (очистка)
-    # =========================
     if where == "home":
-        async with session_scope() as session:
-            user = await session.get(User, cb.from_user.id)
-            if user and user.flow_data:
-                try:
-                    data = json.loads(user.flow_data)
-                    for msg_id in data.get("hint_msg_ids", []):
-                        try:
-                            await cb.bot.delete_message(cb.message.chat.id, msg_id)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                user.flow_state = None
-                user.flow_data = None
-                await session.commit()
+        # 🧹 чистим временные сообщения флоу (если были)
+        await _cleanup_flow_messages(cb)
 
         await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
         await cb.answer()
@@ -94,7 +86,26 @@ async def on_nav(cb: CallbackQuery) -> None:
     if where == "cabinet":
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
-            ym = await _get_yandex_membership_safe(session, cb.from_user.id)
+            ym = await _get_yandex_membership(session, cb.from_user.id)
+
+            # последние 5 оплат
+            q = (
+                select(Payment)
+                .where(Payment.tg_id == cb.from_user.id)
+                .order_by(Payment.id.desc())
+                .limit(5)
+            )
+            res = await session.execute(q)
+            payments = list(res.scalars().all())
+
+        y_status = ym.status if ym else "не подключено"
+        y_login = ym.yandex_login if ym else "—"
+
+        pay_lines = []
+        for p in payments:
+            pay_lines.append(f"• {p.amount} {p.currency} / {p.provider} / {p.status}")
+
+        pay_text = "\n".join(pay_lines) if pay_lines else "• оплат пока нет"
 
         text = (
             "👤 *Личный кабинет*\n\n"
@@ -103,10 +114,11 @@ async def on_nav(cb: CallbackQuery) -> None:
             f"📅 До: {fmt_dt(sub.end_at)}\n"
             f"⏳ Осталось: {days_left(sub.end_at)} дн.\n\n"
             "🟡 *Yandex Plus*\n"
-            f"— Статус: *{getattr(ym, 'status', 'не подключено') if ym else 'не подключено'}*\n"
-            f"— Логин: `{getattr(ym, 'yandex_login', '—') if ym else '—'}`"
+            f"— Статус: *{y_status}*\n"
+            f"— Логин: `{y_login}`\n\n"
+            "🧾 *Последние оплаты*\n"
+            f"{pay_text}"
         )
-
         await cb.message.edit_text(text, reply_markup=kb_cabinet(), parse_mode="Markdown")
         await cb.answer()
         return
@@ -124,41 +136,41 @@ async def on_nav(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
-    # =========================
-    # 🟡 YANDEX PLUS
-    # =========================
     if where == "yandex":
+        # доступ только при активной подписке
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
-            ym = await _get_yandex_membership_safe(session, cb.from_user.id)
+            ym = await _get_yandex_membership(session, cb.from_user.id)
 
         if not _is_sub_active(sub.end_at):
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        if ym and getattr(ym, "yandex_login", None):
+        # ✅ если логин уже есть — НЕ даём менять
+        if ym and ym.yandex_login:
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🛠 Поддержка", callback_data="nav:support")],
                     [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:home")],
                 ]
             )
             await cb.message.edit_text(
                 "🟡 *Yandex Plus*\n\n"
                 f"Ваш логин: `{ym.yandex_login}`\n"
-                f"Статус: *{getattr(ym, 'status', '—')}*\n\n"
-                "Логин уже подтверждён и не может быть изменён.",
+                f"Статус: *{ym.status}*\n\n"
+                "Логин подтверждён и не может быть изменён.",
                 reply_markup=kb,
                 parse_mode="Markdown",
             )
             await cb.answer()
             return
 
+        # ставим ожидание логина
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
-            user.flow_state = "await_yandex_login"
-            user.flow_data = None
-            await session.commit()
+            if user:
+                user.flow_state = "await_yandex_login"
+                user.flow_data = None
+                await session.commit()
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -176,24 +188,215 @@ async def on_nav(cb: CallbackQuery) -> None:
         )
         await cb.answer()
 
+        # картинка + подсказка (и сохраняем msg_id чтобы удалить)
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
-        hint = await cb.message.answer_photo(photo=photo)
-        prompt = await cb.message.answer("👇 Введите логин сообщением ниже")
+        hint_msg = await cb.message.answer_photo(photo=photo)
+        prompt_msg = await cb.message.answer("👇 Введите логин сообщением ниже")
 
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
-            user.flow_data = json.dumps({
-                "hint_msg_ids": [hint.message_id, prompt.message_id]
-            })
-            await session.commit()
+            if user:
+                user.flow_data = json.dumps({"hint_msg_ids": [hint_msg.message_id, prompt_msg.message_id]})
+                await session.commit()
+
+        return
+
+    if where == "faq":
+        text = (
+            "❓ FAQ\n\n"
+            "— Как оплатить? В разделе «Оплата»\n"
+            "— Как получить VPN? Раздел «VPN»"
+        )
+        await cb.message.edit_text(text, reply_markup=kb_back_home())
+        await cb.answer()
         return
 
     if where == "support":
         await cb.message.edit_text(
-            "🛠 Поддержка\n\nНапишите: @support (заглушка)",
+            "🛠 Поддержка\n\nНапиши сюда: @support (заглушка)",
             reply_markup=kb_back_home(),
         )
         await cb.answer()
         return
 
     await cb.answer("Неизвестный раздел")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pay:mock"))
+async def on_mock_pay(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        now = utcnow()
+        base = sub.end_at if sub.end_at and sub.end_at > now else now
+        new_end = base + relativedelta(months=settings.period_months)
+
+        await extend_subscription(
+            session,
+            tg_id,
+            months=settings.period_months,
+            days_legacy=settings.period_days,
+        )
+
+        sub.end_at = new_end
+        sub.is_active = True
+        sub.status = "active"
+        await session.commit()
+
+    await cb.answer("Оплата успешна")
+
+    await cb.message.answer(
+        "✅ *Оплата прошла успешно!*\n\n"
+        "Для подключения перейдите в разделы:\n"
+        "— 🟡 *Yandex Plus*\n"
+        "— 🌍 *VPN*\n\n"
+        "Спасибо, что выбрали наш сервис 💛",
+        reply_markup=kb_back_home(),
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(lambda c: c.data == "vpn:guide")
+async def on_vpn_guide(cb: CallbackQuery) -> None:
+    text = (
+        "📖 Инструкция\n\n"
+        "1) Нажми «Отправить конфиг + QR»\n"
+        "2) Импортируй в WireGuard\n"
+        f"3) Конфиг удалится через {settings.auto_delete_seconds} сек."
+    )
+    await cb.message.edit_text(text, reply_markup=kb_vpn())
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "vpn:reset:confirm")
+async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
+    await cb.message.edit_text(
+        "♻️ Сбросить VPN?\nСтарый конфиг перестанет работать.",
+        reply_markup=kb_confirm_reset(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "vpn:reset")
+async def on_vpn_reset(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    chat_id = cb.message.chat.id
+
+    await cb.answer("Сбрасываю…")
+    await cb.message.edit_text(
+        "🔄 Сбрасываю VPN и готовлю новый конфиг…\n"
+        "Это займёт несколько секунд.",
+        reply_markup=kb_vpn(),
+    )
+
+    async def _do_reset_and_send():
+        try:
+            async with session_scope() as session:
+                peer = await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
+                await session.commit()
+
+            conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+
+            qr_img = qrcode.make(conf_text)
+            buf = io.BytesIO()
+            qr_img.save(buf, format="PNG")
+            buf.seek(0)
+
+            conf_file = BufferedInputFile(
+                conf_text.encode(),
+                filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf",
+            )
+            qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+
+            msg_conf = await cb.bot.send_document(
+                chat_id=chat_id,
+                document=conf_file,
+                caption=f"WireGuard конфиг (после сброса). Будет удалён через {settings.auto_delete_seconds} сек.",
+            )
+            msg_qr = await cb.bot.send_photo(
+                chat_id=chat_id,
+                photo=qr_file,
+                caption="QR для WireGuard (после сброса)",
+            )
+
+            async def _cleanup():
+                await asyncio.sleep(settings.auto_delete_seconds)
+                for m in (msg_conf, msg_qr):
+                    try:
+                        await cb.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
+                    except Exception:
+                        pass
+
+            asyncio.create_task(_cleanup())
+
+        except Exception:
+            try:
+                await cb.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Не удалось сбросить VPN из-за временной ошибки. Попробуй ещё раз через минуту.",
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_do_reset_and_send())
+
+
+@router.callback_query(lambda c: c.data == "vpn:bundle")
+async def on_vpn_bundle(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Подписка не активна", show_alert=True)
+            return
+
+        try:
+            peer = await vpn_service.ensure_peer(session, tg_id)
+            await session.commit()
+        except Exception:
+            await cb.answer(
+                "⚠️ VPN сервер временно недоступен.\n"
+                "Попробуй ещё раз через минуту.",
+                show_alert=True,
+            )
+            return
+
+    conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+
+    qr_img = qrcode.make(conf_text)
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+
+    conf_file = BufferedInputFile(
+        conf_text.encode(),
+        filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf",
+    )
+    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+
+    msg_conf = await cb.message.answer_document(
+        document=conf_file,
+        caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
+    )
+    msg_qr = await cb.message.answer_photo(
+        photo=qr_file,
+        caption="QR для WireGuard",
+    )
+
+    await cb.answer()
+
+    async def _cleanup():
+        await asyncio.sleep(settings.auto_delete_seconds)
+        for m in (msg_conf, msg_qr):
+            try:
+                await m.delete()
+            except Exception:
+                pass
+        try:
+            await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+        except Exception:
+            pass
+
+    asyncio.create_task(_cleanup())
