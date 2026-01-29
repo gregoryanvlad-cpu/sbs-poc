@@ -1,11 +1,12 @@
 import json
+
 from aiogram import Router, F
 from aiogram.types import Message
 
+from app.bot.keyboards import kb_main
+from app.db.models.user import User
 from app.db.session import session_scope
 from app.services.yandex.service import yandex_service
-from app.db.models.user import User
-from app.bot.keyboards import kb_main
 
 router = Router()
 
@@ -20,15 +21,14 @@ async def yandex_login_input(message: Message):
         if not user or user.flow_state != "await_yandex_login":
             return
 
-        # ✅ удаляем картинку-подсказку, если она была
+        # удаляем картинку-подсказку, если она была
         try:
             if user.flow_data:
                 data = json.loads(user.flow_data)
                 msg_id = data.get("yandex_hint_msg_id")
-                chat_id = data.get("yandex_hint_chat_id")
-                if msg_id and chat_id:
+                if msg_id:
                     try:
-                        await message.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                        await message.bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
                     except Exception:
                         pass
         except Exception:
@@ -45,7 +45,6 @@ async def yandex_login_input(message: Message):
         )
         await session.commit()
 
-    # ✅ далее — ответ пользователю
     if res.invite_link:
         await message.answer(
             "🟡 *Yandex Plus*\n\n"
@@ -57,5 +56,5 @@ async def yandex_login_input(message: Message):
     else:
         await message.answer(res.message)
 
-    # ✅ И сразу показываем главное меню
+    # возвращаем пользователя в меню
     await message.answer("Главное меню:", reply_markup=kb_main())
