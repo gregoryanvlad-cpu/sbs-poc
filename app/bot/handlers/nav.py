@@ -106,11 +106,25 @@ async def on_nav(cb: CallbackQuery) -> None:
         )
         await cb.answer()
 
-        # 4) картинка + просьба отправить логин ниже
+               # 4) картинка-подсказка (сохраняем message_id)
+        import json
+
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
-        await cb.message.answer_photo(photo=photo)
+        hint_msg = await cb.message.answer_photo(photo=photo)
+
+        async with session_scope() as session:
+            user = await session.get(User, cb.from_user.id)
+            if user:
+                user.flow_data = json.dumps({
+                    "yandex_hint_msg_id": hint_msg.message_id,
+                    "yandex_hint_chat_id": hint_msg.chat.id,
+                })
+                await session.commit()
+
+        # 5) ВНИМАНИЕ: меню “не улетает”, потому что мы остаёмся на этом экране
         await cb.message.answer("👇 Введите ваш логин *Yandex ID* сообщением ниже", parse_mode="Markdown")
         return
+
 
     if where == "faq":
         text = (
