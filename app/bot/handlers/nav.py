@@ -17,6 +17,7 @@ from aiogram.types import (
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import select
 
+from app.bot.auth import is_owner
 from app.bot.keyboards import (
     kb_back_home,
     kb_cabinet,
@@ -45,12 +46,21 @@ def _is_sub_active(sub_end_at: datetime | None) -> bool:
 
 
 async def _get_yandex_membership(session, tg_id: int) -> YandexMembership | None:
-    q = select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
+    q = (
+        select(YandexMembership)
+        .where(YandexMembership.tg_id == tg_id)
+        .order_by(YandexMembership.id.desc())
+        .limit(1)
+    )
     res = await session.execute(q)
     return res.scalar_one_or_none()
 
 
 async def _cleanup_flow_messages(cb: CallbackQuery) -> None:
+    """
+    Удаляем временные сообщения (картинка/промпт) которые мы отправляем в flow ввода логина.
+    Вызываем при nav:home и при успешном вводе логина в yandex.py (там отдельно).
+    """
     async with session_scope() as session:
         user = await session.get(User, cb.from_user.id)
         if not user or not user.flow_data:
@@ -58,9 +68,10 @@ async def _cleanup_flow_messages(cb: CallbackQuery) -> None:
 
         try:
             data = json.loads(user.flow_data)
-            for msg_id in data.get("hint_msg_ids", []):
+            msg_ids = data.get("hint_msg_ids", [])
+            for msg_id in msg_ids:
                 try:
-                    await cb.bot.delete_message(cb.message.chat.id, msg_id)
+                    await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=msg_id)
                 except Exception:
                     pass
         except Exception:
@@ -75,12 +86,14 @@ async def _cleanup_flow_messages(cb: CallbackQuery) -> None:
 async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
 
+    # ---------------- HOME ----------------
     if where == "home":
         await _cleanup_flow_messages(cb)
         await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
         await cb.answer()
         return
 
+    # ---------------- CABINET ----------------
     if where == "cabinet":
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
@@ -96,7 +109,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             payments = list(res.scalars().all())
 
         y_status = ym.status if ym else "не подключено"
-        y_login = ym.yandex_login if ym else "—"
+        y_login = ym.yandex_login if (ym and ym.yandex_login) else "—"
 
         pay_lines = [f"• {p.amount} {p.currency} / {p.provider} / {p.status}" for p in payments]
         pay_text = "\n".join(pay_lines) if pay_lines else "• оплат пока нет"
@@ -113,11 +126,16 @@ async def on_nav(cb: CallbackQuery) -> None:
             "🧾 *Последние оплаты*\n"
             f"{pay_text}"
         )
-from app.bot.auth import is_owner
-await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)), parse_mode="Markdown")
+
+        await cb.message.edit_text(
+            text,
+            reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)),
+            parse_mode="Markdown",
+        )
         await cb.answer()
         return
 
+    # ---------------- PAY ----------------
     if where == "pay":
         await cb.message.edit_text(
             f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
@@ -126,12 +144,15 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
         await cb.answer()
         return
 
+    # ---------------- VPN ----------------
     if where == "vpn":
         await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
         await cb.answer()
         return
 
+    # ---------------- YANDEX ----------------
     if where == "yandex":
+        # 1) доступ только при активной подписке
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
@@ -140,6 +161,7 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
+        # 2) если логин уже сохранён — не даём менять
         if ym and ym.yandex_login:
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -157,6 +179,7 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
             await cb.answer()
             return
 
+        # 3) ставим флоу ожидания логина
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
             if user:
@@ -164,6 +187,7 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
                 user.flow_data = None
                 await session.commit()
 
+        # 4) основной экран Yandex Plus (это сообщение “останется”, его редактируем)
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
@@ -173,13 +197,14 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
 
         await cb.message.edit_text(
             "🟡 *Yandex Plus*\n\n"
-            "Введите ваш логин Yandex ID.\n"
+            "Введите ваш логин *Yandex ID*.\n"
             "⚠️ После подтверждения изменить логин нельзя.",
             reply_markup=kb,
             parse_mode="Markdown",
         )
         await cb.answer()
 
+        # 5) картинка + промпт (сохраняем message_id, чтобы удалять при nav:home и при вводе логина)
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
         hint_msg = await cb.message.answer_photo(photo=photo)
         prompt_msg = await cb.message.answer("👇 Введите логин сообщением ниже")
@@ -192,6 +217,7 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
 
         return
 
+    # ---------------- FAQ ----------------
     if where == "faq":
         text = (
             "❓ FAQ\n\n"
@@ -202,6 +228,7 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
         await cb.answer()
         return
 
+    # ---------------- SUPPORT ----------------
     if where == "support":
         await cb.message.edit_text(
             "🛠 Поддержка\n\nНапиши сюда: @support (заглушка)",
@@ -213,6 +240,7 @@ await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.fr
     await cb.answer("Неизвестный раздел")
 
 
+# ---------------- MOCK PAY ----------------
 @router.callback_query(lambda c: c.data and c.data.startswith("pay:mock"))
 async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
@@ -221,7 +249,6 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub = await get_subscription(session, tg_id)
         now = utcnow()
         base = sub.end_at if sub.end_at and sub.end_at > now else now
-
         new_end = base + relativedelta(months=settings.period_months)
 
         await extend_subscription(
@@ -238,7 +265,7 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 
     await cb.answer("Оплата успешна")
 
-    # ✅ ВАЖНО: редактируем текущее сообщение оплаты, чтобы кнопка оплаты больше не висела
+    # редактируем текущее сообщение оплаты (чтобы кнопка не висела)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
@@ -254,9 +281,9 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         reply_markup=kb,
         parse_mode="Markdown",
     )
-    return
 
 
+# ---------------- VPN ----------------
 @router.callback_query(lambda c: c.data == "vpn:guide")
 async def on_vpn_guide(cb: CallbackQuery) -> None:
     text = (
