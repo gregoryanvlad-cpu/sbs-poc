@@ -6,7 +6,13 @@ from datetime import datetime, timezone
 
 import qrcode
 from aiogram import Router
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from dateutil.relativedelta import relativedelta
 
 from app.bot.keyboards import (
@@ -72,15 +78,20 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "yandex":
+        import json
+
         # 1) доступ только при активной подписке
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
 
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна. Оплатите доступ в разделе «Оплата».", show_alert=True)
+            await cb.answer(
+                "Подписка не активна. Оплатите доступ в разделе «Оплата».",
+                show_alert=True,
+            )
             return
 
-        # 2) ставим ожидание логина
+        # 2) ставим ожидание логина (flow_data чистим)
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
             if user:
@@ -99,32 +110,26 @@ async def on_nav(cb: CallbackQuery) -> None:
         await cb.message.edit_text(
             "🟡 *Yandex Plus*\n\n"
             "Нажмите кнопку ниже, чтобы посмотреть свой логин.\n"
-            "Затем отправьте логин сообщением.\n\n"
+            "Затем отправьте логин сообщением ниже.\n\n"
             "⚠️ После подтверждения изменить логин нельзя.",
             reply_markup=kb,
             parse_mode="Markdown",
         )
         await cb.answer()
 
-               # 4) картинка-подсказка (сохраняем message_id)
-        import json
-
+        # 4) картинка-подсказка (получаем message_id и сохраняем)
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
         hint_msg = await cb.message.answer_photo(photo=photo)
 
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
             if user:
-                user.flow_data = json.dumps({
-                    "yandex_hint_msg_id": hint_msg.message_id,
-                    "yandex_hint_chat_id": hint_msg.chat.id,
-                })
+                user.flow_data = json.dumps({"yandex_hint_msg_id": hint_msg.message_id})
                 await session.commit()
 
-        # 5) ВНИМАНИЕ: меню “не улетает”, потому что мы остаёмся на этом экране
+        # 5) стрелка вниз — отдельным сообщением
         await cb.message.answer("👇 Введите ваш логин *Yandex ID* сообщением ниже", parse_mode="Markdown")
         return
-
 
     if where == "faq":
         text = (
@@ -171,7 +176,7 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub.status = "active"
         await session.commit()
 
-    # после оплаты НЕ просим логин — только 안내 + кнопка в меню
+    # после оплаты НЕ просим логин — только уведомление
     await cb.answer("Оплата успешна")
 
     await cb.message.answer(
