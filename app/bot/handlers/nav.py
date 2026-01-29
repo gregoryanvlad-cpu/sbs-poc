@@ -96,6 +96,7 @@ async def on_nav(cb: CallbackQuery) -> None:
 async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
+    # 1) продляем подписку
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         now = utcnow()
@@ -114,24 +115,24 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub.is_active = True
         sub.status = "active"
 
+        # 2) ставим флоу ожидания логина Яндекса
+        user = await session.get(User, tg_id)
+        if user:
+            user.flow_state = "await_yandex_login"
+            user.flow_data = None
+
         await session.commit()
 
-await cb.answer("Оплата успешна")
+    # 3) отвечаем на callback и просим логин
+    await cb.answer("Оплата успешна")
 
-async with session_scope() as session:
-    user = await session.get(User, tg_id)
-    if user:
-        user.flow_state = "await_yandex_login"
-        user.flow_data = None
-        await session.commit()
-
-await message.answer(
-    "✅ Оплата успешна\n"
-    "📦 Подписка активирована\n"
-    "⏳ Действует до ...\n\n"
-    "🟡 Введите логин Яндекса (как в профиле):",
-    reply_markup=kb_back_home(),
-)
+    await cb.message.answer(
+        "✅ Оплата успешна\n\n"
+        "📦 Подписка активирована\n"
+        "⏳ Действует до ...\n\n"
+        "🟡 Введите логин Яндекса (как в профиле):",
+        reply_markup=kb_back_home(),
+    )
 
 
 @router.callback_query(lambda c: c.data == "vpn:guide")
@@ -185,7 +186,10 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
             qr_img.save(buf, format="PNG")
             buf.seek(0)
 
-            conf_file = BufferedInputFile(conf_text.encode(), filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf")
+            conf_file = BufferedInputFile(
+                conf_text.encode(),
+                filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf",
+            )
             qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
             msg_conf = await cb.bot.send_document(
@@ -210,7 +214,6 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
             asyncio.create_task(_cleanup())
 
         except Exception:
-            # Не валим бота, просто сообщаем пользователю
             try:
                 await cb.bot.send_message(
                     chat_id=chat_id,
@@ -250,7 +253,10 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
     qr_img.save(buf, format="PNG")
     buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode(), filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf")
+    conf_file = BufferedInputFile(
+        conf_text.encode(),
+        filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf",
+    )
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
     msg_conf = await cb.message.answer_document(
