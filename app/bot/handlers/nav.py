@@ -113,7 +113,8 @@ async def on_nav(cb: CallbackQuery) -> None:
             "🧾 *Последние оплаты*\n"
             f"{pay_text}"
         )
-        await cb.message.edit_text(text, reply_markup=kb_cabinet(), parse_mode="Markdown")
+from app.bot.auth import is_owner
+await cb.message.edit_text(text, reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)), parse_mode="Markdown")
         await cb.answer()
         return
 
