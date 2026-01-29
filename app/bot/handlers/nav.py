@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import qrcode
 from aiogram import Router
-from aiogram.types import CallbackQuery, BufferedInputFile
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from dateutil.relativedelta import relativedelta
 
 from app.bot.keyboards import (
@@ -19,9 +19,9 @@ from app.bot.keyboards import (
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
-from app.db.session import session_scope
 from app.db.models.user import User
-from app.repo import get_subscription, extend_subscription
+from app.db.session import session_scope
+from app.repo import extend_subscription, get_subscription
 from app.services.vpn.service import vpn_service
 
 router = Router()
@@ -71,8 +71,8 @@ async def on_nav(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
-        if where == "yandex":
-        # 1) проверяем активную подписку
+    if where == "yandex":
+        # 1) доступ только при активной подписке
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
 
@@ -88,25 +88,28 @@ async def on_nav(cb: CallbackQuery) -> None:
                 user.flow_data = None
                 await session.commit()
 
-        # 3) сообщение + кнопки
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:home")],
-        ])
+        # 3) текст + кнопки
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:home")],
+            ]
+        )
 
         await cb.message.edit_text(
-            "🟡 Yandex Plus\n\n"
-            "Введите ваш логин Yandex ID.\n"
-            "После подтверждения изменить нельзя.",
+            "🟡 *Yandex Plus*\n\n"
+            "Нажмите кнопку ниже, чтобы посмотреть свой логин.\n"
+            "Затем отправьте логин сообщением.\n\n"
+            "⚠️ После подтверждения изменить логин нельзя.",
             reply_markup=kb,
+            parse_mode="Markdown",
         )
         await cb.answer()
 
-        # 4) картинка-подсказка
-        from aiogram.types import FSInputFile
+        # 4) картинка + просьба отправить логин ниже
         photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
         await cb.message.answer_photo(photo=photo)
+        await cb.message.answer("👇 Введите ваш логин *Yandex ID* сообщением ниже", parse_mode="Markdown")
         return
 
     if where == "faq":
@@ -134,7 +137,7 @@ async def on_nav(cb: CallbackQuery) -> None:
 async def on_mock_pay(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
 
-    # 1) продляем подписку
+    # продляем подписку
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         now = utcnow()
@@ -152,24 +155,19 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         sub.end_at = new_end
         sub.is_active = True
         sub.status = "active"
-
-        # 2) ставим флоу ожидания логина Яндекса
-        user = await session.get(User, tg_id)
-        if user:
-            user.flow_state = "await_yandex_login"
-            user.flow_data = None
-
         await session.commit()
 
-    # 3) отвечаем на callback и просим логин
+    # после оплаты НЕ просим логин — только 안내 + кнопка в меню
     await cb.answer("Оплата успешна")
 
     await cb.message.answer(
-        "✅ Оплата успешна\n\n"
-        "📦 Подписка активирована\n"
-        "⏳ Действует до ...\n\n"
-        "🟡 Введите логин Яндекса (как в профиле):",
+        "✅ *Оплата прошла успешно!*\n\n"
+        "Для подключения перейдите в разделы:\n"
+        "— 🟡 *Yandex Plus*\n"
+        "— 🌍 *VPN*\n\n"
+        "Спасибо, что выбрали наш сервис 💛",
         reply_markup=kb_back_home(),
+        parse_mode="Markdown",
     )
 
 
