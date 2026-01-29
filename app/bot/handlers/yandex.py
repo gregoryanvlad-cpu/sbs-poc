@@ -1,13 +1,3 @@
-from aiogram import Router, F
-from aiogram.types import Message
-
-from app.db.session import session_scope
-from app.services.yandex.service import yandex_service
-from app.db.models.user import User
-
-router = Router()
-
-
 @router.message(F.text & ~F.text.startswith("/"))
 async def yandex_login_input(message: Message):
     tg_id = message.from_user.id
@@ -17,6 +7,20 @@ async def yandex_login_input(message: Message):
         user = await session.get(User, tg_id)
         if not user or user.flow_state != "await_yandex_login":
             return
+
+        # удаляем картинку-подсказку, если она была
+        try:
+            if user.flow_data:
+                data = json.loads(user.flow_data)
+                msg_id = data.get("yandex_hint_msg_id")
+                chat_id = data.get("yandex_hint_chat_id")
+                if msg_id and chat_id:
+                    try:
+                        await message.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # фиксируем логин
         user.flow_state = None
