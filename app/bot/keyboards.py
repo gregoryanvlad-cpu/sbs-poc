@@ -44,7 +44,8 @@ def kb_vpn() -> InlineKeyboardMarkup:
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
-    b.button(text="⬅️ Назад", callback_data="nav:vpn")
+    # ✅ FIX: "Назад" должен вести в Главное меню
+    b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
 
@@ -52,6 +53,7 @@ def kb_vpn() -> InlineKeyboardMarkup:
 def kb_confirm_reset() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, сбросить", callback_data="vpn:reset")
+    # тут оставляем возврат в VPN-меню
     b.button(text="⬅️ Назад", callback_data="nav:vpn")
     b.adjust(1)
     return b.as_markup()
@@ -62,10 +64,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
     b.button(text="📋 Список аккаунтов", callback_data="admin:yandex:list")
     b.button(text="🔍 Проверить Yandex аккаунт", callback_data="admin:yandex:probe")
-
-    # ➕ НОВАЯ КНОПКА
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
-
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
