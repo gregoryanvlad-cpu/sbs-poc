@@ -203,16 +203,7 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
     return None
 
 
-# =========================
-# FIX INVITE BUTTON (ONLY)
-# =========================
 async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
-    """
-    Ищем кнопку/ссылку приглашения максимально устойчиво:
-    - скроллим в начало
-    - пробуем несколько локаторов: button/link/text
-    - если нашли — scroll_into_view + click
-    """
     try:
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(300)
@@ -230,7 +221,6 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
         candidates.append(page.get_by_role("button", name=pat))
         candidates.append(page.get_by_role("link", name=pat))
 
-    # текстовые fallback’и
     candidates.append(page.locator("text=Пригласить близкого"))
     candidates.append(page.locator("text=Пригласить"))
 
@@ -239,14 +229,12 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
             if await loc.count() == 0:
                 continue
             el = loc.first
-            # иногда элемент есть, но вне экрана
             try:
                 await el.scroll_into_view_if_needed(timeout=2_000)
                 await page.wait_for_timeout(150)
             except Exception:
                 pass
 
-            # пробуем клик
             await el.click(timeout=3_000)
             await page.wait_for_load_state("networkidle", timeout=30_000)
             await _save_debug(page, out_dir, "click_invite_OK")
@@ -254,7 +242,6 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
         except Exception:
             continue
 
-    # крайний случай — пролистать вниз и повторить (у Яндекса кнопка бывает внизу)
     try:
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(500)
@@ -279,6 +266,27 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
             continue
 
     await _save_debug(page, out_dir, "invite_button_NOT_FOUND")
+    return False
+
+
+async def _click_confirm_remove(page: Page) -> bool:
+    """
+    На Яндексе подтверждение исключения может называться по-разному.
+    """
+    patterns = [
+        re.compile(r"Исключить", re.I),
+        re.compile(r"Удалить", re.I),
+        re.compile(r"Подтвердить", re.I),
+    ]
+    for pat in patterns:
+        try:
+            btn = page.get_by_role("button", name=pat)
+            if await btn.count() > 0:
+                await btn.first.click(timeout=3_000)
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+                return True
+        except Exception:
+            continue
     return False
 
 
@@ -401,7 +409,6 @@ class PlaywrightYandexProvider:
             except Exception:
                 pass
 
-            # ✅ FIX INVITE BUTTON: устойчивый поиск кнопки
             ok = await _click_invite_button_strict(page, debug_dir)
             if not ok:
                 await context.close()
@@ -410,10 +417,8 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Invite button not found. Debug: {debug_dir}")
                 return ""
 
-            # модалка "Кто этот человек..." -> "Пропустить"
             await _click_by_text(page, "Пропустить", debug_dir, "relation_skipped")
 
-            # "Поделиться ссылкой"
             share_clicked = await _click_by_text(page, "Поделиться ссылкой", debug_dir, "share_clicked")
             if not share_clicked:
                 try:
@@ -453,6 +458,95 @@ class PlaywrightYandexProvider:
             return ""
 
         return invite_link
+
+    # =========================
+    # NEW: remove guest by login
+    # =========================
+    async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
+        """
+        Удаляет гостя из семьи по логину.
+        Best-effort, возвращает True если похоже удалось.
+        """
+        guest_login = (guest_login or "").strip().lstrip("@").lower()
+        if not guest_login:
+            return False
+
+        debug_dir = _debug_root() / Path(storage_state_path).stem / f"kick_{guest_login}_{_now_tag()}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+
+            await _goto(page, FAMILY_URL, debug_dir, "family_open")
+
+            # 1) кликаем по карточке гостя (по тексту логина)
+            clicked_card = False
+            try:
+                loc = page.get_by_text(guest_login, exact=False)
+                if await loc.count() > 0:
+                    await loc.first.scroll_into_view_if_needed(timeout=5_000)
+                    await loc.first.click(timeout=5_000)
+                    await _save_debug(page, debug_dir, "guest_card_opened")
+                    clicked_card = True
+            except Exception:
+                clicked_card = False
+
+            if not clicked_card:
+                await _save_debug(page, debug_dir, "guest_card_not_found")
+                await context.close()
+                await browser.close()
+                return False
+
+            # 2) кнопка "Исключить из семьи" (варианты)
+            removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
+            if not removed:
+                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
+            if not removed:
+                # fallback через role button
+                try:
+                    btn = page.get_by_role("button", name=re.compile(r"Исключить", re.I))
+                    if await btn.count() > 0:
+                        await btn.first.click(timeout=5_000)
+                        await _save_debug(page, debug_dir, "click_remove_role")
+                        removed = True
+                except Exception:
+                    removed = False
+
+            if not removed:
+                await _save_debug(page, debug_dir, "remove_button_not_found")
+                await context.close()
+                await browser.close()
+                return False
+
+            # 3) подтверждение (если появилось)
+            try:
+                await page.wait_for_timeout(300)
+                await _click_confirm_remove(page)
+                await _save_debug(page, debug_dir, "remove_confirmed")
+            except Exception:
+                pass
+
+            # 4) обновим страницу и проверим, что логина больше нет (best-effort)
+            ok = True
+            try:
+                await _goto(page, FAMILY_URL, debug_dir, "family_after_remove")
+                body = await page.locator("body").inner_text()
+                ok = guest_login not in (body or "").lower()
+            except Exception:
+                ok = True
+
+            await context.close()
+            await browser.close()
+
+        return ok
 
 
 def build_provider() -> PlaywrightYandexProvider:
