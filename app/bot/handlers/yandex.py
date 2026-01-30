@@ -4,6 +4,7 @@ import json
 import re
 
 from aiogram import Router, F
+from aiogram.exceptions import SkipHandler
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.db.session import session_scope
@@ -25,10 +26,6 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
 
 
 async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
-    """
-    Удаляем подсказочные сообщения (скрин + "введите логин"),
-    если их ID были сохранены в user.flow_data: {"hint_msg_ids":[...]}.
-    """
     if not user.flow_data:
         return
     try:
@@ -46,10 +43,8 @@ async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
 @router.message(F.text)
 async def on_yandex_login_input(message: Message) -> None:
     """
-    Авто-инвайт:
-    пользователь зашёл в 🟡 Yandex Plus (nav.py поставил flow_state=await_yandex_login)
-    -> ввёл логин сообщением
-    -> мы создаём invite и отправляем ссылку
+    Ловим ввод логина ТОЛЬКО когда пользователь в DB flow_state == await_yandex_login.
+    Если не наш flow — обязательно SkipHandler(), иначе мы "съедим" сообщения админских FSM и др.
     """
     tg_id = message.from_user.id
     text = (message.text or "").strip()
@@ -57,7 +52,8 @@ async def on_yandex_login_input(message: Message) -> None:
     async with session_scope() as session:
         user = await session.get(User, tg_id)
         if not user or user.flow_state != "await_yandex_login":
-            return  # это не наш флоу
+            # ✅ Ключевой фикс: не наш сценарий — пропускаем другим роутерам/хэндлерам
+            raise SkipHandler
 
         login = text.strip().lstrip("@").strip()
         if not _LOGIN_RE.match(login):
@@ -68,10 +64,8 @@ async def on_yandex_login_input(message: Message) -> None:
             )
             return
 
-        # Сразу сообщаем пользователю, чтобы было понятно что идёт работа
         await message.answer("⏳ Создаю приглашение в семейную подписку…")
 
-        # Создаём membership + инвайт через сервис
         try:
             membership = await yandex_service.ensure_membership_for_user(
                 session=session,
@@ -79,7 +73,6 @@ async def on_yandex_login_input(message: Message) -> None:
                 yandex_login=login,
             )
         except Exception as e:
-            # оставим flow_state, чтобы пользователь мог попытаться ещё раз
             await message.answer(
                 "❌ Не получилось создать приглашение.\n\n"
                 f"<code>{type(e).__name__}: {e}</code>\n\n"
@@ -88,14 +81,13 @@ async def on_yandex_login_input(message: Message) -> None:
             )
             return
 
-        # Чистим подсказки и flow
+        # чистим подсказки и flow
         await _cleanup_hint_messages(message.bot, message.chat.id, user)
         user.flow_state = None
         user.flow_data = None
-
         await session.commit()
 
-    # Отправляем итог: ссылку
+    # отправляем ссылку
     if membership.invite_link:
         await message.answer(
             "✅ Логин принят.\n\n"
