@@ -11,7 +11,8 @@ from app.db.models.yandex_membership import YandexMembership
 from app.repo import utcnow
 from app.services.yandex.provider import build_provider
 
-INVITE_TTL_MINUTES = 10
+# ✅ TTL приглашения (ANTI-BLOCK): 15 минут
+INVITE_TTL_MINUTES = 15
 
 
 class YandexService:
