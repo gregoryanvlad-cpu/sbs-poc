@@ -16,10 +16,6 @@ log = logging.getLogger(__name__)
 
 
 async def run_scheduler() -> None:
-    """
-    Scheduler jobs loop (single replica).
-    Protected by Postgres advisory lock.
-    """
     bot = Bot(token=settings.bot_token)
     log.info("scheduler_start")
 
@@ -35,9 +31,8 @@ async def run_scheduler() -> None:
                 try:
                     await _job_expire_subscriptions(bot)
                     if settings.yandex_enabled:
-                        # ✅ 1) сначала синк семьи (активация)
+                        await _job_yandex_enforce_no_foreign(bot)
                         await _job_yandex_sync_and_activate(bot)
-                        # ✅ 2) потом TTL
                         await _job_yandex_invite_ttl(bot)
                 finally:
                     await advisory_unlock(session)
@@ -68,10 +63,28 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         await session.commit()
 
 
+async def _job_yandex_enforce_no_foreign(bot: Bot) -> None:
+    async with session_scope() as session:
+        warnings, _debug_dirs = await yandex_service.enforce_no_foreign_logins(session)
+        if not warnings:
+            return
+        await session.commit()
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟡 Yandex Plus", callback_data="nav:yandex")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+    for tg_id, text in warnings:
+        try:
+            await bot.send_message(tg_id, text, reply_markup=kb)
+        except Exception:
+            pass
+
+
 async def _job_yandex_sync_and_activate(bot: Bot) -> None:
-    """
-    Автоматика: если пользователь принял инвайт — переводим в active и уведомляем.
-    """
     async with session_scope() as session:
         activated, _debug_dirs = await yandex_service.sync_family_and_activate(session)
         if not activated:
@@ -89,7 +102,7 @@ async def _job_yandex_sync_and_activate(bot: Bot) -> None:
             await bot.send_message(
                 tg_id,
                 "✅ Вы успешно подключены к семейной подписке Yandex Plus.\n\n"
-                "Если нужно — откройте раздел 🟡 Yandex Plus, там будет ваш статус.",
+                "Откройте раздел 🟡 Yandex Plus — там будет ваш статус.",
                 reply_markup=kb,
             )
         except Exception:
