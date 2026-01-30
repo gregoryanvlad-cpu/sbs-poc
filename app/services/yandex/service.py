@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_membership import YandexMembership
-from app.services.yandex.provider import MockYandexProvider
+from app.services.yandex.provider import build_provider
 from app.services.yandex.repo import pick_account
 
 
@@ -25,8 +25,8 @@ class YandexResult:
 
 class YandexService:
     def __init__(self) -> None:
-        # позже: provider = PlaywrightYandexProvider()
-        self.provider = MockYandexProvider()
+        # Provider выбирается через ENV YANDEX_PROVIDER (mock/playwright)
+        self.provider = build_provider()
 
     async def ensure_membership_after_payment(self, session: AsyncSession, tg_id: int, yandex_login: str) -> YandexResult:
         """
@@ -79,7 +79,6 @@ class YandexService:
             ym.yandex_account_id = acc.id
             acc.used_slots += 1
         else:
-            # если уже был аккаунт, подтянем объект
             if ym.yandex_account_id != acc.id:
                 prev = await session.get(YandexAccount, ym.yandex_account_id)
                 if prev:
@@ -137,6 +136,8 @@ class YandexService:
     async def expire_pending_invites(self, session: AsyncSession) -> list[int]:
         """
         Возвращает список tg_id, у которых истёк pending invite.
+        ВАЖНО: на этом шаге мы пока только помечаем в БД.
+        Отмену инвайта в UI можно будет добавить следующим шагом (cancel_pending_invite).
         """
         now = utcnow()
         q = select(YandexMembership).where(
