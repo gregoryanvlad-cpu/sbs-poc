@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import re
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +18,10 @@ _MONTHS_RU = (
 )
 
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
+
+# ⚠️ ВАЖНО: логины гостей будем искать ТОЛЬКО в нижнем регистре (без IGNORECASE)
+# Это резко режет мусор типа "Vlad", "Grigoryan".
+LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 
 
 # -----------------------------
@@ -49,15 +51,11 @@ def _now_tag() -> str:
 
 
 def _debug_root() -> Path:
-    # Обычно settings.yandex_cookies_dir == "/data/yandex"
     base = Path(settings.yandex_cookies_dir or "/data/yandex")
     return base / "debug_out"
 
 
 async def _save_debug(page: Page, out_dir: Path, prefix: str) -> None:
-    """
-    Сохраняем: html, body.txt, screenshot
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         html = await page.content()
@@ -78,11 +76,6 @@ async def _save_debug(page: Page, out_dir: Path, prefix: str) -> None:
 
 
 def extract_next_charge(text: str) -> Optional[str]:
-    """
-    Достаём из страницы Plus текст типа:
-      - "Спишется 9 февраля"
-      - "Следующий платёж ... 9 февраля"
-    """
     if not text:
         return None
 
@@ -103,11 +96,10 @@ def extract_next_charge(text: str) -> Optional[str]:
 
 def parse_family_min(text: str) -> YandexFamilySnapshot:
     """
-    Минимальный парсер состава семьи из body-текста.
-    На твоих скринах это строки формата:
-      "Админ • vladgin9"
-      "dereshchuk.lina"
-      "Ждём ответ" (pending)
+    Более строгий парсер семьи:
+    - admin: "Админ • login"
+    - pending: по "Ждём ответ"
+    - guests: логины только в нижнем регистре + фильтрация мусора
     """
     admins: list[str] = []
     guests: list[str] = []
@@ -116,35 +108,82 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
     if not text:
         return YandexFamilySnapshot(admins=[], guests=[], pending_count=0, used_slots=0, free_slots=3)
 
-    # pending
     pending_count = len(re.findall(r"Жд[её]м\s+ответ", text, flags=re.IGNORECASE))
 
-    # admin logins: "Админ • login"
+    # админ: "Админ • vladgin9"
     for m in re.finditer(r"Админ\s*[•·]\s*([a-z0-9][a-z0-9._-]{1,63})", text, re.IGNORECASE):
-        admins.append(m.group(1))
+        admins.append(m.group(1).lower())
 
-    # guest logins: берём похожие на логин строки, но стараемся не схватить мусор
-    candidates = set(re.findall(r"\b([a-z0-9][a-z0-9._-]{1,63})\b", text, re.IGNORECASE))
-    # выкинем "admin" и прочее
+    # кандидаты гостей: ТОЛЬКО нижний регистр (LOGIN_LOWER_RE)
+    candidates = set(LOGIN_LOWER_RE.findall(text or ""))
+
+    # жёсткий blacklist — UI-слова, домены, технические куски
     blacklist = {
-        "yandex", "id", "family", "plus", "login", "admin", "pending", "invite", "https", "http"
+        "yandex",
+        "id",
+        "family",
+        "plus",
+        "login",
+        "admin",
+        "pending",
+        "invite",
+        "https",
+        "http",
+        "ru",
+        "com",
+        "org",
+        "www",
+        "mailto",
+        "support",
+        "help",
+        "account",
+        "settings",
+        "profile",
+        "oauth",
+        "token",
+        "clientsource",
+        "from",
+        "skip",
+        "share",
+        "copy",
+        "button",
+        "link",
+        "open",
+        "close",
+        "ok",
+        "cancel",
     }
-    candidates = {c for c in candidates if c.lower() not in blacklist}
 
-    # админов исключаем из гостей
-    for c in sorted(candidates):
+    # Фильтрация:
+    # 1) только lowercase уже обеспечено
+    # 2) не только цифры
+    # 3) длина >= 3 (чтобы отсечь мусор)
+    # 4) исключаем админа
+    # 5) исключаем blacklist
+    filtered: list[str] = []
+    for c in candidates:
+        if c in blacklist:
+            continue
+        if c.isdigit():
+            continue
+        if len(c) < 3:
+            continue
         if c in admins:
             continue
-        # грубый фильтр: логин на скрине имеет точку — но не всегда; оставим как есть
-        guests.append(c)
+        filtered.append(c)
 
-    # used_slots: админ + guests (pending не входит в guests, но занимает слот)
-    used_slots = 0
-    if admins:
-        used_slots += 1
-    used_slots += len(guests)
+    filtered.sort()
 
-    # free_slots: всего 4 (админ+3). Свободные = 4 - used_slots - pending_count
+    # Важно: иногда regex ловит и логины из других мест страницы.
+    # На практике у членов семьи обычно есть точка/цифра/подчёркивание/дефис,
+    # но логин может быть и просто "vlad". Поэтому НЕ режем слишком жестко,
+    # но убираем очевидный мусор (цифры/капс/короткое/blacklist).
+    guests = filtered
+
+    # used_slots = 1 (админ) + len(guests)
+    used_slots = (1 if admins else 0) + len(guests)
+
+    # free_slots: всего 4 (админ + 3), pending тоже занимает слот
     free_slots = 4 - used_slots - pending_count
     if free_slots < 0:
         free_slots = 0
@@ -177,7 +216,6 @@ async def _click_by_text(page: Page, text: str, out_dir: Path, prefix: str) -> b
 
 
 async def _extract_invite_from_page(page: Page) -> Optional[str]:
-    # 1) из текста body
     try:
         body = await page.locator("body").inner_text()
         m = INVITE_RE.search(body or "")
@@ -186,7 +224,6 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
     except Exception:
         pass
 
-    # 2) из html
     try:
         html = await page.content()
         m = INVITE_RE.search(html or "")
@@ -202,14 +239,6 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
 # Provider
 # -----------------------------
 class PlaywrightYandexProvider:
-    """
-    Headless Playwright provider.
-    Работает с storage_state.json (cookies) и вытаскивает:
-      - состав семьи
-      - next charge в Plus
-      - invite link из family-модалки
-    """
-
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot:
         debug_dir = _debug_root() / Path(storage_state_path).stem / f"probe_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -217,12 +246,12 @@ class PlaywrightYandexProvider:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            context = await browser.new_context(storage_state=storage_state_path, viewport={"width": 1280, "height": 720})
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
             page = await context.new_page()
 
             next_charge_text: Optional[str] = None
@@ -253,32 +282,7 @@ class PlaywrightYandexProvider:
             raw_debug={"debug_dir": str(debug_dir)},
         )
 
-    async def list_family_logins(self, *, storage_state_path: str, debug_dir_name: str = "family_list") -> YandexFamilySnapshot:
-        debug_dir = _debug_root() / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            context = await browser.new_context(storage_state=storage_state_path, viewport={"width": 1280, "height": 720})
-            page = await context.new_page()
-
-            await _goto(page, FAMILY_URL, debug_dir, "family")
-            body = await page.locator("body").inner_text()
-            snap = parse_family_min(body or "")
-
-            await context.close()
-            await browser.close()
-
-        return snap
-
     async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool:
-        """
-        Отменяет приглашение в статусе "Ждём ответ".
-        Возвращает True если отмена была выполнена, иначе False.
-        """
         debug_dir = _debug_root() / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -287,12 +291,14 @@ class PlaywrightYandexProvider:
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            context = await browser.new_context(storage_state=storage_state_path, viewport={"width": 1280, "height": 720})
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
             page = await context.new_page()
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
-            # Ищем блок "Ждём ответ"
             pending_loc = page.get_by_text("Ждём ответ", exact=False)
             try:
                 await pending_loc.first.wait_for(state="visible", timeout=5_000)
@@ -304,10 +310,8 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            # В модалке есть кнопка "Отменить приглашение"
             cancelled = await _click_by_text(page, "Отменить приглашение", debug_dir, "cancel_clicked")
             if not cancelled:
-                # Иногда кнопка может быть ниже/не влезла, пробуем ещё раз через locator по роли
                 try:
                     btn = page.get_by_role("button", name=re.compile("Отменить", re.I))
                     await btn.first.click()
@@ -328,11 +332,6 @@ class PlaywrightYandexProvider:
         debug_dir_name: str = "invite",
         strict: bool = True,
     ) -> str:
-        """
-        Создаёт приглашение через https://id.yandex.ru/family
-        и возвращает ПРАВИЛЬНУЮ ссылку вида:
-          https://id.yandex.ru/family/invite?invite-id=...
-        """
         debug_dir = _debug_root() / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -341,27 +340,27 @@ class PlaywrightYandexProvider:
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            context = await browser.new_context(storage_state=storage_state_path, viewport={"width": 1280, "height": 720})
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
             page = await context.new_page()
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
-            # На всякий случай: если уже есть pending — отменяем (чтобы не блокировать слот)
+            # если уже есть pending — отменяем
             try:
                 pending = page.get_by_text("Ждём ответ", exact=False)
                 if await pending.count() > 0:
                     await pending.first.click()
                     await _save_debug(page, debug_dir, "pending_modal_opened")
                     await _click_by_text(page, "Отменить приглашение", debug_dir, "pending_cancelled")
-                    # возвращаемся на family
                     await _goto(page, FAMILY_URL, debug_dir, "family_after_cancel")
             except Exception:
                 pass
 
-            # 1) "Пригласить близкого"
-            ok = await _click_by_text(page, "Пригласить близкого", debug_dir, "click_invite_close_person")
+            ok = await _click_by_text(page, "Пригласить близкого", debug_dir, "click_invite")
             if not ok:
-                # fallback: иногда это просто "+" / кнопка рядом
                 try:
                     plus_btn = page.get_by_role("button", name=re.compile(r"приглас", re.I))
                     await plus_btn.first.click()
@@ -378,14 +377,12 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Invite button not found. Debug: {debug_dir}")
                 return ""
 
-            # 2) Может вылезти модалка "Кто этот человек для вас?" -> жмём "Пропустить"
-            # (у тебя на скрине она есть)
+            # модалка "Кто этот человек..." -> "Пропустить"
             await _click_by_text(page, "Пропустить", debug_dir, "relation_skipped")
 
-            # 3) Модалка "Приглашение в семейную группу" -> "Поделиться ссылкой"
+            # "Поделиться ссылкой"
             share_clicked = await _click_by_text(page, "Поделиться ссылкой", debug_dir, "share_clicked")
             if not share_clicked:
-                # иногда кнопка может быть в другом месте
                 try:
                     btn = page.get_by_role("button", name=re.compile("Поделиться", re.I))
                     await btn.first.click()
@@ -402,9 +399,8 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Share button not found. Debug: {debug_dir}")
                 return ""
 
-            # 4) Ждём появления ссылки в модалке
             invite_link: Optional[str] = None
-            for i in range(10):
+            for _ in range(10):
                 invite_link = await _extract_invite_from_page(page)
                 if invite_link:
                     break
@@ -426,9 +422,5 @@ class PlaywrightYandexProvider:
         return invite_link
 
 
-# -----------------------------
-# Factory
-# -----------------------------
 def build_provider() -> PlaywrightYandexProvider:
-    # сейчас у нас один рабочий провайдер
     return PlaywrightYandexProvider()
