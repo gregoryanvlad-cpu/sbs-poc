@@ -18,15 +18,9 @@ _MONTHS_RU = (
 )
 
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
-
-# ⚠️ ВАЖНО: логины гостей будем искать ТОЛЬКО в нижнем регистре (без IGNORECASE)
-# Это резко режет мусор типа "Vlad", "Grigoryan".
 LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 
 
-# -----------------------------
-# Data objects
-# -----------------------------
 @dataclass
 class YandexFamilySnapshot:
     admins: list[str]
@@ -43,9 +37,6 @@ class YandexProbeSnapshot:
     raw_debug: dict[str, Any]
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _now_tag() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -95,12 +86,6 @@ def extract_next_charge(text: str) -> Optional[str]:
 
 
 def parse_family_min(text: str) -> YandexFamilySnapshot:
-    """
-    Более строгий парсер семьи:
-    - admin: "Админ • login"
-    - pending: по "Ждём ответ"
-    - guests: логины только в нижнем регистре + фильтрация мусора
-    """
     admins: list[str] = []
     guests: list[str] = []
     pending_count = 0
@@ -110,14 +95,11 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
 
     pending_count = len(re.findall(r"Жд[её]м\s+ответ", text, flags=re.IGNORECASE))
 
-    # админ: "Админ • vladgin9"
     for m in re.finditer(r"Админ\s*[•·]\s*([a-z0-9][a-z0-9._-]{1,63})", text, re.IGNORECASE):
         admins.append(m.group(1).lower())
 
-    # кандидаты гостей: ТОЛЬКО нижний регистр (LOGIN_LOWER_RE)
     candidates = set(LOGIN_LOWER_RE.findall(text or ""))
 
-    # жёсткий blacklist — UI-слова, домены, технические куски
     blacklist = {
         "yandex",
         "id",
@@ -154,12 +136,6 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
         "cancel",
     }
 
-    # Фильтрация:
-    # 1) только lowercase уже обеспечено
-    # 2) не только цифры
-    # 3) длина >= 3 (чтобы отсечь мусор)
-    # 4) исключаем админа
-    # 5) исключаем blacklist
     filtered: list[str] = []
     for c in candidates:
         if c in blacklist:
@@ -173,17 +149,9 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
         filtered.append(c)
 
     filtered.sort()
-
-    # Важно: иногда regex ловит и логины из других мест страницы.
-    # На практике у членов семьи обычно есть точка/цифра/подчёркивание/дефис,
-    # но логин может быть и просто "vlad". Поэтому НЕ режем слишком жестко,
-    # но убираем очевидный мусор (цифры/капс/короткое/blacklist).
     guests = filtered
 
-    # used_slots = 1 (админ) + len(guests)
     used_slots = (1 if admins else 0) + len(guests)
-
-    # free_slots: всего 4 (админ + 3), pending тоже занимает слот
     free_slots = 4 - used_slots - pending_count
     if free_slots < 0:
         free_slots = 0
@@ -235,9 +203,85 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
     return None
 
 
-# -----------------------------
-# Provider
-# -----------------------------
+# =========================
+# FIX INVITE BUTTON (ONLY)
+# =========================
+async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
+    """
+    Ищем кнопку/ссылку приглашения максимально устойчиво:
+    - скроллим в начало
+    - пробуем несколько локаторов: button/link/text
+    - если нашли — scroll_into_view + click
+    """
+    try:
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    patterns = [
+        re.compile(r"Пригласить близкого", re.I),
+        re.compile(r"Пригласить", re.I),
+        re.compile(r"Добавить.*сем(ь|ю)ю", re.I),
+    ]
+
+    candidates = []
+    for pat in patterns:
+        candidates.append(page.get_by_role("button", name=pat))
+        candidates.append(page.get_by_role("link", name=pat))
+
+    # текстовые fallback’и
+    candidates.append(page.locator("text=Пригласить близкого"))
+    candidates.append(page.locator("text=Пригласить"))
+
+    for loc in candidates:
+        try:
+            if await loc.count() == 0:
+                continue
+            el = loc.first
+            # иногда элемент есть, но вне экрана
+            try:
+                await el.scroll_into_view_if_needed(timeout=2_000)
+                await page.wait_for_timeout(150)
+            except Exception:
+                pass
+
+            # пробуем клик
+            await el.click(timeout=3_000)
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await _save_debug(page, out_dir, "click_invite_OK")
+            return True
+        except Exception:
+            continue
+
+    # крайний случай — пролистать вниз и повторить (у Яндекса кнопка бывает внизу)
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    for loc in candidates:
+        try:
+            if await loc.count() == 0:
+                continue
+            el = loc.first
+            try:
+                await el.scroll_into_view_if_needed(timeout=2_000)
+                await page.wait_for_timeout(150)
+            except Exception:
+                pass
+            await el.click(timeout=3_000)
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await _save_debug(page, out_dir, "click_invite_OK_2")
+            return True
+        except Exception:
+            continue
+
+    await _save_debug(page, out_dir, "invite_button_NOT_FOUND")
+    return False
+
+
 class PlaywrightYandexProvider:
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot:
         debug_dir = _debug_root() / Path(storage_state_path).stem / f"probe_{_now_tag()}"
@@ -257,7 +301,6 @@ class PlaywrightYandexProvider:
             next_charge_text: Optional[str] = None
             family_snap: Optional[YandexFamilySnapshot] = None
 
-            # PLUS
             try:
                 await _goto(page, PLUS_URL, debug_dir, "plus")
                 body = await page.locator("body").inner_text()
@@ -265,7 +308,6 @@ class PlaywrightYandexProvider:
             except Exception:
                 await _save_debug(page, debug_dir, "plus_error")
 
-            # FAMILY
             try:
                 await _goto(page, FAMILY_URL, debug_dir, "family")
                 body = await page.locator("body").inner_text()
@@ -359,18 +401,9 @@ class PlaywrightYandexProvider:
             except Exception:
                 pass
 
-            ok = await _click_by_text(page, "Пригласить близкого", debug_dir, "click_invite")
+            # ✅ FIX INVITE BUTTON: устойчивый поиск кнопки
+            ok = await _click_invite_button_strict(page, debug_dir)
             if not ok:
-                try:
-                    plus_btn = page.get_by_role("button", name=re.compile(r"приглас", re.I))
-                    await plus_btn.first.click()
-                    await _save_debug(page, debug_dir, "click_invite_fallback")
-                    ok = True
-                except Exception:
-                    ok = False
-
-            if not ok:
-                await _save_debug(page, debug_dir, "invite_button_not_found")
                 await context.close()
                 await browser.close()
                 if strict:
