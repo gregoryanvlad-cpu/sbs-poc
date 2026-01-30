@@ -1,177 +1,142 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+from typing import List
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_membership import YandexMembership
+from app.db.session import session_scope
+from app.repo import utcnow
 from app.services.yandex.provider import build_provider
-from app.services.yandex.repo import pick_account
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@dataclass
-class YandexResult:
-    invite_link: str | None = None
-    message: str = "ok"
+INVITE_TTL_MINUTES = 10
 
 
 class YandexService:
+    """
+    Вся бизнес-логика Яндекса.
+    Worker вызывает только методы отсюда.
+    UI/handlers сюда НЕ лезут.
+    """
+
     def __init__(self) -> None:
-        # Provider выбирается через ENV YANDEX_PROVIDER (mock/playwright)
         self.provider = build_provider()
 
-    async def ensure_membership_after_payment(self, session: AsyncSession, tg_id: int, yandex_login: str) -> YandexResult:
+    # ============================================================
+    # PUBLIC API (используется worker'ом)
+    # ============================================================
+
+    async def expire_pending_invites(self, session) -> List[int]:
         """
-        Создаёт (или находит) membership на пользователя.
-        Если логин уже был зафиксирован ранее — менять нельзя.
-        Выдаёт инвайт (pending) и выставляет TTL.
-        """
-        ym = await self._get_latest_membership(session, tg_id)
-
-        # Если уже есть membership и логин отличный — запрещаем менять
-        if ym and ym.yandex_login and ym.yandex_login != yandex_login:
-            return YandexResult(
-                invite_link=None,
-                message="❌ Логин уже подтверждён и не может быть изменён. Обратитесь в поддержку.",
-            )
-
-        # Если membership существует и pending и инвайт ещё жив — просто возвращаем ссылку
-        if ym and ym.status == "pending" and ym.invite_link and ym.invite_expires_at and ym.invite_expires_at > utcnow():
-            return YandexResult(invite_link=ym.invite_link, message="invite_already_issued")
-
-        # Если membership активен — не выдаём новые ссылки
-        if ym and ym.status == "active":
-            return YandexResult(invite_link=None, message="✅ Yandex Plus уже активен.")
-
-        # Если membership не существует — создаём новый
-        if not ym:
-            ym = YandexMembership(
-                tg_id=tg_id,
-                yandex_login=yandex_login,
-                status="pending",
-            )
-            session.add(ym)
-            await session.flush()
-        else:
-            # фиксируем логин, если вдруг был пустой
-            ym.yandex_login = yandex_login
-            ym.status = "pending"
-
-        # coverage_end_at пока можно не трогать (позже привяжем к subscriptions.end_at)
-        need_cover_until = utcnow() + timedelta(days=1)  # минимальная страховка
-
-        acc = await pick_account(session, need_cover_until)
-        if not acc:
-            ym.status = "need_support"
-            await session.flush()
-            return YandexResult(invite_link=None, message="⚠️ Нет доступных аккаунтов Yandex. Обратитесь в поддержку.")
-
-        # если аккаунт меняем — учёт слотов
-        if ym.yandex_account_id is None:
-            ym.yandex_account_id = acc.id
-            acc.used_slots += 1
-        else:
-            if ym.yandex_account_id != acc.id:
-                prev = await session.get(YandexAccount, ym.yandex_account_id)
-                if prev:
-                    prev.used_slots = max(0, prev.used_slots - 1)
-                ym.yandex_account_id = acc.id
-                acc.used_slots += 1
-
-        # выдаём ссылку
-        invite = await self.provider.create_invite_link(credentials_ref=acc.credentials_ref)
-
-        ym.invite_link = invite
-        ym.invite_issued_at = utcnow()
-        ym.invite_expires_at = utcnow() + timedelta(seconds=settings.yandex_pending_ttl_seconds)
-        # reinvite_used не трогаем тут, он для повторного
-        await session.flush()
-
-        return YandexResult(invite_link=invite, message="invite_issued")
-
-    async def reinvite(self, session: AsyncSession, tg_id: int) -> YandexResult:
-        """
-        Выдаёт повторный инвайт максимум 1 раз, только если был invite_timeout.
-        """
-        ym = await self._get_latest_membership(session, tg_id)
-        if not ym:
-            return YandexResult(invite_link=None, message="❌ Сначала укажите логин в разделе Yandex Plus.")
-
-        if ym.status != "invite_timeout":
-            return YandexResult(invite_link=None, message="⚠️ Повторный инвайт доступен только после таймаута приглашения.")
-
-        if int(ym.reinvite_used or 0) >= settings.yandex_reinvite_max:
-            return YandexResult(invite_link=None, message="❌ Лимит повторных приглашений исчерпан. Обратитесь в поддержку.")
-
-        acc = await session.get(YandexAccount, ym.yandex_account_id) if ym.yandex_account_id else None
-        if not acc:
-            # если аккаунта нет — подберём новый
-            need_cover_until = utcnow() + timedelta(days=1)
-            acc = await pick_account(session, need_cover_until)
-            if not acc:
-                ym.status = "need_support"
-                await session.flush()
-                return YandexResult(invite_link=None, message="⚠️ Нет доступных аккаунтов Yandex. Обратитесь в поддержку.")
-            ym.yandex_account_id = acc.id
-            acc.used_slots += 1
-
-        invite = await self.provider.create_invite_link(credentials_ref=acc.credentials_ref)
-        ym.invite_link = invite
-        ym.invite_issued_at = utcnow()
-        ym.invite_expires_at = utcnow() + timedelta(seconds=settings.yandex_pending_ttl_seconds)
-        ym.status = "pending"
-        ym.reinvite_used = int(ym.reinvite_used or 0) + 1
-        await session.flush()
-
-        return YandexResult(invite_link=invite, message="reinvite_issued")
-
-    async def expire_pending_invites(self, session: AsyncSession) -> list[int]:
-        """
-        Возвращает список tg_id, у которых истёк pending invite.
-        ВАЖНО: на этом шаге мы пока только помечаем в БД.
-        Отмену инвайта в UI можно будет добавить следующим шагом (cancel_pending_invite).
+        Автоматически отменяет просроченные инвайты.
+        Возвращает список tg_id, которым нужно отправить уведомление.
         """
         now = utcnow()
-        q = select(YandexMembership).where(
-            YandexMembership.status == "pending",
-            YandexMembership.invite_expires_at.is_not(None),
-            YandexMembership.invite_expires_at <= now,
+        affected_users: List[int] = []
+
+        memberships = (
+            await session.scalars(
+                select(YandexMembership)
+                .where(
+                    YandexMembership.status == "awaiting_join",
+                    YandexMembership.invite_expires_at <= now,
+                )
+            )
+        ).all()
+
+        if not memberships:
+            return affected_users
+
+        for m in memberships:
+            account = await session.get(YandexAccount, m.yandex_account_id)
+            if not account:
+                continue
+
+            try:
+                await self.provider.cancel_pending_invite(
+                    storage_state_path=self._account_state_path(account),
+                    label=account.label,
+                )
+            except Exception:
+                # Даже если playwright не смог — всё равно освобождаем слот
+                pass
+
+            m.status = "invite_timeout"
+            m.invite_link = None
+            m.invite_expires_at = None
+            m.updated_at = now
+
+            affected_users.append(m.user_id)
+
+        return affected_users
+
+    # ============================================================
+    # PUBLIC API (используется UI при входе в Yandex Plus)
+    # ============================================================
+
+    async def ensure_membership_for_user(
+        self,
+        *,
+        session,
+        user_id: int,
+        yandex_login: str,
+    ) -> YandexMembership:
+        """
+        Гарантирует, что у пользователя есть join-session.
+        Если нет — автоматически создаёт invite.
+        """
+        existing = await session.scalar(
+            select(YandexMembership)
+            .where(
+                YandexMembership.user_id == user_id,
+                YandexMembership.status.in_(["awaiting_join", "active"]),
+            )
         )
-        res = await session.execute(q)
-        rows = list(res.scalars().all())
-        if not rows:
-            return []
+        if existing:
+            return existing
 
-        affected: list[int] = []
-        for ym in rows:
-            ym.status = "invite_timeout"
-            ym.invite_link = None
-            ym.invite_issued_at = None
-            ym.invite_expires_at = None
+        account = await session.scalar(
+            select(YandexAccount)
+            .where(YandexAccount.status == "active")
+            .limit(1)
+        )
+        if not account:
+            raise RuntimeError("No active YandexAccount")
 
-            # освобождаем слот (pending занимал слот)
-            if ym.yandex_account_id:
-                acc = await session.get(YandexAccount, ym.yandex_account_id)
-                if acc:
-                    acc.used_slots = max(0, acc.used_slots - 1)
+        invite_link = await self.provider.create_invite_link(
+            storage_state_path=self._account_state_path(account),
+            label=account.label,
+        )
 
-            affected.append(ym.tg_id)
+        now = utcnow()
 
+        membership = YandexMembership(
+            user_id=user_id,
+            yandex_account_id=account.id,
+            yandex_login=yandex_login,
+            invite_link=invite_link,
+            invite_issued_at=now,
+            invite_expires_at=now + timedelta(minutes=INVITE_TTL_MINUTES),
+            status="awaiting_join",
+            reinvite_used=False,
+        )
+
+        session.add(membership)
         await session.flush()
-        return affected
 
-    async def _get_latest_membership(self, session: AsyncSession, tg_id: int) -> YandexMembership | None:
-        q = select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
-        res = await session.execute(q)
-        return res.scalar_one_or_none()
+        return membership
+
+    # ============================================================
+    # INTERNAL
+    # ============================================================
+
+    def _account_state_path(self, account: YandexAccount) -> str:
+        return f"{settings.yandex_cookies_dir}/{account.credentials_ref}"
 
 
+# Singleton, как у тебя принято
 yandex_service = YandexService()
