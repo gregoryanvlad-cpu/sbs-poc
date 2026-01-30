@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
+import re
+
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.db.session import session_scope
 from app.db.models.user import User
 from app.services.yandex.service import yandex_service
 
 router = Router()
+
+_LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$", re.IGNORECASE)
 
 
 def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
@@ -19,76 +24,89 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
     )
 
 
-def _kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-        ]
-    )
+async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
+    """
+    Удаляем подсказочные сообщения (скрин + "введите логин"),
+    если их ID были сохранены в user.flow_data: {"hint_msg_ids":[...]}.
+    """
+    if not user.flow_data:
+        return
+    try:
+        data = json.loads(user.flow_data)
+        ids = data.get("hint_msg_ids") or []
+        for mid in ids:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=int(mid))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
-@router.callback_query(F.data == "nav:yandex")
-async def yandex_plus_handler(cb: CallbackQuery) -> None:
-    tg_id = cb.from_user.id
+@router.message(F.text)
+async def on_yandex_login_input(message: Message) -> None:
+    """
+    Авто-инвайт:
+    пользователь зашёл в 🟡 Yandex Plus (nav.py поставил flow_state=await_yandex_login)
+    -> ввёл логин сообщением
+    -> мы создаём invite и отправляем ссылку
+    """
+    tg_id = message.from_user.id
+    text = (message.text or "").strip()
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
-        if not user:
-            await cb.answer()
-            return
+        if not user or user.flow_state != "await_yandex_login":
+            return  # это не наш флоу
 
-        # 1️⃣ Логин ещё не введён
-        if not user.yandex_login:
-            await cb.message.edit_text(
-                "🟡 <b>Yandex Plus</b>\n\n"
-                "Для подключения укажи логин Яндекс ID.\n"
-                "Логин можно ввести <b>только один раз</b>.",
-                reply_markup=_kb_back(),
+        login = text.strip().lstrip("@").strip()
+        if not _LOGIN_RE.match(login):
+            await message.answer(
+                "❌ Логин выглядит некорректно.\n\n"
+                "Пример: <code>ivan.petrov</code>",
                 parse_mode="HTML",
             )
-            await cb.answer()
             return
 
-        # 2️⃣ Гарантируем наличие membership (авто-инвайт здесь!)
-        membership = await yandex_service.ensure_membership_for_user(
-            session=session,
-            user_id=tg_id,
-            yandex_login=user.yandex_login,
-        )
+        # Сразу сообщаем пользователю, чтобы было понятно что идёт работа
+        await message.answer("⏳ Создаю приглашение в семейную подписку…")
 
-        # 3️⃣ Awaiting join — показываем ссылку
-        if membership.status == "awaiting_join":
-            await cb.message.edit_text(
-                "🟡 <b>Yandex Plus</b>\n\n"
-                f"Логин: <code>{membership.yandex_login}</code>\n"
-                "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
-                "Перейди по ссылке ниже, чтобы принять приглашение в семейную подписку.",
-                reply_markup=_kb_open_invite(membership.invite_link),
+        # Создаём membership + инвайт через сервис
+        try:
+            membership = await yandex_service.ensure_membership_for_user(
+                session=session,
+                tg_id=tg_id,
+                yandex_login=login,
+            )
+        except Exception as e:
+            # оставим flow_state, чтобы пользователь мог попытаться ещё раз
+            await message.answer(
+                "❌ Не получилось создать приглашение.\n\n"
+                f"<code>{type(e).__name__}: {e}</code>\n\n"
+                "Попробуй ещё раз через минуту.",
                 parse_mode="HTML",
             )
-            await cb.answer()
             return
 
-        # 4️⃣ Активный пользователь
-        if membership.status == "active":
-            await cb.message.edit_text(
-                "🟡 <b>Yandex Plus</b>\n\n"
-                f"Логин: <code>{membership.yandex_login}</code>\n"
-                "Статус: ✅ <b>Подключён</b>\n\n"
-                "Доступ к Яндекс Плюс активен.",
-                reply_markup=_kb_back(),
-                parse_mode="HTML",
-            )
-            await cb.answer()
-            return
+        # Чистим подсказки и flow
+        await _cleanup_hint_messages(message.bot, message.chat.id, user)
+        user.flow_state = None
+        user.flow_data = None
 
-        # 5️⃣ Таймаут / удалён
-        await cb.message.edit_text(
-            "🟡 <b>Yandex Plus</b>\n\n"
+        await session.commit()
+
+    # Отправляем итог: ссылку
+    if membership.invite_link:
+        await message.answer(
+            "✅ Логин принят.\n\n"
             f"Логин: <code>{membership.yandex_login}</code>\n"
-            "Статус: ⛔️ <b>Приглашение недоступно</b>\n\n"
-            "Если доступно, новое приглашение будет выдано автоматически.",
-            reply_markup=_kb_back(),
+            "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
+            "Нажми кнопку ниже и прими приглашение:",
+            reply_markup=_kb_open_invite(membership.invite_link),
             parse_mode="HTML",
         )
-        await cb.answer()
+    else:
+        await message.answer(
+            "✅ Логин сохранён, но ссылка приглашения не найдена.\n"
+            "Открой 🟡 Yandex Plus ещё раз — я попробую выдать приглашение повторно.",
+        )
