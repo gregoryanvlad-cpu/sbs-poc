@@ -4,7 +4,6 @@ import json
 import re
 
 from aiogram import Router, F
-from aiogram.dispatcher.event.handler import SkipHandler
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.db.session import session_scope
@@ -13,7 +12,9 @@ from app.services.yandex.service import yandex_service
 
 router = Router()
 
-_LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$", re.IGNORECASE)
+# ✅ Важно: требуем хотя бы одну букву (a-z), чтобы НЕ ловить tg_id (цифры)
+# Пример валидного логина: ivan.petrov, dereshchuk.lina, vladgin9
+_YANDEX_LOGIN_RE_STRICT = re.compile(r"(?i)^(?=.*[a-z])[a-z0-9][a-z0-9._-]{1,63}$")
 
 
 def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
@@ -44,7 +45,7 @@ async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
         pass
 
 
-@router.message(F.text)
+@router.message(F.text.regexp(r"(?i)^(?=.*[a-z])[a-z0-9][a-z0-9._-]{1,63}$"))
 async def on_yandex_login_input(message: Message) -> None:
     """
     Авто-инвайт:
@@ -52,20 +53,19 @@ async def on_yandex_login_input(message: Message) -> None:
     - пользователь вводит логин сообщением
     - мы создаём membership + invite_link и отправляем ссылку
 
-    ВАЖНО:
-    Если сообщение не относится к нашему flow — пропускаем дальше через SkipHandler,
-    чтобы работали админские FSM и другие сценарии.
+    ✅ Этот handler НЕ ловит tg_id (цифры), поэтому не мешает админскому FSM reset.
     """
     tg_id = message.from_user.id
-    text = (message.text or "").strip()
+    login = (message.text or "").strip().lstrip("@").strip()
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
         if not user or user.flow_state != "await_yandex_login":
-            raise SkipHandler
+            # Не наш сценарий — просто ничего не делаем.
+            # (И это не мешает админскому reset, потому что tg_id не матчится по regexp.)
+            return
 
-        login = text.strip().lstrip("@").strip()
-        if not _LOGIN_RE.match(login):
+        if not _YANDEX_LOGIN_RE_STRICT.match(login):
             await message.answer(
                 "❌ Логин выглядит некорректно.\n\n"
                 "Пример: <code>ivan.petrov</code>",
