@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.db.models.user import User
 from app.db.models.yandex_account import YandexAccount
 from app.db.session import session_scope
+from app.services.yandex.provider import build_provider
 
 router = Router()
 
@@ -127,7 +128,7 @@ async def admin_receive_state_file(message: Message) -> None:
         f"Label: <code>{label}</code>\n"
         f"Файл: <code>{saved_name}</code>\n"
         f"Путь: <code>{settings.yandex_cookies_dir}</code>\n\n"
-        "Следующий шаг: подключаем Playwright-провайдер и проверку cookies/семьи.",
+        "Теперь можно нажать «🔍 Проверить Yandex аккаунт» (Playwright).",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
@@ -166,3 +167,78 @@ async def admin_yandex_list(cb: CallbackQuery) -> None:
         parse_mode="HTML",
     )
     await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:yandex:probe")
+async def admin_yandex_probe(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await cb.answer("Проверяю аккаунт…", show_alert=False)
+
+    # берём первый active аккаунт (пока у нас 1 — как ты и сказал)
+    async with session_scope() as session:
+        q = (
+            select(YandexAccount)
+            .where(YandexAccount.status == "active")
+            .order_by(YandexAccount.id.asc())
+            .limit(1)
+        )
+        res = await session.execute(q)
+        acc = res.scalar_one_or_none()
+
+    if not acc:
+        await cb.message.edit_text(
+            "❌ Нет активных Yandex-аккаунтов. Сначала добавь cookies (storage_state.json).",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+        return
+
+    storage_state_path = str(Path(settings.yandex_cookies_dir) / str(acc.credentials_ref))
+
+    provider = build_provider()
+
+    try:
+        snap = await provider.probe(storage_state_path=storage_state_path)
+    except Exception as e:
+        await cb.message.edit_text(
+            "❌ <b>Ошибка Playwright</b>\n\n"
+            f"<code>{type(e).__name__}: {e}</code>\n\n"
+            "Проверь:\n"
+            "— cookies актуальны\n"
+            "— YANDEX_PROVIDER=playwright\n"
+            "— volume /data/yandex доступен\n",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+        return
+
+    fam = snap.family
+    if fam:
+        admins = ", ".join(fam.admins) if fam.admins else "—"
+        guests = ", ".join(fam.guests) if fam.guests else "—"
+        fam_block = (
+            "👨‍👩‍👧‍👦 <b>Семья</b>\n"
+            f"Админ: <code>{admins}</code>\n"
+            f"Гости: <code>{guests}</code>\n"
+            f"Pending: <b>{fam.pending_count}</b>\n"
+            f"Used slots: <b>{fam.used_slots}</b> (admin+guests)\n"
+            f"Free slots: <b>{fam.free_slots}</b> (учитывает pending)\n"
+        )
+    else:
+        fam_block = "👨‍👩‍👧‍👦 <b>Семья</b>\n—\n"
+
+    plus_line = snap.next_charge_text or "—"
+    debug_dir = snap.raw_debug.get("debug_dir") if snap.raw_debug else None
+
+    await cb.message.edit_text(
+        "✅ <b>Проверка Yandex аккаунта</b>\n\n"
+        f"Аккаунт: <code>{acc.label}</code>\n"
+        f"Next charge: <code>{plus_line}</code>\n\n"
+        f"{fam_block}\n"
+        f"Debug dir: <code>{debug_dir or '—'}</code>\n",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
