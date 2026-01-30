@@ -4,9 +4,8 @@ import json
 import re
 
 from aiogram import Router, F
-from aiogram.exceptions import SkipHandler
+from aiogram.dispatcher.event.handler import SkipHandler
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.dispatcher.event.handler import SkipHandler  # ✅ ВОТ ЭТО ВАЖНО
 
 from app.db.session import session_scope
 from app.db.models.user import User
@@ -27,6 +26,10 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
 
 
 async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
+    """
+    Удаляем подсказочные сообщения (скрин/текст), если их ID были сохранены в user.flow_data:
+    {"hint_msg_ids": [...]}.
+    """
     if not user.flow_data:
         return
     try:
@@ -44,8 +47,14 @@ async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
 @router.message(F.text)
 async def on_yandex_login_input(message: Message) -> None:
     """
-    Ловим ввод логина ТОЛЬКО когда пользователь в DB flow_state == await_yandex_login.
-    Если не наш flow — обязательно SkipHandler(), иначе мы "съедим" сообщения админских FSM и др.
+    Авто-инвайт:
+    - nav.py выставляет user.flow_state = "await_yandex_login"
+    - пользователь вводит логин сообщением
+    - мы создаём membership + invite_link и отправляем ссылку
+
+    ВАЖНО:
+    Если сообщение не относится к нашему flow — пропускаем дальше через SkipHandler,
+    чтобы работали админские FSM и другие сценарии.
     """
     tg_id = message.from_user.id
     text = (message.text or "").strip()
@@ -53,7 +62,6 @@ async def on_yandex_login_input(message: Message) -> None:
     async with session_scope() as session:
         user = await session.get(User, tg_id)
         if not user or user.flow_state != "await_yandex_login":
-            # ✅ Ключевой фикс: не наш сценарий — пропускаем другим роутерам/хэндлерам
             raise SkipHandler
 
         login = text.strip().lstrip("@").strip()
