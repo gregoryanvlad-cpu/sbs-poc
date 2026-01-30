@@ -1,85 +1,63 @@
 from __future__ import annotations
 
-from sqlalchemy import select, delete
+import logging
 
-from app.core.config import settings
+from sqlalchemy import delete, select
+
 from app.db.session import session_scope
 from app.db.models.user import User
 from app.db.models.subscription import Subscription
+from app.db.models.payment import Payment
 from app.db.models.vpn_peer import VpnPeer
-from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_membership import YandexMembership
-from app.services.yandex.provider import build_provider
+
+log = logging.getLogger(__name__)
 
 
 class AdminResetUserService:
     """
-    Полный сброс пользователя (ТОЛЬКО ДЛЯ ТЕСТОВ).
-
-    Удаляет:
-    - подписку
-    - VPN peer'ы
-    - Yandex membership (включая pending-инвайты)
-    - сбрасывает User в "как новый"
+    Полный сброс пользователя для тестов:
+    - удаляем Subscription
+    - удаляем Payment
+    - удаляем VpnPeer
+    - удаляем YandexMembership
+    - сбрасываем flow_state/flow_data у User (или удаляем User, если хочешь — но безопаснее сброс)
     """
-
-    def __init__(self) -> None:
-        self.provider = build_provider()
 
     async def reset_user(self, *, tg_id: int) -> None:
         async with session_scope() as session:
-            # ─────────────────────────────────────
-            # USER
-            # ─────────────────────────────────────
-            user = await session.get(User, tg_id)
-            if not user:
-                return
+            # 1) удаляем yandex_membership по tg_id (ВАЖНО: НЕ user_id)
+            await session.execute(
+                delete(YandexMembership).where(YandexMembership.tg_id == tg_id)
+            )
 
-            # ─────────────────────────────────────
-            # YANDEX MEMBERSHIPS
-            # ─────────────────────────────────────
-            memberships = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.tg_id == tg_id
-                    )
-                )
-            ).all()
-
-            for m in memberships:
-                # если было ожидающее приглашение — отменяем в Яндексе
-                if m.status == "awaiting_join" and m.yandex_account_id:
-                    account = await session.get(YandexAccount, m.yandex_account_id)
-                    if account:
-                        try:
-                            await self.provider.cancel_pending_invite(
-                                storage_state_path=f"{settings.yandex_cookies_dir}/{account.credentials_ref}",
-                                login=m.login,
-                            )
-                        except Exception:
-                            pass
-
-                await session.delete(m)
-
-            # ─────────────────────────────────────
-            # VPN
-            # ─────────────────────────────────────
+            # 2) удаляем vpn peers
             await session.execute(
                 delete(VpnPeer).where(VpnPeer.tg_id == tg_id)
             )
 
-            # ─────────────────────────────────────
-            # SUBSCRIPTION
-            # ─────────────────────────────────────
+            # 3) удаляем платежи
+            await session.execute(
+                delete(Payment).where(Payment.tg_id == tg_id)
+            )
+
+            # 4) удаляем подписку
             await session.execute(
                 delete(Subscription).where(Subscription.tg_id == tg_id)
             )
 
-            # ─────────────────────────────────────
-            # USER RESET (как новый)
-            # ─────────────────────────────────────
-            user.flow_state = None
-            user.flow_data = None
-            user.is_active = False
+            # 5) сбрасываем пользователя (не удаляем строку, чтобы не ломать связи/логику)
+            user = await session.get(User, tg_id)
+            if user:
+                user.flow_state = None
+                user.flow_data = None
+
+                # если у тебя есть поля, которые фиксируют яндекс-логин/статус в User — тоже сбрось:
+                if hasattr(user, "yandex_login"):
+                    setattr(user, "yandex_login", None)
+                if hasattr(user, "yandex_status"):
+                    setattr(user, "yandex_status", None)
 
             await session.commit()
+
+        log.info("admin_reset_user_done tg_id=%s", tg_id)
