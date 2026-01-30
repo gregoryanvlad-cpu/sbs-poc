@@ -1,99 +1,94 @@
-import asyncio
-import json
+from __future__ import annotations
 
 from aiogram import Router, F
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from app.bot.keyboards import kb_main
-from app.db.models.user import User
-from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
+from app.db.models.user import User
 from app.services.yandex.service import yandex_service
 
 router = Router()
 
-ERROR_AUTO_DELETE_SECONDS = 30
+
+def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Открыть приглашение", url=invite_link)],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
 
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def yandex_login_input(message: Message):
-    tg_id = message.from_user.id
-    login = message.text.strip()
+def _kb_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "nav:yandex")
+async def yandex_plus_handler(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
-        if not user or user.flow_state != "await_yandex_login":
+        if not user:
+            await cb.answer()
             return
 
-        # если логин уже зафиксирован — не даём менять
-        q = (
-            select(YandexMembership)
-            .where(YandexMembership.tg_id == tg_id)
-            .order_by(YandexMembership.id.desc())
-            .limit(1)
-        )
-        res = await session.execute(q)
-        ym = res.scalar_one_or_none()
-        if ym and ym.yandex_login:
-            user.flow_state = None
-            user.flow_data = None
-            await session.commit()
-            await message.answer(
-                f"🟡 Yandex Plus уже подключается/подключён.\nЛогин: {ym.yandex_login}",
-                reply_markup=kb_main(),
+        # 1️⃣ Логин ещё не введён
+        if not user.yandex_login:
+            await cb.message.edit_text(
+                "🟡 <b>Yandex Plus</b>\n\n"
+                "Для подключения укажи логин Яндекс ID.\n"
+                "Логин можно ввести <b>только один раз</b>.",
+                reply_markup=_kb_back(),
+                parse_mode="HTML",
             )
+            await cb.answer()
             return
 
-        # удаляем подсказочные сообщения
-        try:
-            if user.flow_data:
-                data = json.loads(user.flow_data)
-                for msg_id in data.get("hint_msg_ids", []):
-                    try:
-                        await message.bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        user.flow_state = None
-        user.flow_data = None
-
-        res = await yandex_service.ensure_membership_after_payment(
+        # 2️⃣ Гарантируем наличие membership (авто-инвайт здесь!)
+        membership = await yandex_service.ensure_membership_for_user(
             session=session,
-            tg_id=tg_id,
-            yandex_login=login,
+            user_id=tg_id,
+            yandex_login=user.yandex_login,
         )
-        await session.commit()
 
-    # ✅ УСПЕХ: ссылка + кнопка "Главное меню" (инлайн)
-    if getattr(res, "invite_link", None):
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔗 Открыть приглашение", url=res.invite_link)],
-                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-            ]
+        # 3️⃣ Awaiting join — показываем ссылку
+        if membership.status == "awaiting_join":
+            await cb.message.edit_text(
+                "🟡 <b>Yandex Plus</b>\n\n"
+                f"Логин: <code>{membership.yandex_login}</code>\n"
+                "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
+                "Перейди по ссылке ниже, чтобы принять приглашение в семейную подписку.",
+                reply_markup=_kb_open_invite(membership.invite_link),
+                parse_mode="HTML",
+            )
+            await cb.answer()
+            return
+
+        # 4️⃣ Активный пользователь
+        if membership.status == "active":
+            await cb.message.edit_text(
+                "🟡 <b>Yandex Plus</b>\n\n"
+                f"Логин: <code>{membership.yandex_login}</code>\n"
+                "Статус: ✅ <b>Подключён</b>\n\n"
+                "Доступ к Яндекс Плюс активен.",
+                reply_markup=_kb_back(),
+                parse_mode="HTML",
+            )
+            await cb.answer()
+            return
+
+        # 5️⃣ Таймаут / удалён
+        await cb.message.edit_text(
+            "🟡 <b>Yandex Plus</b>\n\n"
+            f"Логин: <code>{membership.yandex_login}</code>\n"
+            "Статус: ⛔️ <b>Приглашение недоступно</b>\n\n"
+            "Если доступно, новое приглашение будет выдано автоматически.",
+            reply_markup=_kb_back(),
+            parse_mode="HTML",
         )
-        await message.answer(
-            "🟡 *Yandex Plus*\n\n"
-            "Приглашение готово 👇",
-            reply_markup=kb,
-            parse_mode="Markdown",
-        )
-        return
-
-    # ✅ ОШИБКА: одно сообщение + меню, и авто-удаление через 30 сек
-    err_msg = await message.answer(
-        getattr(res, "message", "⚠️ Не удалось выдать приглашение."),
-        reply_markup=kb_main(),
-    )
-
-    async def _auto_delete():
-        await asyncio.sleep(ERROR_AUTO_DELETE_SECONDS)
-        try:
-            await message.bot.delete_message(chat_id=err_msg.chat.id, message_id=err_msg.message_id)
-        except Exception:
-            pass
-
-    asyncio.create_task(_auto_delete())
+        await cb.answer()
