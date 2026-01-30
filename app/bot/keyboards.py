@@ -62,6 +62,10 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
     b.button(text="📋 Список аккаунтов", callback_data="admin:yandex:list")
     b.button(text="🔍 Проверить Yandex аккаунт", callback_data="admin:yandex:probe")
+
+    # ➕ НОВАЯ КНОПКА
+    b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
+
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
