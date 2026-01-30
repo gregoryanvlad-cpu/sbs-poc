@@ -6,6 +6,7 @@ import re
 from aiogram import Router, F
 from aiogram.exceptions import SkipHandler
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher.event.handler import SkipHandler  # ✅ ВОТ ЭТО ВАЖНО
 
 from app.db.session import session_scope
 from app.db.models.user import User
