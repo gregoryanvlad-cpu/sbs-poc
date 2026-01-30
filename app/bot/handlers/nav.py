@@ -83,7 +83,10 @@ async def on_nav(cb: CallbackQuery) -> None:
 
     if where == "home":
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
-        await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+        try:
+            await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+        except Exception:
+            pass
         await cb.answer()
         return
 
@@ -119,24 +122,33 @@ async def on_nav(cb: CallbackQuery) -> None:
             "🧾 <b>Последние оплаты</b>\n"
             f"{pay_text}"
         )
-        await cb.message.edit_text(
-            text,
-            reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)),
-            parse_mode="HTML",
-        )
+        try:
+            await cb.message.edit_text(
+                text,
+                reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         await cb.answer()
         return
 
     if where == "pay":
-        await cb.message.edit_text(
-            f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
-            reply_markup=kb_pay(),
-        )
+        try:
+            await cb.message.edit_text(
+                f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
+                reply_markup=kb_pay(),
+            )
+        except Exception:
+            pass
         await cb.answer()
         return
 
     if where == "vpn":
-        await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
+        try:
+            await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
+        except Exception:
+            pass
         await cb.answer()
         return
 
@@ -149,11 +161,15 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        # если уже подтверждён логин — показываем экран статуса (без возможности изменить)
+        # Если membership уже есть — показываем статус + ссылку, если ожидает вступления
         if ym and ym.yandex_login:
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
-            )
+            buttons = []
+            if ym.status in ("awaiting_join", "pending") and ym.invite_link:
+                buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
+            buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+
+            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
             await cb.message.edit_text(
                 "🟡 <b>Yandex Plus</b>\n\n"
                 f"Ваш логин: <code>{ym.yandex_login}</code>\n"
@@ -165,7 +181,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer()
             return
 
-        # переходим в режим ожидания логина
+        # переходим в режим ожидания логина (ввод сообщением)
         async with session_scope() as session:
             user = await session.get(User, cb.from_user.id)
             if user:
@@ -207,15 +223,21 @@ async def on_nav(cb: CallbackQuery) -> None:
             "— Как оплатить? В разделе «Оплата»\n"
             "— Как получить VPN? Раздел «VPN»"
         )
-        await cb.message.edit_text(text, reply_markup=kb_back_home())
+        try:
+            await cb.message.edit_text(text, reply_markup=kb_back_home())
+        except Exception:
+            pass
         await cb.answer()
         return
 
     if where == "support":
-        await cb.message.edit_text(
-            "🛠 Поддержка\n\nНапиши сюда: @support (заглушка)",
-            reply_markup=kb_back_home(),
-        )
+        try:
+            await cb.message.edit_text(
+                "🛠 Поддержка\n\nНапиши сюда: @support (заглушка)",
+                reply_markup=kb_back_home(),
+            )
+        except Exception:
+            pass
         await cb.answer()
         return
 
@@ -287,6 +309,13 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
 async def on_vpn_reset(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
     chat_id = cb.message.chat.id
+
+    # ✅ FIX: запрет сброса VPN без активной подписки
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Подписка не активна", show_alert=True)
+            return
 
     await cb.answer("Сбрасываю…")
     await cb.message.edit_text(
