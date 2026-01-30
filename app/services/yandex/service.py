@@ -11,16 +11,10 @@ from app.db.models.yandex_membership import YandexMembership
 from app.repo import utcnow
 from app.services.yandex.provider import build_provider
 
-# ✅ TTL приглашения: 15 минут
 INVITE_TTL_MINUTES = 15
 
 
 class YandexService:
-    """
-    Вся бизнес-логика Яндекса.
-    Worker вызывает методы отсюда.
-    """
-
     def __init__(self) -> None:
         self.provider = build_provider()
 
@@ -34,10 +28,6 @@ class YandexService:
         tg_id: int,
         yandex_login: str,
     ) -> YandexMembership:
-        """
-        Гарантирует, что у пользователя есть join-session.
-        Если нет — создаёт invite и сохраняет membership.
-        """
         existing = await session.scalar(
             select(YandexMembership).where(
                 YandexMembership.tg_id == tg_id,
@@ -77,10 +67,6 @@ class YandexService:
         return membership
 
     async def expire_pending_invites(self, session) -> List[int]:
-        """
-        Отменяет просроченные инвайты (awaiting_join) и освобождает слот.
-        Возвращает список tg_id, которым нужно отправить уведомление.
-        """
         now = utcnow()
         affected: List[int] = []
 
@@ -105,7 +91,6 @@ class YandexService:
                         storage_state_path=self._account_state_path(account)
                     )
                 except Exception:
-                    # Даже если playwright не смог — всё равно помечаем как истёкшее
                     pass
 
             m.status = "invite_timeout"
@@ -119,17 +104,6 @@ class YandexService:
         return affected
 
     async def sync_family_and_activate(self, session) -> Tuple[List[int], List[str]]:
-        """
-        Автоматика:
-        - открываем id.yandex.ru/family
-        - получаем текущих guests/admins
-        - если awaiting_join и логин появился в guests -> status=active
-        - обновляем used_slots у аккаунта (best-effort)
-
-        Возвращает:
-        - activated_tg_ids: кому можно отправить "✅ подключено"
-        - debug_dirs: для логов/наблюдения (опционально)
-        """
         activated: List[int] = []
         debug_dirs: List[str] = []
 
@@ -155,14 +129,12 @@ class YandexService:
                 if snap.raw_debug and snap.raw_debug.get("debug_dir"):
                     debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
             except Exception:
-                # если Яндекс временно не ответил — не ломаем воркер
                 continue
 
             fam = snap.family
             if not fam:
                 continue
 
-            # best-effort: обновим used_slots в аккаунте
             try:
                 acc.used_slots = int(fam.used_slots)
             except Exception:
@@ -171,7 +143,6 @@ class YandexService:
             fam_admins = {x.lower() for x in (fam.admins or [])}
             fam_guests = {x.lower() for x in (fam.guests or [])}
 
-            # memberships на этом аккаунте, которые ждут вступления
             pending_memberships = (
                 await session.scalars(
                     select(YandexMembership).where(
@@ -186,27 +157,125 @@ class YandexService:
                 if not login:
                     continue
 
-                # ✅ если логин появился в гостях — значит вступил
-                if login in fam_guests:
+                if login in fam_guests or login in fam_admins:
                     m.status = "active"
                     m.invite_link = None
                     m.invite_issued_at = None
                     m.invite_expires_at = None
                     m.updated_at = now
                     activated.append(m.tg_id)
-                    continue
-
-                # (опционально) если логин почему-то стал админом — тоже считаем активным
-                if login in fam_admins:
-                    m.status = "active"
-                    m.invite_link = None
-                    m.invite_issued_at = None
-                    m.invite_expires_at = None
-                    m.updated_at = now
-                    activated.append(m.tg_id)
-                    continue
 
         return activated, debug_dirs
+
+    # =========================
+    # NEW: enforce no foreign logins
+    # =========================
+    async def enforce_no_foreign_logins(self, session) -> Tuple[List[tuple[int, str]], List[str]]:
+        """
+        Находим "левых" гостей в семье и исключаем их.
+        Если в момент нарушения есть ровно один awaiting_join на этом аккаунте —
+        считаем, что он дал ссылку не туда -> abuse_strikes += 1.
+
+        Возвращает:
+        - warnings: список (tg_id, message_text) для уведомлений
+        - debug_dirs: список debug_dir от probe
+        """
+        warnings: List[tuple[int, str]] = []
+        debug_dirs: List[str] = []
+
+        accounts = (
+            await session.scalars(
+                select(YandexAccount)
+                .where(YandexAccount.status == "active")
+                .order_by(YandexAccount.id.asc())
+            )
+        ).all()
+
+        if not accounts:
+            return warnings, debug_dirs
+
+        now = utcnow()
+
+        for acc in accounts:
+            if not acc.credentials_ref:
+                continue
+
+            storage_path = self._account_state_path(acc)
+
+            try:
+                snap = await self.provider.probe(storage_state_path=storage_path)
+                if snap.raw_debug and snap.raw_debug.get("debug_dir"):
+                    debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
+            except Exception:
+                continue
+
+            fam = snap.family
+            if not fam:
+                continue
+
+            fam_admins = {x.lower() for x in (fam.admins or [])}
+            fam_guests = {x.lower() for x in (fam.guests or [])}
+
+            # разрешённые логины = админы + active-memberships
+            active_members = (
+                await session.scalars(
+                    select(YandexMembership).where(
+                        YandexMembership.yandex_account_id == acc.id,
+                        YandexMembership.status == "active",
+                    )
+                )
+            ).all()
+            allowed = {m.yandex_login.strip().lstrip("@").lower() for m in active_members if m.yandex_login}
+            allowed |= fam_admins
+
+            foreign = sorted([g for g in fam_guests if g not in allowed])
+            if not foreign:
+                continue
+
+            # Кто "виноват"? Если ровно один awaiting_join — предупреждаем его.
+            awaiting = (
+                await session.scalars(
+                    select(YandexMembership).where(
+                        YandexMembership.yandex_account_id == acc.id,
+                        YandexMembership.status == "awaiting_join",
+                    )
+                )
+            ).all()
+            culprit = awaiting[0] if len(awaiting) == 1 else None
+
+            # кикаем всех чужих
+            for guest_login in foreign:
+                try:
+                    await self.provider.remove_guest(storage_state_path=storage_path, guest_login=guest_login)
+                except Exception:
+                    # best-effort
+                    pass
+
+            if culprit:
+                culprit.abuse_strikes = int(culprit.abuse_strikes or 0) + 1
+                culprit.updated_at = now
+
+                if culprit.abuse_strikes >= 2:
+                    # блокируем повторную выдачу (1 раз) и отправляем в поддержку
+                    culprit.reinvite_used = 1
+                    culprit.status = "invite_timeout"
+                    culprit.invite_link = None
+                    culprit.invite_issued_at = None
+                    culprit.invite_expires_at = None
+
+                msg = (
+                    "⚠️ Обнаружена попытка подключения по вашей ссылке другого аккаунта.\n\n"
+                    f"Лишние логины удалены: {', '.join(foreign)}\n\n"
+                    f"Strikes: {culprit.abuse_strikes}/2\n"
+                )
+                if culprit.abuse_strikes >= 2:
+                    msg += "\n🚫 Доступ к повторному приглашению заблокирован. Напишите в поддержку."
+                else:
+                    msg += "\nПожалуйста, используйте приглашение только для вашего логина."
+
+                warnings.append((culprit.tg_id, msg))
+
+        return warnings, debug_dirs
 
 
 yandex_service = YandexService()
