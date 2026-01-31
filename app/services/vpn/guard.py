@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable
-
-from aiogram import Bot
 from sqlalchemy import select
 
-from app.core.config import settings
-from app.db.models.user import User
 from app.db.models.yandex_membership import YandexMembership
+from app.db.models.user import User
 from app.db.session import session_scope
 from app.services.yandex.provider import build_provider
 
@@ -20,80 +16,87 @@ MAX_STRIKES = 2
 class YandexGuardService:
     """
     Жёсткая проверка вступления в семейную группу.
-    Если вошёл не тот логин — кикаем, выдаём страйк, при повторе баним.
+    Кикает левых, предупреждает, банит.
     """
 
     def __init__(self) -> None:
         self.provider = build_provider()
 
-    async def verify_join_for_user(
+    async def verify_join(
         self,
         *,
-        storage_state_path: str,
-        tg_id: int,
+        yandex_account_storage: str,
         expected_login: str,
-        allowed_logins: Iterable[str] | None = None,
+        tg_id: int,
     ) -> None:
         """
-        Проверяем семью по cookies админа и решаем:
-        - если expected_login в гостях => OK, ставим joined
-        - иначе кикаем "лишних" (в первую очередь тех, кто не в allowlist),
-          выдаём страйк tg_id, при повторе бан.
+        Вызывается ПОСЛЕ probe().
         """
-        expected = (expected_login or "").strip().lstrip("@").lower()
-        if not expected:
-            return
+        expected_login = expected_login.lower().strip()
 
-        allow = {expected}
-        if allowed_logins:
-            allow |= {(x or "").strip().lstrip("@").lower() for x in allowed_logins if x}
+        snapshot = await self.provider.probe(
+            storage_state_path=yandex_account_storage
+        )
 
-        snap = await self.provider.probe(storage_state_path=storage_state_path)
-        family = snap.family
+        family = snapshot.family
         if not family:
+            log.warning("YandexGuard: no family snapshot")
             return
 
-        guests = {(g or "").strip().lower() for g in (family.guests or []) if g}
-        if not guests:
+        joined_logins = set(l.lower() for l in (family.guests or []))
+
+        if not joined_logins:
+            log.info("YandexGuard: nobody joined yet")
             return
 
-        # ✅ ожидаемый логин есть — всё отлично
-        if expected in guests:
-            log.info("YandexGuard: joined ok tg_id=%s login=%s", tg_id, expected)
+        # ✅ правильный логин — всё ок
+        if expected_login in joined_logins:
+            log.info("YandexGuard: correct login joined: %s", expected_login)
             await self._mark_joined(tg_id)
             return
 
-        # ❌ вошёл кто-то другой.
-        # Логика "Вариант 2":
-        # 1) кикаем всех гостей, которые НЕ в allowlist (чтобы убрать "левых")
-        intruders = sorted([g for g in guests if g not in allow])
+        # ❌ ЛЕВЫЕ ПОЛЬЗОВАТЕЛИ
+        intruders = joined_logins - {expected_login}
         if not intruders:
-            # теоретически гости есть, но все в allow — тогда ничего не делаем
             return
 
-        # кикаем каждого чужого (без падения всего джоба)
-        kicked_any = False
+        log.warning("YandexGuard: intruders detected: %s", intruders)
+
+        # 1️⃣ КИКАЕМ ВСЕХ ЛЕВЫХ
         for login in intruders:
             try:
-                ok = await self.provider.remove_guest(
-                    storage_state_path=storage_state_path,
+                await self.provider.remove_guest(
+                    storage_state_path=yandex_account_storage,
                     guest_login=login,
                 )
-                kicked_any = kicked_any or bool(ok)
+                log.info("YandexGuard: kicked intruder %s", login)
             except Exception:
-                log.exception("YandexGuard: failed to kick login=%s", login)
+                log.exception("YandexGuard: failed to kick %s", login)
 
-        # выдаём страйк именно текущему tg_id (того, кто должен был войти правильно)
-        strikes = await self._add_strike_and_maybe_ban(tg_id)
+        # 2️⃣ СТРАЙКИ
+        async with session_scope() as session:
+            user = await session.get(User, tg_id)
+            ym = await self._get_membership(session, tg_id)
 
-        # уведомление пользователю
-        if kicked_any:
-            await self._notify_user(
-                tg_id=tg_id,
-                intruder=intruders[0],
-                expected=expected,
-                strikes=strikes,
-            )
+            if not user or not ym:
+                return
+
+            ym.strikes = (ym.strikes or 0) + 1
+
+            # 3️⃣ БАН
+            if ym.strikes >= MAX_STRIKES:
+                ym.status = "banned"
+                user.yandex_blocked = True
+
+            await session.commit()
+
+        # 4️⃣ УВЕДОМЛЕНИЕ
+        await self._notify_user(
+            tg_id=tg_id,
+            intruder=", ".join(sorted(intruders)),
+            expected=expected_login,
+            strikes=ym.strikes,
+        )
 
     async def _get_membership(self, session, tg_id: int) -> YandexMembership | None:
         q = (
@@ -112,25 +115,18 @@ class YandexGuardService:
                 ym.status = "joined"
                 await session.commit()
 
-    async def _add_strike_and_maybe_ban(self, tg_id: int) -> int:
-        async with session_scope() as session:
-            user = await session.get(User, tg_id)
-            ym = await self._get_membership(session, tg_id)
+    async def _notify_user(
+        self,
+        *,
+        tg_id: int,
+        intruder: str,
+        expected: str,
+        strikes: int,
+    ) -> None:
+        from aiogram import Bot
+        from app.core.config import settings
 
-            if not user or not ym:
-                return 0
-
-            ym.strikes = int(ym.strikes or 0) + 1
-
-            if ym.strikes >= MAX_STRIKES:
-                ym.status = "banned"
-                user.yandex_blocked = True
-
-            await session.commit()
-            return int(ym.strikes or 0)
-
-    async def _notify_user(self, *, tg_id: int, intruder: str, expected: str, strikes: int) -> None:
-        bot = Bot(token=settings.bot_token)
+        bot = Bot(settings.bot_token)
 
         if strikes >= MAX_STRIKES:
             text = (
@@ -146,7 +142,7 @@ class YandexGuardService:
                 "Вы приняли приглашение под <b>неверным логином</b>.\n\n"
                 f"Ожидался: <code>{expected}</code>\n"
                 f"Вошёл: <code>{intruder}</code>\n\n"
-                "Лишний участник был удалён из семьи.\n"
+                "Вы были удалены из семейной группы.\n"
                 "Повторное нарушение приведёт к блокировке."
             )
 
