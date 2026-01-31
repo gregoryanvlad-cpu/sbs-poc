@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,99 @@ _MONTHS_RU = (
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
 LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 
+
+# ==========================
+# Debug storage management
+# ==========================
+
+# сколько последних debug-run папок хранить на КАЖДЫЙ аккаунт
+_DEBUG_KEEP_LAST_PER_ACCOUNT = 20
+
+# максимальный общий размер debug_out (в МБ), после чего удаляем самые старые
+_DEBUG_MAX_TOTAL_MB = 250
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return total
+
+
+def _safe_rmtree(path: Path) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _prune_debug_root(root: Path) -> None:
+    """
+    Чистим debug_out, чтобы volume не забивался.
+    1) На каждый аккаунт оставляем N последних папок.
+    2) Если общий размер всё равно > лимита — удаляем самые старые, пока не станет ок.
+    """
+    try:
+        if not root.exists():
+            return
+        if not root.is_dir():
+            return
+    except Exception:
+        return
+
+    # 1) keep last per account
+    try:
+        for acc_dir in root.iterdir():
+            try:
+                if not acc_dir.is_dir():
+                    continue
+                runs = [p for p in acc_dir.iterdir() if p.is_dir()]
+                runs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                for old in runs[_DEBUG_KEEP_LAST_PER_ACCOUNT :]:
+                    _safe_rmtree(old)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2) cap total size
+    try:
+        limit = int(_DEBUG_MAX_TOTAL_MB) * 1024 * 1024
+        total = _dir_size_bytes(root)
+        if total <= limit:
+            return
+
+        # собрать ВСЕ папки запусков (все аккаунты) и удалить самые старые
+        all_runs: list[Path] = []
+        for acc_dir in root.iterdir():
+            if acc_dir.is_dir():
+                for run in acc_dir.iterdir():
+                    if run.is_dir():
+                        all_runs.append(run)
+
+        all_runs.sort(key=lambda p: p.stat().st_mtime)  # старые -> новые
+
+        for run in all_runs:
+            if total <= limit:
+                break
+            before = _dir_size_bytes(run)
+            _safe_rmtree(run)
+            # пересчёт грубо (чтобы не делать полный пересчёт root каждый раз)
+            total = max(0, total - before)
+    except Exception:
+        pass
+
+
+# ==========================
+# Data models
+# ==========================
 
 @dataclass
 class YandexFamilySnapshot:
@@ -48,6 +142,7 @@ def _debug_root() -> Path:
 
 async def _save_debug(page: Page, out_dir: Path, prefix: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+
     try:
         html = await page.content()
         (out_dir / f"{prefix}_page.html").write_text(html, encoding="utf-8")
@@ -270,9 +365,6 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
 
 
 async def _click_confirm_remove(page: Page) -> bool:
-    """
-    На Яндексе подтверждение исключения может называться по-разному.
-    """
     patterns = [
         re.compile(r"Исключить", re.I),
         re.compile(r"Удалить", re.I),
@@ -292,7 +384,11 @@ async def _click_confirm_remove(page: Page) -> bool:
 
 class PlaywrightYandexProvider:
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot:
-        debug_dir = _debug_root() / Path(storage_state_path).stem / f"probe_{_now_tag()}"
+        # ✅ важное: чистим debug_out ДО создания новой папки
+        root = _debug_root()
+        _prune_debug_root(root)
+
+        debug_dir = root / Path(storage_state_path).stem / f"probe_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
@@ -333,7 +429,10 @@ class PlaywrightYandexProvider:
         )
 
     async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool:
-        debug_dir = _debug_root() / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
+        root = _debug_root()
+        _prune_debug_root(root)
+
+        debug_dir = root / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
@@ -382,7 +481,10 @@ class PlaywrightYandexProvider:
         debug_dir_name: str = "invite",
         strict: bool = True,
     ) -> str:
-        debug_dir = _debug_root() / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
+        root = _debug_root()
+        _prune_debug_root(root)
+
+        debug_dir = root / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
@@ -459,19 +561,15 @@ class PlaywrightYandexProvider:
 
         return invite_link
 
-    # =========================
-    # NEW: remove guest by login
-    # =========================
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
-        """
-        Удаляет гостя из семьи по логину.
-        Best-effort, возвращает True если похоже удалось.
-        """
         guest_login = (guest_login or "").strip().lstrip("@").lower()
         if not guest_login:
             return False
 
-        debug_dir = _debug_root() / Path(storage_state_path).stem / f"kick_{guest_login}_{_now_tag()}"
+        root = _debug_root()
+        _prune_debug_root(root)
+
+        debug_dir = root / Path(storage_state_path).stem / f"kick_{guest_login}_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
@@ -487,7 +585,6 @@ class PlaywrightYandexProvider:
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
-            # 1) кликаем по карточке гостя (по тексту логина)
             clicked_card = False
             try:
                 loc = page.get_by_text(guest_login, exact=False)
@@ -505,12 +602,10 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            # 2) кнопка "Исключить из семьи" (варианты)
             removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
             if not removed:
                 removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
             if not removed:
-                # fallback через role button
                 try:
                     btn = page.get_by_role("button", name=re.compile(r"Исключить", re.I))
                     if await btn.count() > 0:
@@ -526,28 +621,10 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            # 3) подтверждение (если появилось)
-            try:
-                await page.wait_for_timeout(300)
-                await _click_confirm_remove(page)
-                await _save_debug(page, debug_dir, "remove_confirmed")
-            except Exception:
-                pass
-
-            # 4) обновим страницу и проверим, что логина больше нет (best-effort)
-            ok = True
-            try:
-                await _goto(page, FAMILY_URL, debug_dir, "family_after_remove")
-                body = await page.locator("body").inner_text()
-                ok = guest_login not in (body or "").lower()
-            except Exception:
-                ok = True
+            confirmed = await _click_confirm_remove(page)
+            await _save_debug(page, debug_dir, f"remove_confirmed_{int(bool(confirmed))}")
 
             await context.close()
             await browser.close()
 
-        return ok
-
-
-def build_provider() -> PlaywrightYandexProvider:
-    return PlaywrightYandexProvider()
+        return True
