@@ -15,16 +15,11 @@ INVITE_TTL_MINUTES = 15
 
 
 def _allowed_logins_from_env() -> set[str]:
-    """
-    Белый список логинов, которых не кикаем никогда.
-    ENV: YANDEX_ALLOWED_LOGINS="vladgin9"
-    """
     raw = getattr(settings, "yandex_allowed_logins", None)
     if not raw:
         return set()
     if isinstance(raw, str):
-        items = [x.strip().lstrip("@").lower() for x in raw.split(",") if x.strip()]
-        return set(items)
+        return {x.strip().lstrip("@").lower() for x in raw.split(",") if x.strip()}
     return set()
 
 
@@ -74,6 +69,7 @@ class YandexService:
             invite_expires_at=now + timedelta(minutes=INVITE_TTL_MINUTES),
             status="awaiting_join",
             reinvite_used=0,
+            abuse_strikes=0,
         )
 
         session.add(membership)
@@ -183,11 +179,12 @@ class YandexService:
 
     async def enforce_no_foreign_logins(self, session) -> Tuple[List[tuple[int, str]], List[str]]:
         """
-        Левые логины:
-        - удаляем чужаков
+        Автоматика "левые логины":
+        - ищем гостей, которые НЕ в allowed
+        - удаляем их
         - strikes выдаём только если есть ровно один awaiting_join
-        - OWNER никогда не получает strikes/баны
-        - белый список логинов не кикаем
+        - OWNER (settings.owner_tg_id) никогда не получает strikes/ban
+        - allowlist логинов из ENV никогда не кикаем
         """
         warnings: List[tuple[int, str]] = []
         debug_dirs: List[str] = []
@@ -228,7 +225,7 @@ class YandexService:
             fam_admins = {x.lower() for x in (fam.admins or [])}
             fam_guests = {x.lower() for x in (fam.guests or [])}
 
-            # разрешённые логины = админы + active memberships + allowlist
+            # allowed = админы + active-members + allowlist
             active_members = (
                 await session.scalars(
                     select(YandexMembership).where(
@@ -246,7 +243,7 @@ class YandexService:
             if not foreign:
                 continue
 
-            # кто "виновник"? если ровно один awaiting_join
+            # виновник только если есть ровно один awaiting_join
             awaiting = (
                 await session.scalars(
                     select(YandexMembership).where(
@@ -257,25 +254,31 @@ class YandexService:
             ).all()
             culprit = awaiting[0] if len(awaiting) == 1 else None
 
-            # кикаем всех чужих
+            # кикаем чужих (кроме allowlist)
+            kicked = []
             for guest_login in foreign:
-                # allowlist не кикаем
                 if guest_login in allowlist:
                     continue
                 try:
-                    await self.provider.remove_guest(storage_state_path=storage_path, guest_login=guest_login)
+                    ok = await self.provider.remove_guest(storage_state_path=storage_path, guest_login=guest_login)
+                    if ok:
+                        kicked.append(guest_login)
                 except Exception:
                     pass
 
-            # OWNER не наказываем никогда
+            if not kicked:
+                continue
+
+            # OWNER не наказываем
             if culprit and int(culprit.tg_id) == owner_id:
-                # но можно отправить владельцу инфо (как warning, но без strikes)
-                msg = (
-                    "ℹ️ Обнаружены лишние логины в семье (удалены автоматически).\n\n"
-                    f"Лишние логины: {', '.join([x for x in foreign if x not in allowlist])}\n\n"
-                    "⚠️ Это уведомление. Strikes владельцу НЕ выдаются."
+                warnings.append(
+                    (
+                        owner_id,
+                        "ℹ️ Обнаружены лишние логины в семье.\n\n"
+                        f"Удалены: {', '.join(kicked)}\n\n"
+                        "⚠️ Это только уведомление. Strikes владельцу НЕ выдаются.",
+                    )
                 )
-                warnings.append((owner_id, msg))
                 continue
 
             if culprit:
@@ -291,13 +294,13 @@ class YandexService:
 
                 msg = (
                     "⚠️ Обнаружена попытка подключения по вашей ссылке другого аккаунта.\n\n"
-                    f"Лишние логины удалены: {', '.join([x for x in foreign if x not in allowlist])}\n\n"
+                    f"Удалены лишние логины: {', '.join(kicked)}\n\n"
                     f"Strikes: {culprit.abuse_strikes}/2\n"
                 )
                 if culprit.abuse_strikes >= 2:
                     msg += "\n🚫 Повторное приглашение заблокировано. Напишите в поддержку."
                 else:
-                    msg += "\nПожалуйста, используйте приглашение только для вашего логина."
+                    msg += "\nИспользуйте приглашение только для вашего логина."
 
                 warnings.append((culprit.tg_id, msg))
 
