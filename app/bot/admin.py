@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import tempfile
+import zipfile
+
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import FSInputFile
+
 from sqlalchemy import select
 
 from app.bot.auth import is_owner
@@ -15,17 +18,9 @@ from app.db.models.user import User
 from app.db.models.yandex_account import YandexAccount
 from app.db.session import session_scope
 from app.services.yandex.provider import build_provider
-from app.services.admin.reset_user import AdminResetUserService
-from app.services.admin.forgive_user import AdminForgiveUserService
 
 router = Router()
-_reset_service = AdminResetUserService()
-_forgive_service = AdminForgiveUserService()
 
-
-# =========================
-# HELPERS
-# =========================
 
 def _safe_label_from_filename(filename: str) -> str:
     base = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
@@ -34,33 +29,26 @@ def _safe_label_from_filename(filename: str) -> str:
     return base or "yandex_admin"
 
 
-# =========================
-# ADMIN MENU
-# =========================
-
 @router.callback_query(lambda c: c.data == "admin:menu")
 async def admin_menu(cb: CallbackQuery) -> None:
-    await cb.answer()
-
     if not is_owner(cb.from_user.id):
+        await cb.answer()
         return
 
     await cb.message.edit_text(
-        "🛠 <b>Админка</b>",
+        "🛠 <b>Админка</b>\n\n"
+        "Здесь ты можешь подключать админские аккаунты Яндекса через cookies "
+        "(<code>storage_state.json</code>).",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+    await cb.answer()
 
-
-# =========================
-# ADD YANDEX ACCOUNT
-# =========================
 
 @router.callback_query(lambda c: c.data == "admin:yandex:add")
 async def admin_yandex_add(cb: CallbackQuery) -> None:
-    await cb.answer()
-
     if not is_owner(cb.from_user.id):
+        await cb.answer()
         return
 
     async with session_scope() as session:
@@ -72,10 +60,14 @@ async def admin_yandex_add(cb: CallbackQuery) -> None:
 
     await cb.message.edit_text(
         "➕ <b>Добавление Yandex-аккаунта</b>\n\n"
-        "Пришли файлом <code>storage_state.json</code> (Playwright cookies).",
+        "Пришли сюда файлом <code>storage_state.json</code> (Playwright cookies).\n\n"
+        "<b>Важно:</b>\n"
+        "— Файл должен быть .json\n"
+        "— Имя файла можно сделать как label (например <code>admin1_state.json</code>)\n",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+    await cb.answer()
 
 
 @router.message(F.document)
@@ -90,7 +82,7 @@ async def admin_receive_state_file(message: Message) -> None:
 
     doc = message.document
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".json"):
-        await message.answer("❌ Пришли файл .json", reply_markup=kb_admin_menu())
+        await message.answer("❌ Пришли файл .json (storage_state).", reply_markup=kb_admin_menu())
         return
 
     label = _safe_label_from_filename(doc.file_name)
@@ -100,11 +92,16 @@ async def admin_receive_state_file(message: Message) -> None:
     saved_name = f"{label}.json"
     saved_path = cookies_dir / saved_name
 
-    await message.bot.download(doc, destination=str(saved_path))
+    try:
+        await message.bot.download(doc, destination=str(saved_path))
+    except Exception:
+        await message.answer("❌ Не смог скачать файл из Telegram. Повтори попытку.", reply_markup=kb_admin_menu())
+        return
 
     async with session_scope() as session:
         q = select(YandexAccount).where(YandexAccount.label == label).limit(1)
-        acc = (await session.execute(q)).scalar_one_or_none()
+        res = await session.execute(q)
+        acc = res.scalar_one_or_none()
 
         if not acc:
             acc = YandexAccount(
@@ -127,91 +124,200 @@ async def admin_receive_state_file(message: Message) -> None:
         await session.commit()
 
     await message.answer(
-        f"✅ <b>Yandex-аккаунт добавлен</b>\n\n"
-        f"Label: <code>{label}</code>",
+        "✅ <b>Yandex-аккаунт добавлен</b>\n\n"
+        f"Label: <code>{label}</code>\n"
+        f"Файл: <code>{saved_name}</code>\n"
+        f"Путь: <code>{settings.yandex_cookies_dir}</code>\n\n"
+        "Теперь можно нажать «🔍 Проверить Yandex аккаунт» (Playwright).",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
 
 
-# =========================
-# LIST YANDEX ACCOUNTS
-# =========================
-
 @router.callback_query(lambda c: c.data == "admin:yandex:list")
 async def admin_yandex_list(cb: CallbackQuery) -> None:
-    await cb.answer()
-
     if not is_owner(cb.from_user.id):
+        await cb.answer()
         return
 
     async with session_scope() as session:
-        items = (await session.execute(select(YandexAccount))).scalars().all()
+        q = select(YandexAccount).order_by(YandexAccount.id.asc())
+        res = await session.execute(q)
+        items = list(res.scalars().all())
 
     if not items:
         await cb.message.edit_text(
-            "📋 Пусто",
+            "📋 <b>Yandex аккаунты</b>\n\nПока пусто. Нажми «Добавить Yandex-аккаунт».",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        return
+
+    lines = []
+    for a in items:
+        capacity = max(0, int(a.max_slots) - 1)
+        lines.append(
+            f"• <code>{a.label}</code> — {a.status} | slots: {a.used_slots}/{capacity} | plus_end: {a.plus_end_at or '—'}"
+        )
+
+    await cb.message.edit_text(
+        "📋 <b>Yandex аккаунты</b>\n\n" + "\n".join(lines),
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:yandex:probe")
+async def admin_yandex_probe(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await cb.answer("Проверяю аккаунт…", show_alert=False)
+
+    async with session_scope() as session:
+        q = (
+            select(YandexAccount)
+            .where(YandexAccount.status == "active")
+            .order_by(YandexAccount.id.asc())
+            .limit(1)
+        )
+        acc = (await session.execute(q)).scalar_one_or_none()
+
+    if not acc:
+        await cb.message.edit_text(
+            "❌ Нет активных Yandex-аккаунтов. Сначала добавь cookies (storage_state.json).",
             reply_markup=kb_admin_menu(),
             parse_mode="HTML",
         )
         return
 
-    text = "📋 <b>Yandex аккаунты</b>\n\n"
-    for a in items:
-        text += (
-            f"• <code>{a.label}</code> | "
-            f"{a.used_slots}/{a.max_slots - 1} | "
-            f"{a.status}\n"
-        )
-
-    await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
-
-
-# =========================
-# PROBE YANDEX ACCOUNT
-# =========================
-
-@router.callback_query(lambda c: c.data == "admin:yandex:probe")
-async def admin_yandex_probe(cb: CallbackQuery) -> None:
-    await cb.answer("Проверяю…")
-
-    if not is_owner(cb.from_user.id):
-        return
-
-    async with session_scope() as session:
-        acc = (
-            await session.execute(
-                select(YandexAccount)
-                .where(YandexAccount.status == "active")
-                .order_by(YandexAccount.id.asc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-
-    if not acc:
-        await cb.message.edit_text("❌ Нет активных аккаунтов", reply_markup=kb_admin_menu())
-        return
-
+    path = str(Path(settings.yandex_cookies_dir) / str(acc.credentials_ref))
     provider = build_provider()
-    path = str(Path(settings.yandex_cookies_dir) / acc.credentials_ref)
 
-    snap = await provider.probe(storage_state_path=path)
+    try:
+        snap = await provider.probe(storage_state_path=path)
+    except Exception as e:
+        await cb.message.edit_text(
+            "❌ <b>Ошибка Playwright</b>\n\n"
+            f"<code>{type(e).__name__}: {e}</code>\n\n"
+            "Проверь:\n"
+            "— cookies актуальны\n"
+            "— volume /data/yandex доступен\n",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+        return
+
+    debug_dir = (snap.raw_debug or {}).get("debug_dir")
+
     fam = snap.family
+    if not fam:
+        # ВАЖНО: если парс не удался — НЕ показываем фейковые слоты
+        await cb.message.edit_text(
+            "✅ <b>Yandex аккаунт</b>\n\n"
+            "⚠️ <b>Семья:</b> не удалось стабильно прочитать страницу (возможен редирект/капча/не прогрузилась).\n"
+            "Нажми «📦 Скачать последний debug» и посмотри скрин/HTML.\n\n"
+            f"Debug: <code>{debug_dir or '—'}</code>",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+        return
+
+    admins = ", ".join(fam.admins) if fam.admins else "—"
+    guests = ", ".join(fam.guests) if fam.guests else "—"
 
     await cb.message.edit_text(
         "✅ <b>Yandex аккаунт</b>\n\n"
-        f"Админ: <code>{', '.join(fam.admins)}</code>\n"
-        f"Гости: <code>{', '.join(fam.guests)}</code>\n"
+        f"Админ: <code>{admins}</code>\n"
+        f"Гости: <code>{guests}</code>\n"
         f"Pending: <b>{fam.pending_count}</b>\n"
-        f"Free slots: <b>{fam.free_slots}</b>",
+        f"Free slots: <b>{fam.free_slots}</b>\n\n"
+        f"Debug: <code>{debug_dir or '—'}</code>",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
 
 
-# =========================
-# FULL USER RESET (TEST)
-# =========================
+def _pick_latest_dir(root: Path) -> Path | None:
+    try:
+        if not root.exists() or not root.is_dir():
+            return None
+        dirs = [p for p in root.iterdir() if p.is_dir()]
+        if not dirs:
+            return None
+        dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return dirs[0]
+    except Exception:
+        return None
+
+
+@router.callback_query(lambda c: c.data == "admin:yandex:debug:last")
+async def admin_yandex_debug_last(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await cb.answer("Готовлю debug…", show_alert=False)
+
+    async with session_scope() as session:
+        q = (
+            select(YandexAccount)
+            .where(YandexAccount.status == "active")
+            .order_by(YandexAccount.id.asc())
+            .limit(1)
+        )
+        acc = (await session.execute(q)).scalar_one_or_none()
+
+    if not acc:
+        await cb.message.answer("❌ Нет активных Yandex-аккаунтов.", reply_markup=kb_admin_menu())
+        return
+
+    debug_root = Path(settings.yandex_cookies_dir) / "debug_out" / str(acc.label)
+    latest_run = _pick_latest_dir(debug_root)
+
+    if not latest_run:
+        await cb.message.answer(
+            "ℹ️ Debug папок пока нет.\n"
+            "Сначала нажми «🔍 Проверить Yandex аккаунт» или создай инвайт.",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    # zip -> temp file
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            zip_path = Path(tmp.name)
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in latest_run.rglob("*"):
+                if p.is_file():
+                    zf.write(p, arcname=str(p.relative_to(latest_run.parent)))
+
+        await cb.message.answer_document(
+            document=FSInputFile(str(zip_path), filename=f"yandex_debug_{acc.label}_{latest_run.name}.zip"),
+            caption=f"📦 Debug: <code>{latest_run}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        await cb.message.answer("❌ Не смог упаковать/отправить debug.", reply_markup=kb_admin_menu())
+
+
+# ==============================
+# ADMIN: FULL USER RESET (TEST)
+# ==============================
+
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+
+from app.services.admin.reset_user import AdminResetUserService
+from app.services.admin.forgive_user import AdminForgiveUserService
+
+_reset_service = AdminResetUserService()
+_forgive_service = AdminForgiveUserService()
+
 
 class AdminResetFSM(StatesGroup):
     waiting_tg_id = State()
@@ -228,8 +334,9 @@ async def admin_reset_start(cb: CallbackQuery, state: FSMContext) -> None:
 
     await cb.message.answer(
         "🧨 <b>Полный сброс пользователя</b>\n\n"
-        "Пришли <code>tg_id</code>.\n"
-        "⚠️ Будет удалено ВСЁ.",
+        "Пришли <code>tg_id</code> пользователя.\n"
+        "⚠️ Будет удалено ВСЁ: подписка, VPN, Yandex, логин.\n"
+        "Использовать ТОЛЬКО для тестов.",
         parse_mode="HTML",
     )
 
@@ -245,20 +352,22 @@ async def admin_reset_confirm(msg: Message, state: FSMContext) -> None:
         await msg.answer("❌ tg_id должен быть числом")
         return
 
-    await msg.answer("⏳ Сбрасываю пользователя…")
-    # ✅ ВАЖНО: keyword-only вызов
+    await msg.answer("⏳ Сбрасываю пользователя...")
+
     await _reset_service.reset_user(tg_id=tg_id)
+
     await state.clear()
 
     await msg.answer(
-        f"✅ Пользователь <code>{tg_id}</code> полностью сброшен",
+        f"✅ Пользователь <code>{tg_id}</code> полностью сброшен.\n"
+        "Теперь он как новый.",
         parse_mode="HTML",
     )
 
 
-# =========================
-# FORGIVE (UNBAN / CLEAR STRIKES)
-# =========================
+# ==============================
+# ADMIN: FORGIVE (remove strikes)
+# ==============================
 
 class AdminForgiveFSM(StatesGroup):
     waiting_tg_id = State()
