@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.db.models.yandex_membership import YandexMembership
 from app.db.models.user import User
 from app.db.session import session_scope
@@ -16,7 +17,7 @@ MAX_STRIKES = 2
 class YandexGuardService:
     """
     Жёсткая проверка вступления в семейную группу.
-    Кикает левых, предупреждает, банит.
+    Кикает левых, предупреждает, банит (через yandex_membership.status = blocked).
     """
 
     def __init__(self) -> None:
@@ -29,14 +30,11 @@ class YandexGuardService:
         expected_login: str,
         tg_id: int,
     ) -> None:
-        """
-        Вызывается ПОСЛЕ probe().
-        """
-        expected_login = expected_login.lower().strip()
+        expected_login = (expected_login or "").lower().strip().lstrip("@")
+        if not expected_login:
+            return
 
-        snapshot = await self.provider.probe(
-            storage_state_path=yandex_account_storage
-        )
+        snapshot = await self.provider.probe(storage_state_path=yandex_account_storage)
 
         family = snapshot.family
         if not family:
@@ -44,7 +42,6 @@ class YandexGuardService:
             return
 
         joined_logins = set(l.lower() for l in (family.guests or []))
-
         if not joined_logins:
             log.info("YandexGuard: nobody joined yet")
             return
@@ -55,25 +52,29 @@ class YandexGuardService:
             await self._mark_joined(tg_id)
             return
 
-        # ❌ ЛЕВЫЕ ПОЛЬЗОВАТЕЛИ
+        # ❌ левые (все кто в guests, кроме ожидаемого)
         intruders = joined_logins - {expected_login}
         if not intruders:
             return
 
         log.warning("YandexGuard: intruders detected: %s", intruders)
 
-        # 1️⃣ КИКАЕМ ВСЕХ ЛЕВЫХ
-        for login in intruders:
+        # 1) КИКАЕМ ВСЕХ ЛЕВЫХ
+        for login in sorted(intruders):
             try:
-                await self.provider.remove_guest(
+                ok = await self.provider.remove_guest(
                     storage_state_path=yandex_account_storage,
                     guest_login=login,
                 )
-                log.info("YandexGuard: kicked intruder %s", login)
+                log.info("YandexGuard: kicked %s -> %s", login, ok)
             except Exception:
                 log.exception("YandexGuard: failed to kick %s", login)
 
-        # 2️⃣ СТРАЙКИ
+        # 2) СТРАЙКИ/БАН (НО owner не трогаем)
+        if tg_id == int(getattr(settings, "owner_tg_id", 0) or 0):
+            log.info("YandexGuard: owner tg_id=%s -> no strikes", tg_id)
+            return
+
         async with session_scope() as session:
             user = await session.get(User, tg_id)
             ym = await self._get_membership(session, tg_id)
@@ -81,21 +82,22 @@ class YandexGuardService:
             if not user or not ym:
                 return
 
-            ym.strikes = (ym.strikes or 0) + 1
+            ym.abuse_strikes = int(ym.abuse_strikes or 0) + 1
 
-            # 3️⃣ БАН
-            if ym.strikes >= MAX_STRIKES:
-                ym.status = "banned"
-                user.yandex_blocked = True
+            # бан
+            if ym.abuse_strikes >= MAX_STRIKES:
+                ym.status = "blocked"
 
             await session.commit()
 
-        # 4️⃣ УВЕДОМЛЕНИЕ
+            strikes_now = int(ym.abuse_strikes or 0)
+
+        # 3) уведомление
         await self._notify_user(
             tg_id=tg_id,
             intruder=", ".join(sorted(intruders)),
             expected=expected_login,
-            strikes=ym.strikes,
+            strikes=strikes_now,
         )
 
     async def _get_membership(self, session, tg_id: int) -> YandexMembership | None:
@@ -124,7 +126,6 @@ class YandexGuardService:
         strikes: int,
     ) -> None:
         from aiogram import Bot
-        from app.core.config import settings
 
         bot = Bot(settings.bot_token)
 
@@ -142,7 +143,7 @@ class YandexGuardService:
                 "Вы приняли приглашение под <b>неверным логином</b>.\n\n"
                 f"Ожидался: <code>{expected}</code>\n"
                 f"Вошёл: <code>{intruder}</code>\n\n"
-                "Вы были удалены из семейной группы.\n"
+                "Лишний участник был удалён из семейной группы.\n"
                 "Повторное нарушение приведёт к блокировке."
             )
 
