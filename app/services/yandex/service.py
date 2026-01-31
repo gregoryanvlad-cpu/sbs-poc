@@ -14,6 +14,10 @@ from app.services.yandex.provider import build_provider
 INVITE_TTL_MINUTES = 15
 
 
+def _norm_login(x: str | None) -> str:
+    return (x or "").strip().lstrip("@").lower()
+
+
 def _allowed_logins_from_env() -> set[str]:
     raw = getattr(settings, "yandex_allowed_logins", None)
     if not raw:
@@ -63,7 +67,7 @@ class YandexService:
         membership = YandexMembership(
             tg_id=tg_id,
             yandex_account_id=account.id,
-            yandex_login=yandex_login,
+            yandex_login=_norm_login(yandex_login),
             invite_link=invite_link,
             invite_issued_at=now,
             invite_expires_at=now + timedelta(minutes=INVITE_TTL_MINUTES),
@@ -114,6 +118,10 @@ class YandexService:
         return affected
 
     async def sync_family_and_activate(self, session) -> Tuple[List[int], List[str]]:
+        """
+        1) awaiting_join -> active (если логин появился в семье)
+        2) active -> removed (если активный логин ПРОПАЛ из семьи)
+        """
         activated: List[int] = []
         debug_dirs: List[str] = []
 
@@ -134,8 +142,10 @@ class YandexService:
             if not acc.credentials_ref:
                 continue
 
+            storage_path = self._account_state_path(acc)
+
             try:
-                snap = await self.provider.probe(storage_state_path=self._account_state_path(acc))
+                snap = await self.provider.probe(storage_state_path=storage_path)
                 if snap.raw_debug and snap.raw_debug.get("debug_dir"):
                     debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
             except Exception:
@@ -150,9 +160,10 @@ class YandexService:
             except Exception:
                 pass
 
-            fam_admins = {x.lower() for x in (fam.admins or [])}
-            fam_guests = {x.lower() for x in (fam.guests or [])}
+            fam_admins = {_norm_login(x) for x in (fam.admins or [])}
+            fam_guests = {_norm_login(x) for x in (fam.guests or [])}
 
+            # awaiting_join -> active
             pending_memberships = (
                 await session.scalars(
                     select(YandexMembership).where(
@@ -163,7 +174,7 @@ class YandexService:
             ).all()
 
             for m in pending_memberships:
-                login = (m.yandex_login or "").strip().lstrip("@").lower()
+                login = _norm_login(m.yandex_login)
                 if not login:
                     continue
 
@@ -175,13 +186,34 @@ class YandexService:
                     m.updated_at = now
                     activated.append(m.tg_id)
 
+            # active -> removed (если исчез из семьи)
+            active_memberships = (
+                await session.scalars(
+                    select(YandexMembership).where(
+                        YandexMembership.yandex_account_id == acc.id,
+                        YandexMembership.status == "active",
+                    )
+                )
+            ).all()
+
+            for m in active_memberships:
+                login = _norm_login(m.yandex_login)
+                if not login:
+                    continue
+                if login not in fam_guests and login not in fam_admins:
+                    # его реально нет в семье сейчас -> считаем удалённым
+                    m.status = "removed"
+                    m.updated_at = now
+
         return activated, debug_dirs
 
     async def enforce_no_foreign_logins(self, session) -> Tuple[List[tuple[int, str]], List[str]]:
         """
         Автоматика "левые логины":
-        - ищем гостей, которые НЕ в allowed
-        - удаляем их
+        - берём состав семьи
+        - строим allowed так, чтобы НЕ пропускать "устаревших active"
+          (active считаем allowed только если он реально сейчас в семье)
+        - кикаем всех гостей НЕ в allowed
         - strikes выдаём только если есть ровно один awaiting_join
         - OWNER (settings.owner_tg_id) никогда не получает strikes/ban
         - allowlist логинов из ENV никогда не кикаем
@@ -222,10 +254,10 @@ class YandexService:
             if not fam:
                 continue
 
-            fam_admins = {x.lower() for x in (fam.admins or [])}
-            fam_guests = {x.lower() for x in (fam.guests or [])}
+            fam_admins = {_norm_login(x) for x in (fam.admins or [])}
+            fam_guests = {_norm_login(x) for x in (fam.guests or [])}
 
-            # allowed = админы + active-members + allowlist
+            # Берём active-members из БД, но разрешаем ТОЛЬКО тех, кто реально в семье сейчас
             active_members = (
                 await session.scalars(
                     select(YandexMembership).where(
@@ -235,11 +267,15 @@ class YandexService:
                 )
             ).all()
 
-            allowed = {m.yandex_login.strip().lstrip("@").lower() for m in active_members if m.yandex_login}
-            allowed |= fam_admins
-            allowed |= allowlist
+            active_present = set()
+            for m in active_members:
+                login = _norm_login(m.yandex_login)
+                if login and (login in fam_guests or login in fam_admins):
+                    active_present.add(login)
 
-            foreign = sorted([g for g in fam_guests if g not in allowed])
+            allowed = set(fam_admins) | set(allowlist) | active_present
+
+            foreign = sorted([g for g in fam_guests if g and g not in allowed])
             if not foreign:
                 continue
 
@@ -254,13 +290,15 @@ class YandexService:
             ).all()
             culprit = awaiting[0] if len(awaiting) == 1 else None
 
-            # кикаем чужих (кроме allowlist)
-            kicked = []
+            kicked: list[str] = []
             for guest_login in foreign:
                 if guest_login in allowlist:
                     continue
                 try:
-                    ok = await self.provider.remove_guest(storage_state_path=storage_path, guest_login=guest_login)
+                    ok = await self.provider.remove_guest(
+                        storage_state_path=storage_path,
+                        guest_login=guest_login,
+                    )
                     if ok:
                         kicked.append(guest_login)
                 except Exception:
