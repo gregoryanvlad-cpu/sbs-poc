@@ -64,6 +64,10 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
     b.button(text="📋 Список аккаунтов", callback_data="admin:yandex:list")
     b.button(text="🔍 Проверить Yandex аккаунт", callback_data="admin:yandex:probe")
+
+    # ✅ НОВОЕ: снять страйки / разблокировать reinvite
+    b.button(text="🧽 Снять страйки Yandex", callback_data="admin:forgive:user")
+
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
