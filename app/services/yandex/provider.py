@@ -19,7 +19,8 @@ _MONTHS_RU = (
 )
 
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
-LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b", re.I)
+LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
+
 
 # ==========================
 # Debug storage management
@@ -210,7 +211,7 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
 
     filtered: list[str] = []
     for c in candidates:
-        c = c.lower()
+        c = c.lower().strip()
         if c in blacklist:
             continue
         if c.isdigit():
@@ -238,39 +239,18 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
     )
 
 
-# ==========================
-# ✅ SPEED FIXES
-# ==========================
-
 async def _goto(page: Page, url: str, out_dir: Path, prefix: str) -> None:
-    """
-    ВАЖНО: НЕ networkidle.
-    У Яндекса фоновые запросы часто бесконечны => networkidle может висеть до таймаута.
-    """
-    await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-
-    # небольшая пауза на отрисовку
-    try:
-        await page.wait_for_timeout(1200)
-    except Exception:
-        pass
-
-    # пытаемся дождаться базового UI, но без фанатизма
-    try:
-        await page.wait_for_selector("body", timeout=5_000)
-    except Exception:
-        pass
-
+    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    await page.wait_for_load_state("networkidle", timeout=60_000)
     await _save_debug(page, out_dir, prefix)
 
 
 async def _click_by_text(page: Page, text: str, out_dir: Path, prefix: str) -> bool:
     loc = page.get_by_text(text, exact=False)
     try:
-        await loc.first.wait_for(state="visible", timeout=6_000)
-        await loc.first.click(timeout=6_000)
-        # не networkidle — короткая пауза на модалку/рендер
-        await page.wait_for_timeout(900)
+        await loc.first.wait_for(state="visible", timeout=10_000)
+        await loc.first.click()
+        await page.wait_for_load_state("networkidle", timeout=30_000)
         await _save_debug(page, out_dir, prefix)
         return True
     except Exception:
@@ -297,15 +277,85 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
     return None
 
 
+async def _wait_family_ui(page: Page) -> None:
+    """
+    Иногда networkidle приходит раньше, чем нарисуется блок "Семья".
+    Мягко подождём появления любого "якоря" интерфейса.
+    """
+    anchors = [
+        page.get_by_text("Семейная группа", exact=False),
+        page.get_by_text("Пригласить близкого", exact=False),
+        page.get_by_text("Пригласить", exact=False),
+    ]
+    for a in anchors:
+        try:
+            await a.first.wait_for(state="visible", timeout=6_000)
+            return
+        except Exception:
+            pass
+
+
+async def _click_nearest_clickable_ancestor(page: Page, needle_text: str) -> bool:
+    """
+    Фоллбек: если "Пригласить близкого" — это не button/link,
+    кликаем по ближайшему кликабельному предку (button/a/div[role=button]).
+    """
+    js = """
+    (needle) => {
+      const els = Array.from(document.querySelectorAll("*"))
+        .filter(el => el && el.innerText && el.innerText.trim().includes(needle));
+      if (!els.length) return false;
+
+      // берем самый "узкий" (наиболее вложенный) элемент
+      els.sort((a,b) => (a.innerText.length||0) - (b.innerText.length||0));
+      let el = els[0];
+
+      const isClickable = (x) => {
+        if (!x) return false;
+        const tag = (x.tagName||"").toLowerCase();
+        if (tag === "button" || tag === "a") return true;
+        const role = (x.getAttribute && x.getAttribute("role")) || "";
+        if (role.toLowerCase() === "button" || role.toLowerCase() === "link") return true;
+        return false;
+      };
+
+      // поднимаемся вверх, ищем кликабельный контейнер
+      let cur = el;
+      for (let i=0; i<8; i++) {
+        if (isClickable(cur)) { cur.click(); return true; }
+        cur = cur.parentElement;
+        if (!cur) break;
+      }
+
+      // если не нашли — пробуем кликнуть по самому элементу
+      el.click();
+      return true;
+    }
+    """
+    try:
+        ok = await page.evaluate(js, needle_text)
+        return bool(ok)
+    except Exception:
+        return False
+
+
 async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
+    """
+    Усиленный клик по "+ Пригласить близкого".
+    Главное отличие: умеем кликнуть по строке/карточке,
+    даже если это не role=button/link.
+    """
     try:
         await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(250)
+        await page.wait_for_timeout(300)
     except Exception:
         pass
 
+    await _wait_family_ui(page)
+
     patterns = [
         re.compile(r"Пригласить близкого", re.I),
+        re.compile(r"\+\s*Пригласить близкого", re.I),
         re.compile(r"Пригласить", re.I),
         re.compile(r"Добавить.*сем(ь|ю)ю", re.I),
     ]
@@ -315,28 +365,39 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
         candidates.append(page.get_by_role("button", name=pat))
         candidates.append(page.get_by_role("link", name=pat))
 
+    # текстовые локаторы (часто это div/section)
     candidates.append(page.locator("text=Пригласить близкого"))
+    candidates.append(page.locator("text=+ Пригласить близкого"))
     candidates.append(page.locator("text=Пригласить"))
-    candidates.append(page.locator("text=Пригласить близкого").locator("xpath=.."))  # на случай кликабельного контейнера
 
+    # 1) обычные попытки
     for loc in candidates:
         try:
             if await loc.count() == 0:
                 continue
             el = loc.first
-
             try:
                 await el.scroll_into_view_if_needed(timeout=2_000)
-                await page.wait_for_timeout(120)
+                await page.wait_for_timeout(150)
             except Exception:
                 pass
 
             await el.click(timeout=5_000)
-            await page.wait_for_timeout(900)
+            await page.wait_for_load_state("networkidle", timeout=30_000)
             await _save_debug(page, out_dir, "click_invite_OK")
             return True
         except Exception:
             continue
+
+    # 2) фоллбек: ближайший кликабельный предок по тексту
+    ok2 = await _click_nearest_clickable_ancestor(page, "Пригласить близкого")
+    if ok2:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+        except Exception:
+            pass
+        await _save_debug(page, out_dir, "click_invite_OK_fallback")
+        return True
 
     await _save_debug(page, out_dir, "invite_button_NOT_FOUND")
     return False
@@ -353,7 +414,7 @@ async def _click_confirm_remove(page: Page) -> bool:
             btn = page.get_by_role("button", name=pat)
             if await btn.count() > 0:
                 await btn.first.click(timeout=6_000)
-                await page.wait_for_timeout(900)
+                await page.wait_for_load_state("networkidle", timeout=20_000)
                 return True
         except Exception:
             continue
@@ -391,6 +452,7 @@ class PlaywrightYandexProvider:
 
             try:
                 await _goto(page, FAMILY_URL, debug_dir, "family")
+                await _wait_family_ui(page)
                 body = await page.locator("body").inner_text()
                 family_snap = parse_family_min(body or "")
             except Exception:
@@ -405,7 +467,9 @@ class PlaywrightYandexProvider:
             raw_debug={"debug_dir": str(debug_dir)},
         )
 
-    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool:
+    async def cancel_pending_invite(
+        self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending"
+    ) -> bool:
         root = _debug_root()
         _prune_debug_root(root)
 
@@ -424,11 +488,12 @@ class PlaywrightYandexProvider:
             page = await context.new_page()
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
+            await _wait_family_ui(page)
 
             pending_loc = page.get_by_text("Ждём ответ", exact=False)
             try:
                 await pending_loc.first.wait_for(state="visible", timeout=5_000)
-                await pending_loc.first.click(timeout=6_000)
+                await pending_loc.first.click()
                 await _save_debug(page, debug_dir, "pending_opened")
             except Exception:
                 await _save_debug(page, debug_dir, "no_pending")
@@ -466,15 +531,17 @@ class PlaywrightYandexProvider:
             page = await context.new_page()
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
+            await _wait_family_ui(page)
 
             # если уже есть pending — отменяем
             try:
                 pending = page.get_by_text("Ждём ответ", exact=False)
                 if await pending.count() > 0:
-                    await pending.first.click(timeout=6_000)
+                    await pending.first.click()
                     await _save_debug(page, debug_dir, "pending_modal_opened")
                     await _click_by_text(page, "Отменить приглашение", debug_dir, "pending_cancelled")
                     await _goto(page, FAMILY_URL, debug_dir, "family_after_cancel")
+                    await _wait_family_ui(page)
             except Exception:
                 pass
 
@@ -486,7 +553,7 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Invite button not found. Debug: {debug_dir}")
                 return ""
 
-            # иногда показывается "Кто это для вас?" -> пропускаем
+            # иногда появляется экран "Кто этот человек для вас?"
             await _click_by_text(page, "Пропустить", debug_dir, "relation_skipped")
 
             share_clicked = await _click_by_text(page, "Поделиться ссылкой", debug_dir, "share_clicked")
@@ -504,7 +571,7 @@ class PlaywrightYandexProvider:
                 if invite_link:
                     break
                 try:
-                    await page.wait_for_timeout(450)
+                    await page.wait_for_timeout(800)
                 except Exception:
                     pass
 
@@ -542,15 +609,14 @@ class PlaywrightYandexProvider:
             page = await context.new_page()
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
+            await _wait_family_ui(page)
 
-            # 1) открываем карточку гостя по логину
             clicked_card = False
             try:
                 loc = page.get_by_text(guest_login, exact=False)
                 if await loc.count() > 0:
-                    await loc.first.scroll_into_view_if_needed(timeout=4_000)
-                    await loc.first.click(timeout=6_000)
-                    await page.wait_for_timeout(800)
+                    await loc.first.scroll_into_view_if_needed(timeout=8_000)
+                    await loc.first.click(timeout=8_000)
                     await _save_debug(page, debug_dir, "guest_card_opened")
                     clicked_card = True
             except Exception:
@@ -562,12 +628,11 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            # 2) жмем "Удалить из семейной группы" / "Исключить"
-            removed = await _click_by_text(page, "Удалить из семейной группы", debug_dir, "click_remove")
+            removed = await _click_by_text(page, "Удалить из семейной группы", debug_dir, "click_remove_new")
             if not removed:
-                removed = await _click_by_text(page, "Исключить из семейной группы", debug_dir, "click_remove_2")
+                removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
             if not removed:
-                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_3")
+                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
 
             if not removed:
                 await _save_debug(page, debug_dir, "remove_button_not_found")
@@ -575,7 +640,6 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            # 3) подтверждение "Исключить"
             await _click_confirm_remove(page)
             await _save_debug(page, debug_dir, "remove_confirmed")
 
