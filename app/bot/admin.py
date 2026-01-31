@@ -16,9 +16,12 @@ from app.db.models.yandex_account import YandexAccount
 from app.db.session import session_scope
 from app.services.yandex.provider import build_provider
 from app.services.admin.reset_user import AdminResetUserService
+from app.services.admin.forgive_user import AdminForgiveUserService
 
 router = Router()
+
 _reset_service = AdminResetUserService()
+_forgive_service = AdminForgiveUserService()
 
 
 # =========================
@@ -70,7 +73,7 @@ async def admin_yandex_add(cb: CallbackQuery) -> None:
 
     await cb.message.edit_text(
         "➕ <b>Добавление Yandex-аккаунта</b>\n\n"
-        "Пришли файлом <code>storage_state.json</code> (Playwright cookies).",
+        "Пришли файлом <code>storage_state.json</code>",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
@@ -88,7 +91,7 @@ async def admin_receive_state_file(message: Message) -> None:
 
     doc = message.document
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".json"):
-        await message.answer("❌ Пришли файл .json", reply_markup=kb_admin_menu())
+        await message.answer("❌ Нужен .json файл", reply_markup=kb_admin_menu())
         return
 
     label = _safe_label_from_filename(doc.file_name)
@@ -101,7 +104,7 @@ async def admin_receive_state_file(message: Message) -> None:
     await message.bot.download(doc, destination=str(saved_path))
 
     async with session_scope() as session:
-        q = select(YandexAccount).where(YandexAccount.label == label).limit(1)
+        q = select(YandexAccount).where(YandexAccount.label == label)
         acc = (await session.execute(q)).scalar_one_or_none()
 
         if not acc:
@@ -125,90 +128,14 @@ async def admin_receive_state_file(message: Message) -> None:
         await session.commit()
 
     await message.answer(
-        f"✅ <b>Yandex-аккаунт добавлен</b>\n\n"
-        f"Label: <code>{label}</code>",
+        f"✅ Yandex аккаунт <code>{label}</code> добавлен",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
 
 
 # =========================
-# LIST YANDEX ACCOUNTS
-# =========================
-
-@router.callback_query(lambda c: c.data == "admin:yandex:list")
-async def admin_yandex_list(cb: CallbackQuery) -> None:
-    await cb.answer()
-
-    if not is_owner(cb.from_user.id):
-        return
-
-    async with session_scope() as session:
-        items = (await session.execute(select(YandexAccount))).scalars().all()
-
-    if not items:
-        await cb.message.edit_text(
-            "📋 Пусто",
-            reply_markup=kb_admin_menu(),
-            parse_mode="HTML",
-        )
-        return
-
-    text = "📋 <b>Yandex аккаунты</b>\n\n"
-    for a in items:
-        text += (
-            f"• <code>{a.label}</code> | "
-            f"{a.used_slots}/{a.max_slots - 1} | "
-            f"{a.status}\n"
-        )
-
-    await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
-
-
-# =========================
-# PROBE YANDEX ACCOUNT
-# =========================
-
-@router.callback_query(lambda c: c.data == "admin:yandex:probe")
-async def admin_yandex_probe(cb: CallbackQuery) -> None:
-    await cb.answer("Проверяю…")
-
-    if not is_owner(cb.from_user.id):
-        return
-
-    async with session_scope() as session:
-        acc = (
-            await session.execute(
-                select(YandexAccount)
-                .where(YandexAccount.status == "active")
-                .order_by(YandexAccount.id.asc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-
-    if not acc:
-        await cb.message.edit_text("❌ Нет активных аккаунтов", reply_markup=kb_admin_menu())
-        return
-
-    provider = build_provider()
-    path = str(Path(settings.yandex_cookies_dir) / acc.credentials_ref)
-
-    snap = await provider.probe(storage_state_path=path)
-    fam = snap.family
-
-    await cb.message.edit_text(
-        "✅ <b>Yandex аккаунт</b>\n\n"
-        f"Админ: <code>{', '.join(fam.admins)}</code>\n"
-        f"Гости: <code>{', '.join(fam.guests)}</code>\n"
-        f"Pending: <b>{fam.pending_count}</b>\n"
-        f"Free slots: <b>{fam.free_slots}</b>",
-        reply_markup=kb_admin_menu(),
-        parse_mode="HTML",
-    )
-
-
-# =========================
-# FULL USER RESET (TEST)
+# RESET USER (TEST)
 # =========================
 
 class AdminResetFSM(StatesGroup):
@@ -223,11 +150,10 @@ async def admin_reset_start(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.set_state(AdminResetFSM.waiting_tg_id)
-
     await cb.message.answer(
         "🧨 <b>Полный сброс пользователя</b>\n\n"
         "Пришли <code>tg_id</code>.\n"
-        "⚠️ Будет удалено ВСЁ.",
+        "⚠️ Удаляется ВСЁ.",
         parse_mode="HTML",
     )
 
@@ -243,11 +169,58 @@ async def admin_reset_confirm(msg: Message, state: FSMContext) -> None:
         await msg.answer("❌ tg_id должен быть числом")
         return
 
-    await msg.answer("⏳ Сбрасываю пользователя…")
-    await _reset_service.reset_user(tg_id=tg_id)
+    await _reset_service.reset_user(tg_id)
     await state.clear()
 
     await msg.answer(
         f"✅ Пользователь <code>{tg_id}</code> полностью сброшен",
         parse_mode="HTML",
     )
+
+
+# =========================
+# FORGIVE / UNBAN USER
+# =========================
+
+class AdminForgiveFSM(StatesGroup):
+    waiting_tg_id = State()
+
+
+@router.callback_query(lambda c: c.data == "admin:forgive:user")
+async def admin_forgive_start(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+
+    if not is_owner(cb.from_user.id):
+        return
+
+    await state.set_state(AdminForgiveFSM.waiting_tg_id)
+    await cb.message.answer(
+        "🧽 <b>Снять страйки / разбанить Yandex</b>\n\n"
+        "Пришли <code>tg_id</code> пользователя.\n"
+        "Можно вводить и свой ID.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminForgiveFSM.waiting_tg_id)
+async def admin_forgive_confirm(msg: Message, state: FSMContext) -> None:
+    if not is_owner(msg.from_user.id):
+        return
+
+    try:
+        tg_id = int(msg.text.strip())
+    except ValueError:
+        await msg.answer("❌ tg_id должен быть числом")
+        return
+
+    ok = await _forgive_service.forgive_yandex(tg_id)
+    await state.clear()
+
+    if ok:
+        await msg.answer(
+            f"✅ Пользователь <code>{tg_id}</code> прощён\n"
+            "Strikes = 0, reinvite разблокирован",
+            parse_mode="HTML",
+        )
+    else:
+        await msg.answer("ℹ️ У пользователя нет Yandex-записи")
