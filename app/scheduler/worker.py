@@ -12,7 +12,7 @@ from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
 from app.repo import list_expired_subscriptions, set_subscription_expired
 from app.services.yandex.service import yandex_service
-from app.services.yandex.guard import YandexGuardService
+from app.services.vpn.guard import YandexGuardService
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_membership import YandexMembership
 
