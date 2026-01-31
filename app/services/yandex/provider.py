@@ -19,8 +19,7 @@ _MONTHS_RU = (
 )
 
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
-LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
-
+LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b", re.I)
 
 # ==========================
 # Debug storage management
@@ -127,17 +126,10 @@ class YandexProbeSnapshot:
 class YandexProvider(Protocol):
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot: ...
     async def create_invite_link(
-        self,
-        *,
-        storage_state_path: str,
-        debug_dir_name: str = "invite",
-        strict: bool = True
+        self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True
     ) -> str: ...
     async def cancel_pending_invite(
-        self,
-        *,
-        storage_state_path: str,
-        debug_dir_name: str = "cancel_pending"
+        self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending"
     ) -> bool: ...
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool: ...
 
@@ -218,6 +210,7 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
 
     filtered: list[str] = []
     for c in candidates:
+        c = c.lower()
         if c in blacklist:
             continue
         if c.isdigit():
@@ -245,18 +238,39 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
     )
 
 
+# ==========================
+# ✅ SPEED FIXES
+# ==========================
+
 async def _goto(page: Page, url: str, out_dir: Path, prefix: str) -> None:
-    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_load_state("networkidle", timeout=60_000)
+    """
+    ВАЖНО: НЕ networkidle.
+    У Яндекса фоновые запросы часто бесконечны => networkidle может висеть до таймаута.
+    """
+    await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+
+    # небольшая пауза на отрисовку
+    try:
+        await page.wait_for_timeout(1200)
+    except Exception:
+        pass
+
+    # пытаемся дождаться базового UI, но без фанатизма
+    try:
+        await page.wait_for_selector("body", timeout=5_000)
+    except Exception:
+        pass
+
     await _save_debug(page, out_dir, prefix)
 
 
 async def _click_by_text(page: Page, text: str, out_dir: Path, prefix: str) -> bool:
     loc = page.get_by_text(text, exact=False)
     try:
-        await loc.first.wait_for(state="visible", timeout=10_000)
-        await loc.first.click()
-        await page.wait_for_load_state("networkidle", timeout=30_000)
+        await loc.first.wait_for(state="visible", timeout=6_000)
+        await loc.first.click(timeout=6_000)
+        # не networkidle — короткая пауза на модалку/рендер
+        await page.wait_for_timeout(900)
         await _save_debug(page, out_dir, prefix)
         return True
     except Exception:
@@ -286,7 +300,7 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
 async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
     try:
         await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(250)
     except Exception:
         pass
 
@@ -303,20 +317,22 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
 
     candidates.append(page.locator("text=Пригласить близкого"))
     candidates.append(page.locator("text=Пригласить"))
+    candidates.append(page.locator("text=Пригласить близкого").locator("xpath=.."))  # на случай кликабельного контейнера
 
     for loc in candidates:
         try:
             if await loc.count() == 0:
                 continue
             el = loc.first
+
             try:
                 await el.scroll_into_view_if_needed(timeout=2_000)
-                await page.wait_for_timeout(150)
+                await page.wait_for_timeout(120)
             except Exception:
                 pass
 
-            await el.click(timeout=3_000)
-            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await el.click(timeout=5_000)
+            await page.wait_for_timeout(900)
             await _save_debug(page, out_dir, "click_invite_OK")
             return True
         except Exception:
@@ -326,13 +342,8 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
     return False
 
 
-async def _click_confirm_remove(page: Page, out_dir: Path) -> bool:
-    """
-    Финальное подтверждение на модалке (твой скрин №3).
-    Там именно кнопка "Исключить".
-    """
+async def _click_confirm_remove(page: Page) -> bool:
     patterns = [
-        re.compile(r"Исключить$", re.I),
         re.compile(r"Исключить", re.I),
         re.compile(r"Удалить", re.I),
         re.compile(r"Подтвердить", re.I),
@@ -341,25 +352,11 @@ async def _click_confirm_remove(page: Page, out_dir: Path) -> bool:
         try:
             btn = page.get_by_role("button", name=pat)
             if await btn.count() > 0:
-                await btn.first.click(timeout=5_000)
-                await page.wait_for_load_state("networkidle", timeout=30_000)
-                await _save_debug(page, out_dir, "remove_confirm_clicked")
+                await btn.first.click(timeout=6_000)
+                await page.wait_for_timeout(900)
                 return True
         except Exception:
             continue
-
-    # запасной вариант: просто по тексту
-    try:
-        loc = page.locator("text=Исключить")
-        if await loc.count() > 0:
-            await loc.first.click(timeout=5_000)
-            await page.wait_for_load_state("networkidle", timeout=30_000)
-            await _save_debug(page, out_dir, "remove_confirm_clicked_text")
-            return True
-    except Exception:
-        pass
-
-    await _save_debug(page, out_dir, "remove_confirm_NOT_FOUND")
     return False
 
 
@@ -431,7 +428,7 @@ class PlaywrightYandexProvider:
             pending_loc = page.get_by_text("Ждём ответ", exact=False)
             try:
                 await pending_loc.first.wait_for(state="visible", timeout=5_000)
-                await pending_loc.first.click()
+                await pending_loc.first.click(timeout=6_000)
                 await _save_debug(page, debug_dir, "pending_opened")
             except Exception:
                 await _save_debug(page, debug_dir, "no_pending")
@@ -474,7 +471,7 @@ class PlaywrightYandexProvider:
             try:
                 pending = page.get_by_text("Ждём ответ", exact=False)
                 if await pending.count() > 0:
-                    await pending.first.click()
+                    await pending.first.click(timeout=6_000)
                     await _save_debug(page, debug_dir, "pending_modal_opened")
                     await _click_by_text(page, "Отменить приглашение", debug_dir, "pending_cancelled")
                     await _goto(page, FAMILY_URL, debug_dir, "family_after_cancel")
@@ -489,6 +486,7 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Invite button not found. Debug: {debug_dir}")
                 return ""
 
+            # иногда показывается "Кто это для вас?" -> пропускаем
             await _click_by_text(page, "Пропустить", debug_dir, "relation_skipped")
 
             share_clicked = await _click_by_text(page, "Поделиться ссылкой", debug_dir, "share_clicked")
@@ -501,12 +499,12 @@ class PlaywrightYandexProvider:
                 return ""
 
             invite_link: Optional[str] = None
-            for _ in range(10):
+            for _ in range(12):
                 invite_link = await _extract_invite_from_page(page)
                 if invite_link:
                     break
                 try:
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(450)
                 except Exception:
                     pass
 
@@ -522,13 +520,6 @@ class PlaywrightYandexProvider:
         return invite_link
 
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
-        """
-        Удаление участника из семьи.
-        ВАЖНО: UI сейчас такой:
-        1) клик по карточке гостя
-        2) кнопка "Удалить из семейной группы"
-        3) подтверждение "Исключить"
-        """
         guest_login = (guest_login or "").strip().lstrip("@").lower()
         if not guest_login:
             return False
@@ -552,128 +543,47 @@ class PlaywrightYandexProvider:
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
-            # --- 1) Открыть карточку гостя (клик по списку участников) ---
-            clicked = False
-
-            # Стратегия A: кликаем по тексту логина внутри основного контента
+            # 1) открываем карточку гостя по логину
+            clicked_card = False
             try:
-                loc = page.locator("main").get_by_text(guest_login, exact=False)
+                loc = page.get_by_text(guest_login, exact=False)
                 if await loc.count() > 0:
-                    await loc.first.scroll_into_view_if_needed(timeout=7_000)
-                    await page.wait_for_timeout(150)
-                    await loc.first.click(timeout=7_000)
-                    clicked = True
-                    await _save_debug(page, debug_dir, "guest_card_opened_A")
+                    await loc.first.scroll_into_view_if_needed(timeout=4_000)
+                    await loc.first.click(timeout=6_000)
+                    await page.wait_for_timeout(800)
+                    await _save_debug(page, debug_dir, "guest_card_opened")
+                    clicked_card = True
             except Exception:
-                clicked = False
+                clicked_card = False
 
-            # Стратегия B: ищем кликабельный контейнер, содержащий логин (div/a/button)
-            if not clicked:
-                try:
-                    container = page.locator("main").locator("a,button,div").filter(has_text=guest_login)
-                    if await container.count() > 0:
-                        await container.first.scroll_into_view_if_needed(timeout=7_000)
-                        await page.wait_for_timeout(150)
-                        await container.first.click(timeout=7_000)
-                        clicked = True
-                        await _save_debug(page, debug_dir, "guest_card_opened_B")
-                except Exception:
-                    clicked = False
-
-            # Стратегия C: role link/button по имени логина
-            if not clicked:
-                try:
-                    for loc in [
-                        page.get_by_role("link", name=re.compile(re.escape(guest_login), re.I)),
-                        page.get_by_role("button", name=re.compile(re.escape(guest_login), re.I)),
-                    ]:
-                        if await loc.count() > 0:
-                            await loc.first.scroll_into_view_if_needed(timeout=7_000)
-                            await page.wait_for_timeout(150)
-                            await loc.first.click(timeout=7_000)
-                            clicked = True
-                            await _save_debug(page, debug_dir, "guest_card_opened_C")
-                            break
-                except Exception:
-                    clicked = False
-
-            if not clicked:
+            if not clicked_card:
                 await _save_debug(page, debug_dir, "guest_card_not_found")
                 await context.close()
                 await browser.close()
                 return False
 
-            # ждём, что появится модалка/панель участника
-            try:
-                dlg = page.get_by_role("dialog")
-                if await dlg.count() > 0:
-                    await dlg.first.wait_for(state="visible", timeout=5_000)
-            except Exception:
-                pass
+            # 2) жмем "Удалить из семейной группы" / "Исключить"
+            removed = await _click_by_text(page, "Удалить из семейной группы", debug_dir, "click_remove")
+            if not removed:
+                removed = await _click_by_text(page, "Исключить из семейной группы", debug_dir, "click_remove_2")
+            if not removed:
+                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_3")
 
-            await _save_debug(page, debug_dir, "guest_modal_state")
-
-            # --- 2) Нажать "Удалить из семейной группы" (как на твоём скрине №2) ---
-            removed_clicked = False
-            remove_patterns = [
-                re.compile(r"Удалить из семейной группы", re.I),
-                re.compile(r"Исключить из семейной группы", re.I),
-                re.compile(r"Удалить из семьи", re.I),
-                re.compile(r"Исключить из семьи", re.I),
-                re.compile(r"Исключить", re.I),
-            ]
-
-            for pat in remove_patterns:
-                try:
-                    btn = page.get_by_role("button", name=pat)
-                    if await btn.count() > 0:
-                        await btn.first.click(timeout=7_000)
-                        await page.wait_for_load_state("networkidle", timeout=30_000)
-                        removed_clicked = True
-                        await _save_debug(page, debug_dir, "remove_clicked_role")
-                        break
-                except Exception:
-                    pass
-
-            if not removed_clicked:
-                # запасной клик по тексту (иногда это не button, а пункт меню)
-                for text in [
-                    "Удалить из семейной группы",
-                    "Исключить из семейной группы",
-                    "Удалить из семьи",
-                    "Исключить из семьи",
-                    "Исключить",
-                ]:
-                    try:
-                        loc = page.locator(f"text={text}")
-                        if await loc.count() > 0:
-                            await loc.first.click(timeout=7_000)
-                            await page.wait_for_load_state("networkidle", timeout=30_000)
-                            removed_clicked = True
-                            await _save_debug(page, debug_dir, "remove_clicked_text")
-                            break
-                    except Exception:
-                        pass
-
-            if not removed_clicked:
+            if not removed:
                 await _save_debug(page, debug_dir, "remove_button_not_found")
                 await context.close()
                 await browser.close()
                 return False
 
-            # --- 3) Подтверждение "Исключить" (скрин №3) ---
-            confirmed = await _click_confirm_remove(page, debug_dir)
-            await _save_debug(page, debug_dir, "remove_done")
+            # 3) подтверждение "Исключить"
+            await _click_confirm_remove(page)
+            await _save_debug(page, debug_dir, "remove_confirmed")
 
             await context.close()
             await browser.close()
 
-        return bool(confirmed)
+        return True
 
-
-# ======================================================
-# build_provider()
-# ======================================================
 
 def build_provider() -> YandexProvider:
     provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
