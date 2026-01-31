@@ -126,16 +126,9 @@ class YandexProbeSnapshot:
 
 class YandexProvider(Protocol):
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot: ...
-    async def create_invite_link(
-        self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True
-    ) -> str: ...
-    async def cancel_pending_invite(
-        self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending"
-    ) -> bool: ...
+    async def create_invite_link(self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True) -> str: ...
+    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool: ...
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool: ...
-
-    # ✅ ВАЖНО для guard: единое имя метода “кика”
-    async def kick_member(self, *, storage_state_path: str, login: str) -> bool: ...
 
 
 def _now_tag() -> str:
@@ -327,14 +320,49 @@ async def _click_confirm_remove(page: Page) -> bool:
         re.compile(r"Исключить", re.I),
         re.compile(r"Удалить", re.I),
         re.compile(r"Подтвердить", re.I),
+        re.compile(r"Да", re.I),
     ]
     for pat in patterns:
+        # пробуем и role=button, и просто text (в Яндексе часто div)
         try:
             btn = page.get_by_role("button", name=pat)
             if await btn.count() > 0:
-                await btn.first.click(timeout=3_000)
+                await btn.first.click(timeout=5_000)
                 await page.wait_for_load_state("networkidle", timeout=20_000)
                 return True
+        except Exception:
+            pass
+        try:
+            loc = page.locator("text=" + pat.pattern)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=5_000)
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _open_guest_actions(page: Page, out_dir: Path) -> bool:
+    """
+    Иногда карточка гостя открывается, но кнопка удаления спрятана в меню ⋯.
+    """
+    # варианты кнопки "ещё" / "меню"
+    candidates = [
+        page.get_by_role("button", name=re.compile(r"Ещё", re.I)),
+        page.get_by_role("button", name=re.compile(r"Еще", re.I)),
+        page.locator("button:has-text('⋯')"),
+        page.locator("button:has-text('...')"),
+        page.locator("[aria-label*='Ещё'], [aria-label*='Еще'], [aria-label*='Меню'], [aria-label*='menu']"),
+    ]
+    for loc in candidates:
+        try:
+            if await loc.count() == 0:
+                continue
+            await loc.first.click(timeout=3_000)
+            await page.wait_for_timeout(300)
+            await _save_debug(page, out_dir, "guest_actions_opened")
+            return True
         except Exception:
             continue
     return False
@@ -499,6 +527,13 @@ class PlaywrightYandexProvider:
         return invite_link
 
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
+        """
+        УСИЛЕННЫЙ КИК:
+        1) пытаемся открыть карточку гостя кликом по логину
+        2) если кнопки не видно — открываем меню ⋯
+        3) ищем все варианты текста удаления
+        4) подтверждаем любым "Исключить/Удалить/Да/Подтвердить"
+        """
         guest_login = (guest_login or "").strip().lstrip("@").lower()
         if not guest_login:
             return False
@@ -522,12 +557,15 @@ class PlaywrightYandexProvider:
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
+            # 1) открыть карточку гостя
             clicked_card = False
             try:
                 loc = page.get_by_text(guest_login, exact=False)
                 if await loc.count() > 0:
                     await loc.first.scroll_into_view_if_needed(timeout=5_000)
+                    await page.wait_for_timeout(150)
                     await loc.first.click(timeout=5_000)
+                    await page.wait_for_timeout(300)
                     await _save_debug(page, debug_dir, "guest_card_opened")
                     clicked_card = True
             except Exception:
@@ -539,9 +577,28 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
+            # 2) ищем кнопку удаления (несколько вариантов)
+            remove_texts = [
+                "Исключить из семьи",
+                "Исключить",
+                "Удалить из семьи",
+                "Удалить участника",
+                "Удалить",
+            ]
+
+            removed = False
+            for t in remove_texts:
+                if await _click_by_text(page, t, debug_dir, f"click_remove_{t}"):
+                    removed = True
+                    break
+
+            # 3) если не нашли — возможно кнопка в меню ⋯
             if not removed:
-                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
+                await _open_guest_actions(page, debug_dir)
+                for t in remove_texts:
+                    if await _click_by_text(page, t, debug_dir, f"click_remove_menu_{t}"):
+                        removed = True
+                        break
 
             if not removed:
                 await _save_debug(page, debug_dir, "remove_button_not_found")
@@ -549,24 +606,17 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            await _click_confirm_remove(page)
-            await _save_debug(page, debug_dir, "remove_confirmed")
+            # 4) подтверждение
+            ok_confirm = await _click_confirm_remove(page)
+            await _save_debug(page, debug_dir, "remove_confirmed" if ok_confirm else "remove_confirm_not_found")
 
             await context.close()
             await browser.close()
 
-        return True
-
-    # ✅ Алиас для guard — чтобы не было “не нашёл метод”
-    async def kick_member(self, *, storage_state_path: str, login: str) -> bool:
-        return await self.remove_guest(storage_state_path=storage_state_path, guest_login=login)
+        return bool(removed)
 
 
 def build_provider() -> YandexProvider:
-    """
-    Фабрика провайдера.
-    Эту функцию импортирует app.services.yandex.service
-    """
     provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
     if provider_name == "playwright":
         return PlaywrightYandexProvider()
