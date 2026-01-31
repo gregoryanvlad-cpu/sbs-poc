@@ -21,16 +21,10 @@ _MONTHS_RU = (
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
 LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 
-# Яндекс иногда показывает текст про дневной лимит инвайтов.
 INVITE_DAILY_LIMIT_RE = re.compile(
     r"Превышено\s+дневное\s+ограничение.*попробуйте\s+сгенерировать\s+приглашение\s+позже",
     re.IGNORECASE,
 )
-
-
-# ==========================
-# Debug storage management
-# ==========================
 
 _DEBUG_KEEP_LAST_PER_ACCOUNT = 20
 _DEBUG_MAX_TOTAL_MB = 250
@@ -58,18 +52,13 @@ def _safe_rmtree(path: Path) -> None:
 
 
 def _prune_debug_root(root: Path) -> None:
-    """
-    Чистим debug_out, чтобы volume не забивался.
-    1) На каждый аккаунт оставляем N последних папок.
-    2) Если общий размер > лимита — удаляем самые старые до нормального размера.
-    """
     try:
         if not root.exists() or not root.is_dir():
             return
     except Exception:
         return
 
-    # 1) keep last per account
+    # keep last per account
     try:
         for acc_dir in root.iterdir():
             try:
@@ -84,7 +73,7 @@ def _prune_debug_root(root: Path) -> None:
     except Exception:
         pass
 
-    # 2) cap total size
+    # cap total size
     try:
         limit = int(_DEBUG_MAX_TOTAL_MB) * 1024 * 1024
         total = _dir_size_bytes(root)
@@ -98,7 +87,7 @@ def _prune_debug_root(root: Path) -> None:
                     if run.is_dir():
                         all_runs.append(run)
 
-        all_runs.sort(key=lambda p: p.stat().st_mtime)  # старые -> новые
+        all_runs.sort(key=lambda p: p.stat().st_mtime)
 
         for run in all_runs:
             if total <= limit:
@@ -109,10 +98,6 @@ def _prune_debug_root(root: Path) -> None:
     except Exception:
         pass
 
-
-# ==========================
-# Data models
-# ==========================
 
 @dataclass
 class YandexFamilySnapshot:
@@ -279,7 +264,6 @@ async def _extract_invite_from_page(page: Page) -> Optional[str]:
 
 
 async def _detect_invite_daily_limit(page: Page) -> bool:
-    """True, если на странице виден текст про дневной лимит инвайтов."""
     try:
         body = await page.locator("body").inner_text()
         if body and INVITE_DAILY_LIMIT_RE.search(body):
@@ -321,7 +305,7 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
             except Exception:
                 pass
 
-            await el.click(timeout=3_000)
+            await el.click(timeout=5_000)
             await page.wait_for_load_state("networkidle", timeout=30_000)
             await _save_debug(page, out_dir, "click_invite_OK")
             return True
@@ -333,6 +317,7 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
 
 
 async def _click_confirm_remove(page: Page) -> bool:
+    # На третьем шаге обычно кнопка "Исключить"
     patterns = [
         re.compile(r"Исключить", re.I),
         re.compile(r"Удалить", re.I),
@@ -342,7 +327,7 @@ async def _click_confirm_remove(page: Page) -> bool:
         try:
             btn = page.get_by_role("button", name=pat)
             if await btn.count() > 0:
-                await btn.first.click(timeout=3_000)
+                await btn.first.click(timeout=8_000)
                 await page.wait_for_load_state("networkidle", timeout=20_000)
                 return True
         except Exception:
@@ -417,8 +402,8 @@ class PlaywrightYandexProvider:
 
             pending_loc = page.get_by_text("Ждём ответ", exact=False)
             try:
-                await pending_loc.first.wait_for(state="visible", timeout=5_000)
-                await pending_loc.first.click()
+                await pending_loc.first.wait_for(state="visible", timeout=8_000)
+                await pending_loc.first.click(timeout=8_000)
                 await _save_debug(page, debug_dir, "pending_opened")
             except Exception:
                 await _save_debug(page, debug_dir, "no_pending")
@@ -461,7 +446,7 @@ class PlaywrightYandexProvider:
             try:
                 pending = page.get_by_text("Ждём ответ", exact=False)
                 if await pending.count() > 0:
-                    await pending.first.click()
+                    await pending.first.click(timeout=8_000)
                     await _save_debug(page, debug_dir, "pending_modal_opened")
                     await _click_by_text(page, "Отменить приглашение", debug_dir, "pending_cancelled")
                     await _goto(page, FAMILY_URL, debug_dir, "family_after_cancel")
@@ -476,7 +461,6 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Invite button not found. Debug: {debug_dir}")
                 return ""
 
-            # Иногда вместо нормального флоу Яндекс показывает уведомление про дневной лимит.
             if await _detect_invite_daily_limit(page):
                 await _save_debug(page, debug_dir, "invite_daily_limit")
                 await context.close()
@@ -494,7 +478,6 @@ class PlaywrightYandexProvider:
                     raise RuntimeError(f"Share button not found. Debug: {debug_dir}")
                 return ""
 
-            # Иногда лимит показывается уже после попытки "Поделиться ссылкой"
             if await _detect_invite_daily_limit(page):
                 await _save_debug(page, debug_dir, "invite_daily_limit_after_share")
                 await context.close()
@@ -502,7 +485,7 @@ class PlaywrightYandexProvider:
                 raise RuntimeError(f"Invite daily limit reached. Debug: {debug_dir}")
 
             invite_link: Optional[str] = None
-            for _ in range(10):
+            for _ in range(12):
                 invite_link = await _extract_invite_from_page(page)
                 if invite_link:
                     break
@@ -523,13 +506,21 @@ class PlaywrightYandexProvider:
         return invite_link
 
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
+        """
+        Удаление гостя из семьи:
+        1) открыть карточку гостя кликом по логину
+        2) нажать "Удалить из семейной группы" (или "Исключить из семьи"/"Исключить")
+        3) подтвердить "Исключить"
+        4) проверить что логин исчез со страницы (иначе False)
+
+        ВАЖНО: делаем несколько попыток, т.к. UI Яндекса иногда тупит.
+        """
         guest_login = (guest_login or "").strip().lstrip("@").lower()
         if not guest_login:
             return False
 
         root = _debug_root()
         _prune_debug_root(root)
-
         debug_dir = root / Path(storage_state_path).stem / f"kick_{guest_login}_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -544,49 +535,117 @@ class PlaywrightYandexProvider:
             )
             page = await context.new_page()
 
+            async def _is_login_present() -> bool:
+                try:
+                    # Проверка наличия текста логина на странице
+                    loc = page.get_by_text(guest_login, exact=False)
+                    return (await loc.count()) > 0
+                except Exception:
+                    return False
+
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
-            clicked_card = False
-            try:
-                loc = page.get_by_text(guest_login, exact=False)
-                if await loc.count() > 0:
-                    await loc.first.scroll_into_view_if_needed(timeout=5_000)
-                    await loc.first.click(timeout=5_000)
-                    await _save_debug(page, debug_dir, "guest_card_opened")
-                    clicked_card = True
-            except Exception:
-                clicked_card = False
-
-            if not clicked_card:
-                await _save_debug(page, debug_dir, "guest_card_not_found")
+            # если логина нет — нечего удалять
+            if not await _is_login_present():
+                await _save_debug(page, debug_dir, "kick_login_not_present_initial")
                 await context.close()
                 await browser.close()
-                return False
+                return True
 
-            removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
-            if not removed:
-                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
+            removed_ok = False
 
-            if not removed:
-                await _save_debug(page, debug_dir, "remove_button_not_found")
-                await context.close()
-                await browser.close()
-                return False
+            for attempt in range(1, 4):
+                try:
+                    await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_start")
 
-            await _click_confirm_remove(page)
-            await _save_debug(page, debug_dir, "remove_confirmed")
+                    # 1) кликаем по логину, стараемся открыть карточку
+                    try:
+                        loc = page.get_by_text(guest_login, exact=False)
+                        await loc.first.scroll_into_view_if_needed(timeout=8_000)
+                        await loc.first.click(timeout=8_000)
+                        await page.wait_for_timeout(500)
+                        await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_card_clicked")
+                    except Exception:
+                        await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_card_click_failed")
+                        # рефреш и следующая попытка
+                        await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                        await page.wait_for_load_state("networkidle", timeout=60_000)
+                        continue
+
+                    # 2) кнопка удаления
+                    btn_clicked = False
+                    for text in ("Удалить из семейной группы", "Исключить из семьи", "Исключить", "Удалить"):
+                        try:
+                            btn = page.get_by_role("button", name=re.compile(text, re.I))
+                            if await btn.count() > 0:
+                                await btn.first.click(timeout=10_000)
+                                await page.wait_for_timeout(500)
+                                await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_btn_{text}")
+                                btn_clicked = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not btn_clicked:
+                        # Иногда это не button, а link/текст
+                        for text in ("Удалить из семейной группы", "Исключить из семьи", "Исключить", "Удалить"):
+                            try:
+                                loc2 = page.get_by_text(text, exact=False)
+                                if await loc2.count() > 0:
+                                    await loc2.first.click(timeout=10_000)
+                                    await page.wait_for_timeout(500)
+                                    await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_text_{text}")
+                                    btn_clicked = True
+                                    break
+                            except Exception:
+                                continue
+
+                    if not btn_clicked:
+                        await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_remove_btn_not_found")
+                        await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                        await page.wait_for_load_state("networkidle", timeout=60_000)
+                        continue
+
+                    # 3) подтверждение
+                    confirmed = await _click_confirm_remove(page)
+                    await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_confirmed_{confirmed}")
+
+                    # 4) проверяем, что логин исчез
+                    try:
+                        await page.wait_for_timeout(800)
+                        # бывает, что после модалки остаёмся в карточке — вернёмся на страницу семьи
+                        await page.goto(FAMILY_URL, wait_until="domcontentloaded", timeout=60_000)
+                        await page.wait_for_load_state("networkidle", timeout=60_000)
+                        await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_after_return")
+                    except Exception:
+                        pass
+
+                    if not await _is_login_present():
+                        removed_ok = True
+                        await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_SUCCESS")
+                        break
+
+                    await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_still_present")
+                    # рефреш и следующая попытка
+                    await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_load_state("networkidle", timeout=60_000)
+                except Exception:
+                    await _save_debug(page, debug_dir, f"kick_attempt_{attempt}_exception")
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                        await page.wait_for_load_state("networkidle", timeout=60_000)
+                    except Exception:
+                        pass
+
+            await _save_debug(page, debug_dir, f"kick_final_{removed_ok}")
 
             await context.close()
             await browser.close()
 
-        return True
+        return removed_ok
 
 
 def build_provider() -> YandexProvider:
-    """
-    Фабрика провайдера. Сейчас используем Playwright.
-    Важно: эту функцию импортирует app.services.yandex.service / yandex_flow и т.д.
-    """
     provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
     if provider_name == "playwright":
         return PlaywrightYandexProvider()
