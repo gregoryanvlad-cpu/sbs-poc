@@ -126,9 +126,16 @@ class YandexProbeSnapshot:
 
 class YandexProvider(Protocol):
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot: ...
-    async def create_invite_link(self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True) -> str: ...
-    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool: ...
+    async def create_invite_link(
+        self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True
+    ) -> str: ...
+    async def cancel_pending_invite(
+        self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending"
+    ) -> bool: ...
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool: ...
+
+    # ✅ ВАЖНО для guard: единое имя метода “кика”
+    async def kick_member(self, *, storage_state_path: str, login: str) -> bool: ...
 
 
 def _now_tag() -> str:
@@ -550,18 +557,17 @@ class PlaywrightYandexProvider:
 
         return True
 
+    # ✅ Алиас для guard — чтобы не было “не нашёл метод”
+    async def kick_member(self, *, storage_state_path: str, login: str) -> bool:
+        return await self.remove_guest(storage_state_path=storage_state_path, guest_login=login)
 
-# ======================================================
-# ✅ ВОТ ЭТОГО НЕ ХВАТАЛО: build_provider()
-# ======================================================
 
 def build_provider() -> YandexProvider:
     """
-    Фабрика провайдера. Сейчас используем Playwright.
-    Важно: эту функцию импортирует app.services.yandex.service
+    Фабрика провайдера.
+    Эту функцию импортирует app.services.yandex.service
     """
     provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
     if provider_name == "playwright":
         return PlaywrightYandexProvider()
-    # на будущее — если добавишь другой провайдер
     return PlaywrightYandexProvider()
