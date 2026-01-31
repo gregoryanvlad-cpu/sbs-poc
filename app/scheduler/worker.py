@@ -11,9 +11,12 @@ from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
 from app.repo import list_expired_subscriptions, set_subscription_expired
 from app.services.yandex.service import yandex_service
-from app.services.yandex.guard import YandexGuardService  # ✅ ВАЖНО
+from app.services.yandex.guard import YandexGuardService
+from app.db.models.yandex_membership import YandexMembership
 
 log = logging.getLogger(__name__)
+
+guard = YandexGuardService()
 
 
 async def run_scheduler() -> None:
@@ -22,8 +25,6 @@ async def run_scheduler() -> None:
 
     sleep_seconds = min(30, settings.yandex_worker_period_seconds or 10)
 
-    guard = YandexGuardService()  # ✅ guard создаём ОДИН раз
-
     while True:
         try:
             async with session_scope() as session:
@@ -31,27 +32,23 @@ async def run_scheduler() -> None:
                 if not locked:
                     await asyncio.sleep(3)
                     continue
-
                 try:
                     await _job_expire_subscriptions(bot)
-
                     if settings.yandex_enabled:
-                        await _job_yandex_guard(bot, guard)          # ✅ НОВОЕ
+                        await _job_yandex_enforce_no_foreign(bot)
                         await _job_yandex_sync_and_activate(bot)
                         await _job_yandex_invite_ttl(bot)
-
                 finally:
                     await advisory_unlock(session)
-
         except Exception:
             log.exception("scheduler_loop_error")
 
         await asyncio.sleep(sleep_seconds)
 
 
-# ======================
+# ========================
 # SUBSCRIPTION EXPIRE
-# ======================
+# ========================
 
 async def _job_expire_subscriptions(bot: Bot) -> None:
     async with session_scope() as session:
@@ -74,32 +71,41 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         await session.commit()
 
 
-# ======================
-# 🔥 YANDEX GUARD (ЛЕВЫЕ ЛОГИНЫ)
-# ======================
+# ========================
+# 🔒 GUARD: KICK FOREIGN
+# ========================
 
-async def _job_yandex_guard(bot: Bot, guard: YandexGuardService) -> None:
+async def _job_yandex_enforce_no_foreign(bot: Bot) -> None:
+    """
+    Проверяет, что в семье нет левых логинов.
+    Кикает, предупреждает, банит.
+    """
     async with session_scope() as session:
-        affected = await guard.run_guard(session)
-        if not affected:
-            return
-        await session.commit()
+        q = (
+            session.query(YandexMembership)
+            .filter(YandexMembership.status.in_(("awaiting_join", "joined")))
+            .all()
+        )
 
-    for tg_id in affected:
+    for ym in q:
+        if not ym.yandex_login or not ym.storage_state_path:
+            continue
+        if ym.status == "banned":
+            continue
+
         try:
-            await bot.send_message(
-                tg_id,
-                "⚠️ Обнаружен вход в Yandex Plus под чужим логином.\n\n"
-                "Посторонний участник был удалён.\n"
-                "Повторная попытка приведёт к блокировке.",
+            await guard.verify_join(
+                yandex_account_storage=ym.storage_state_path,
+                expected_login=ym.yandex_login.lower(),
+                tg_id=ym.tg_id,
             )
         except Exception:
-            pass
+            log.exception("guard_verify_failed tg_id=%s", ym.tg_id)
 
 
-# ======================
-# YANDEX SYNC
-# ======================
+# ========================
+# SYNC + ACTIVATE
+# ========================
 
 async def _job_yandex_sync_and_activate(bot: Bot) -> None:
     async with session_scope() as session:
@@ -126,9 +132,9 @@ async def _job_yandex_sync_and_activate(bot: Bot) -> None:
             pass
 
 
-# ======================
+# ========================
 # INVITE TTL
-# ======================
+# ========================
 
 async def _job_yandex_invite_ttl(bot: Bot) -> None:
     async with session_scope() as session:
@@ -148,7 +154,7 @@ async def _job_yandex_invite_ttl(bot: Bot) -> None:
             await bot.send_message(
                 tg_id,
                 "⏳ Время действия приглашения истекло.\n\n"
-                "Откройте раздел 🟡 Yandex Plus — если доступно, вы сможете запросить новое приглашение (1 раз).",
+                "Откройте раздел 🟡 Yandex Plus — если доступно, вы сможете запросить новое приглашение.",
                 reply_markup=kb,
             )
         except Exception:
