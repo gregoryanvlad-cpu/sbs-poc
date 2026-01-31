@@ -11,6 +11,7 @@ from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
 from app.repo import list_expired_subscriptions, set_subscription_expired
 from app.services.yandex.service import yandex_service
+from app.services.yandex.guard import YandexGuardService  # ✅ ВАЖНО
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ async def run_scheduler() -> None:
 
     sleep_seconds = min(30, settings.yandex_worker_period_seconds or 10)
 
+    guard = YandexGuardService()  # ✅ guard создаём ОДИН раз
+
     while True:
         try:
             async with session_scope() as session:
@@ -28,19 +31,27 @@ async def run_scheduler() -> None:
                 if not locked:
                     await asyncio.sleep(3)
                     continue
+
                 try:
                     await _job_expire_subscriptions(bot)
+
                     if settings.yandex_enabled:
-                        await _job_yandex_enforce_no_foreign(bot)
+                        await _job_yandex_guard(bot, guard)          # ✅ НОВОЕ
                         await _job_yandex_sync_and_activate(bot)
                         await _job_yandex_invite_ttl(bot)
+
                 finally:
                     await advisory_unlock(session)
+
         except Exception:
             log.exception("scheduler_loop_error")
 
         await asyncio.sleep(sleep_seconds)
 
+
+# ======================
+# SUBSCRIPTION EXPIRE
+# ======================
 
 async def _job_expire_subscriptions(bot: Bot) -> None:
     async with session_scope() as session:
@@ -63,25 +74,32 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         await session.commit()
 
 
-async def _job_yandex_enforce_no_foreign(bot: Bot) -> None:
+# ======================
+# 🔥 YANDEX GUARD (ЛЕВЫЕ ЛОГИНЫ)
+# ======================
+
+async def _job_yandex_guard(bot: Bot, guard: YandexGuardService) -> None:
     async with session_scope() as session:
-        warnings, _ = await yandex_service.enforce_no_foreign_logins(session)
-        if not warnings:
+        affected = await guard.run_guard(session)
+        if not affected:
             return
         await session.commit()
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🟡 Yandex Plus", callback_data="nav:yandex")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-        ]
-    )
-    for tg_id, text in warnings:
+    for tg_id in affected:
         try:
-            await bot.send_message(tg_id, text, reply_markup=kb)
+            await bot.send_message(
+                tg_id,
+                "⚠️ Обнаружен вход в Yandex Plus под чужим логином.\n\n"
+                "Посторонний участник был удалён.\n"
+                "Повторная попытка приведёт к блокировке.",
+            )
         except Exception:
             pass
 
+
+# ======================
+# YANDEX SYNC
+# ======================
 
 async def _job_yandex_sync_and_activate(bot: Bot) -> None:
     async with session_scope() as session:
@@ -107,6 +125,10 @@ async def _job_yandex_sync_and_activate(bot: Bot) -> None:
         except Exception:
             pass
 
+
+# ======================
+# INVITE TTL
+# ======================
 
 async def _job_yandex_invite_ttl(bot: Bot) -> None:
     async with session_scope() as session:
