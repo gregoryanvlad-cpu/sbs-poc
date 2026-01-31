@@ -126,8 +126,19 @@ class YandexProbeSnapshot:
 
 class YandexProvider(Protocol):
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot: ...
-    async def create_invite_link(self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True) -> str: ...
-    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool: ...
+    async def create_invite_link(
+        self,
+        *,
+        storage_state_path: str,
+        debug_dir_name: str = "invite",
+        strict: bool = True
+    ) -> str: ...
+    async def cancel_pending_invite(
+        self,
+        *,
+        storage_state_path: str,
+        debug_dir_name: str = "cancel_pending"
+    ) -> bool: ...
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool: ...
 
 
@@ -315,56 +326,40 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
     return False
 
 
-async def _click_confirm_remove(page: Page) -> bool:
+async def _click_confirm_remove(page: Page, out_dir: Path) -> bool:
+    """
+    Финальное подтверждение на модалке (твой скрин №3).
+    Там именно кнопка "Исключить".
+    """
     patterns = [
+        re.compile(r"Исключить$", re.I),
         re.compile(r"Исключить", re.I),
         re.compile(r"Удалить", re.I),
         re.compile(r"Подтвердить", re.I),
-        re.compile(r"Да", re.I),
     ]
     for pat in patterns:
-        # пробуем и role=button, и просто text (в Яндексе часто div)
         try:
             btn = page.get_by_role("button", name=pat)
             if await btn.count() > 0:
                 await btn.first.click(timeout=5_000)
-                await page.wait_for_load_state("networkidle", timeout=20_000)
+                await page.wait_for_load_state("networkidle", timeout=30_000)
+                await _save_debug(page, out_dir, "remove_confirm_clicked")
                 return True
-        except Exception:
-            pass
-        try:
-            loc = page.locator("text=" + pat.pattern)
-            if await loc.count() > 0:
-                await loc.first.click(timeout=5_000)
-                await page.wait_for_load_state("networkidle", timeout=20_000)
-                return True
-        except Exception:
-            pass
-    return False
-
-
-async def _open_guest_actions(page: Page, out_dir: Path) -> bool:
-    """
-    Иногда карточка гостя открывается, но кнопка удаления спрятана в меню ⋯.
-    """
-    # варианты кнопки "ещё" / "меню"
-    candidates = [
-        page.get_by_role("button", name=re.compile(r"Ещё", re.I)),
-        page.get_by_role("button", name=re.compile(r"Еще", re.I)),
-        page.locator("button:has-text('⋯')"),
-        page.locator("button:has-text('...')"),
-        page.locator("[aria-label*='Ещё'], [aria-label*='Еще'], [aria-label*='Меню'], [aria-label*='menu']"),
-    ]
-    for loc in candidates:
-        try:
-            if await loc.count() == 0:
-                continue
-            await loc.first.click(timeout=3_000)
-            await page.wait_for_timeout(300)
-            await _save_debug(page, out_dir, "guest_actions_opened")
-            return True
         except Exception:
             continue
+
+    # запасной вариант: просто по тексту
+    try:
+        loc = page.locator("text=Исключить")
+        if await loc.count() > 0:
+            await loc.first.click(timeout=5_000)
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await _save_debug(page, out_dir, "remove_confirm_clicked_text")
+            return True
+    except Exception:
+        pass
+
+    await _save_debug(page, out_dir, "remove_confirm_NOT_FOUND")
     return False
 
 
@@ -528,11 +523,11 @@ class PlaywrightYandexProvider:
 
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
         """
-        УСИЛЕННЫЙ КИК:
-        1) пытаемся открыть карточку гостя кликом по логину
-        2) если кнопки не видно — открываем меню ⋯
-        3) ищем все варианты текста удаления
-        4) подтверждаем любым "Исключить/Удалить/Да/Подтвердить"
+        Удаление участника из семьи.
+        ВАЖНО: UI сейчас такой:
+        1) клик по карточке гостя
+        2) кнопка "Удалить из семейной группы"
+        3) подтверждение "Исключить"
         """
         guest_login = (guest_login or "").strip().lstrip("@").lower()
         if not guest_login:
@@ -557,64 +552,128 @@ class PlaywrightYandexProvider:
 
             await _goto(page, FAMILY_URL, debug_dir, "family_open")
 
-            # 1) открыть карточку гостя
-            clicked_card = False
-            try:
-                loc = page.get_by_text(guest_login, exact=False)
-                if await loc.count() > 0:
-                    await loc.first.scroll_into_view_if_needed(timeout=5_000)
-                    await page.wait_for_timeout(150)
-                    await loc.first.click(timeout=5_000)
-                    await page.wait_for_timeout(300)
-                    await _save_debug(page, debug_dir, "guest_card_opened")
-                    clicked_card = True
-            except Exception:
-                clicked_card = False
+            # --- 1) Открыть карточку гостя (клик по списку участников) ---
+            clicked = False
 
-            if not clicked_card:
+            # Стратегия A: кликаем по тексту логина внутри основного контента
+            try:
+                loc = page.locator("main").get_by_text(guest_login, exact=False)
+                if await loc.count() > 0:
+                    await loc.first.scroll_into_view_if_needed(timeout=7_000)
+                    await page.wait_for_timeout(150)
+                    await loc.first.click(timeout=7_000)
+                    clicked = True
+                    await _save_debug(page, debug_dir, "guest_card_opened_A")
+            except Exception:
+                clicked = False
+
+            # Стратегия B: ищем кликабельный контейнер, содержащий логин (div/a/button)
+            if not clicked:
+                try:
+                    container = page.locator("main").locator("a,button,div").filter(has_text=guest_login)
+                    if await container.count() > 0:
+                        await container.first.scroll_into_view_if_needed(timeout=7_000)
+                        await page.wait_for_timeout(150)
+                        await container.first.click(timeout=7_000)
+                        clicked = True
+                        await _save_debug(page, debug_dir, "guest_card_opened_B")
+                except Exception:
+                    clicked = False
+
+            # Стратегия C: role link/button по имени логина
+            if not clicked:
+                try:
+                    for loc in [
+                        page.get_by_role("link", name=re.compile(re.escape(guest_login), re.I)),
+                        page.get_by_role("button", name=re.compile(re.escape(guest_login), re.I)),
+                    ]:
+                        if await loc.count() > 0:
+                            await loc.first.scroll_into_view_if_needed(timeout=7_000)
+                            await page.wait_for_timeout(150)
+                            await loc.first.click(timeout=7_000)
+                            clicked = True
+                            await _save_debug(page, debug_dir, "guest_card_opened_C")
+                            break
+                except Exception:
+                    clicked = False
+
+            if not clicked:
                 await _save_debug(page, debug_dir, "guest_card_not_found")
                 await context.close()
                 await browser.close()
                 return False
 
-            # 2) ищем кнопку удаления (несколько вариантов)
-            remove_texts = [
-                "Исключить из семьи",
-                "Исключить",
-                "Удалить из семьи",
-                "Удалить участника",
-                "Удалить",
+            # ждём, что появится модалка/панель участника
+            try:
+                dlg = page.get_by_role("dialog")
+                if await dlg.count() > 0:
+                    await dlg.first.wait_for(state="visible", timeout=5_000)
+            except Exception:
+                pass
+
+            await _save_debug(page, debug_dir, "guest_modal_state")
+
+            # --- 2) Нажать "Удалить из семейной группы" (как на твоём скрине №2) ---
+            removed_clicked = False
+            remove_patterns = [
+                re.compile(r"Удалить из семейной группы", re.I),
+                re.compile(r"Исключить из семейной группы", re.I),
+                re.compile(r"Удалить из семьи", re.I),
+                re.compile(r"Исключить из семьи", re.I),
+                re.compile(r"Исключить", re.I),
             ]
 
-            removed = False
-            for t in remove_texts:
-                if await _click_by_text(page, t, debug_dir, f"click_remove_{t}"):
-                    removed = True
-                    break
-
-            # 3) если не нашли — возможно кнопка в меню ⋯
-            if not removed:
-                await _open_guest_actions(page, debug_dir)
-                for t in remove_texts:
-                    if await _click_by_text(page, t, debug_dir, f"click_remove_menu_{t}"):
-                        removed = True
+            for pat in remove_patterns:
+                try:
+                    btn = page.get_by_role("button", name=pat)
+                    if await btn.count() > 0:
+                        await btn.first.click(timeout=7_000)
+                        await page.wait_for_load_state("networkidle", timeout=30_000)
+                        removed_clicked = True
+                        await _save_debug(page, debug_dir, "remove_clicked_role")
                         break
+                except Exception:
+                    pass
 
-            if not removed:
+            if not removed_clicked:
+                # запасной клик по тексту (иногда это не button, а пункт меню)
+                for text in [
+                    "Удалить из семейной группы",
+                    "Исключить из семейной группы",
+                    "Удалить из семьи",
+                    "Исключить из семьи",
+                    "Исключить",
+                ]:
+                    try:
+                        loc = page.locator(f"text={text}")
+                        if await loc.count() > 0:
+                            await loc.first.click(timeout=7_000)
+                            await page.wait_for_load_state("networkidle", timeout=30_000)
+                            removed_clicked = True
+                            await _save_debug(page, debug_dir, "remove_clicked_text")
+                            break
+                    except Exception:
+                        pass
+
+            if not removed_clicked:
                 await _save_debug(page, debug_dir, "remove_button_not_found")
                 await context.close()
                 await browser.close()
                 return False
 
-            # 4) подтверждение
-            ok_confirm = await _click_confirm_remove(page)
-            await _save_debug(page, debug_dir, "remove_confirmed" if ok_confirm else "remove_confirm_not_found")
+            # --- 3) Подтверждение "Исключить" (скрин №3) ---
+            confirmed = await _click_confirm_remove(page, debug_dir)
+            await _save_debug(page, debug_dir, "remove_done")
 
             await context.close()
             await browser.close()
 
-        return bool(removed)
+        return bool(confirmed)
 
+
+# ======================================================
+# build_provider()
+# ======================================================
 
 def build_provider() -> YandexProvider:
     provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
