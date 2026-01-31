@@ -20,7 +20,8 @@ router = Router()
 
 _LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$", re.IGNORECASE)
 
-INVITE_TTL_MINUTES = 10
+# TTL для инвайта (сколько держим слот, если пользователь не вступил)
+INVITE_TTL_MINUTES = 15
 
 
 def _kb_confirm_login() -> InlineKeyboardMarkup:
@@ -167,7 +168,7 @@ async def on_yandex_login_confirm(cb: CallbackQuery) -> None:
                 )
             return
 
-        # Берём первый активный аккаунт (пока 1 — как ты и говорил)
+        # Берём первый активный аккаунт (пока 1)
         acc = await session.scalar(
             select(YandexAccount)
             .where(YandexAccount.status == "active")
@@ -180,14 +181,28 @@ async def on_yandex_login_confirm(cb: CallbackQuery) -> None:
 
         provider = build_provider()
 
-        # Создаём invite (Playwright)
-        storage_state_path = f"{acc.credentials_ref}"
-        # credentials_ref у тебя хранится как имя файла, путь соберём из settings в провайдере (как в probe)
-        # но чтобы не гадать — используем тот же паттерн как в service: settings.yandex_cookies_dir + ref
+        # credentials_ref хранится как имя файла, полный путь = settings.yandex_cookies_dir / credentials_ref
         from app.core.config import settings
-        full_state_path = f"{settings.yandex_cookies_dir}/{storage_state_path}"
+        full_state_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
 
-        invite_link = await provider.create_invite_link(storage_state_path=full_state_path)
+        # Создаём invite (Playwright)
+        try:
+            invite_link = await provider.create_invite_link(storage_state_path=full_state_path)
+        except Exception as e:
+            msg_text = (
+                "❌ Не получилось создать приглашение.\n\n"
+                f"<code>{type(e).__name__}: {e}</code>\n\n"
+            )
+            if "Invite daily limit reached" in str(e):
+                msg_text += (
+                    "Превышено дневное ограничение на количество создаваемых приглашений.\n"
+                    "Пожалуйста, попробуйте сгенерировать приглашение позже."
+                )
+            else:
+                msg_text += "Попробуй ещё раз через минуту."
+
+            await cb.message.answer(msg_text, parse_mode="HTML")
+            return
 
         now = utcnow()
         membership = YandexMembership(
