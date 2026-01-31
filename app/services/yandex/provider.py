@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any, Optional, Protocol
 
 from playwright.async_api import async_playwright, Page
 
@@ -26,10 +26,7 @@ LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 # Debug storage management
 # ==========================
 
-# сколько последних debug-run папок хранить на КАЖДЫЙ аккаунт
 _DEBUG_KEEP_LAST_PER_ACCOUNT = 20
-
-# максимальный общий размер debug_out (в МБ), после чего удаляем самые старые
 _DEBUG_MAX_TOTAL_MB = 250
 
 
@@ -58,12 +55,10 @@ def _prune_debug_root(root: Path) -> None:
     """
     Чистим debug_out, чтобы volume не забивался.
     1) На каждый аккаунт оставляем N последних папок.
-    2) Если общий размер всё равно > лимита — удаляем самые старые, пока не станет ок.
+    2) Если общий размер > лимита — удаляем самые старые до нормального размера.
     """
     try:
-        if not root.exists():
-            return
-        if not root.is_dir():
+        if not root.exists() or not root.is_dir():
             return
     except Exception:
         return
@@ -76,7 +71,7 @@ def _prune_debug_root(root: Path) -> None:
                     continue
                 runs = [p for p in acc_dir.iterdir() if p.is_dir()]
                 runs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                for old in runs[_DEBUG_KEEP_LAST_PER_ACCOUNT :]:
+                for old in runs[_DEBUG_KEEP_LAST_PER_ACCOUNT:]:
                     _safe_rmtree(old)
             except Exception:
                 continue
@@ -90,7 +85,6 @@ def _prune_debug_root(root: Path) -> None:
         if total <= limit:
             return
 
-        # собрать ВСЕ папки запусков (все аккаунты) и удалить самые старые
         all_runs: list[Path] = []
         for acc_dir in root.iterdir():
             if acc_dir.is_dir():
@@ -105,7 +99,6 @@ def _prune_debug_root(root: Path) -> None:
                 break
             before = _dir_size_bytes(run)
             _safe_rmtree(run)
-            # пересчёт грубо (чтобы не делать полный пересчёт root каждый раз)
             total = max(0, total - before)
     except Exception:
         pass
@@ -129,6 +122,13 @@ class YandexProbeSnapshot:
     next_charge_text: Optional[str]
     family: Optional[YandexFamilySnapshot]
     raw_debug: dict[str, Any]
+
+
+class YandexProvider(Protocol):
+    async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot: ...
+    async def create_invite_link(self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True) -> str: ...
+    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool: ...
+    async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool: ...
 
 
 def _now_tag() -> str:
@@ -196,39 +196,13 @@ def parse_family_min(text: str) -> YandexFamilySnapshot:
     candidates = set(LOGIN_LOWER_RE.findall(text or ""))
 
     blacklist = {
-        "yandex",
-        "id",
-        "family",
-        "plus",
-        "login",
-        "admin",
-        "pending",
-        "invite",
-        "https",
-        "http",
-        "ru",
-        "com",
-        "org",
-        "www",
-        "mailto",
-        "support",
-        "help",
-        "account",
-        "settings",
-        "profile",
-        "oauth",
-        "token",
-        "clientsource",
-        "from",
-        "skip",
-        "share",
-        "copy",
-        "button",
-        "link",
-        "open",
-        "close",
-        "ok",
-        "cancel",
+        "yandex", "id", "family", "plus",
+        "login", "admin", "pending", "invite",
+        "https", "http", "ru", "com", "org", "www",
+        "mailto", "support", "help", "account", "settings", "profile",
+        "oauth", "token", "clientsource", "from",
+        "skip", "share", "copy", "button", "link", "open", "close",
+        "ok", "cancel",
     }
 
     filtered: list[str] = []
@@ -337,29 +311,6 @@ async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
         except Exception:
             continue
 
-    try:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(500)
-    except Exception:
-        pass
-
-    for loc in candidates:
-        try:
-            if await loc.count() == 0:
-                continue
-            el = loc.first
-            try:
-                await el.scroll_into_view_if_needed(timeout=2_000)
-                await page.wait_for_timeout(150)
-            except Exception:
-                pass
-            await el.click(timeout=3_000)
-            await page.wait_for_load_state("networkidle", timeout=30_000)
-            await _save_debug(page, out_dir, "click_invite_OK_2")
-            return True
-        except Exception:
-            continue
-
     await _save_debug(page, out_dir, "invite_button_NOT_FOUND")
     return False
 
@@ -384,7 +335,6 @@ async def _click_confirm_remove(page: Page) -> bool:
 
 class PlaywrightYandexProvider:
     async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot:
-        # ✅ важное: чистим debug_out ДО создания новой папки
         root = _debug_root()
         _prune_debug_root(root)
 
@@ -460,19 +410,9 @@ class PlaywrightYandexProvider:
                 return False
 
             cancelled = await _click_by_text(page, "Отменить приглашение", debug_dir, "cancel_clicked")
-            if not cancelled:
-                try:
-                    btn = page.get_by_role("button", name=re.compile("Отменить", re.I))
-                    await btn.first.click()
-                    await _save_debug(page, debug_dir, "cancel_clicked_2")
-                    cancelled = True
-                except Exception:
-                    cancelled = False
-
             await context.close()
             await browser.close()
-
-        return cancelled
+            return bool(cancelled)
 
     async def create_invite_link(
         self,
@@ -523,15 +463,6 @@ class PlaywrightYandexProvider:
 
             share_clicked = await _click_by_text(page, "Поделиться ссылкой", debug_dir, "share_clicked")
             if not share_clicked:
-                try:
-                    btn = page.get_by_role("button", name=re.compile("Поделиться", re.I))
-                    await btn.first.click()
-                    await _save_debug(page, debug_dir, "share_clicked_2")
-                    share_clicked = True
-                except Exception:
-                    share_clicked = False
-
-            if not share_clicked:
                 await _save_debug(page, debug_dir, "share_button_not_found")
                 await context.close()
                 await browser.close()
@@ -558,7 +489,6 @@ class PlaywrightYandexProvider:
             if strict:
                 raise RuntimeError(f"Invite link not found (strict). Debug: {debug_dir}")
             return ""
-
         return invite_link
 
     async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
@@ -605,15 +535,6 @@ class PlaywrightYandexProvider:
             removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
             if not removed:
                 removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
-            if not removed:
-                try:
-                    btn = page.get_by_role("button", name=re.compile(r"Исключить", re.I))
-                    if await btn.count() > 0:
-                        await btn.first.click(timeout=5_000)
-                        await _save_debug(page, debug_dir, "click_remove_role")
-                        removed = True
-                except Exception:
-                    removed = False
 
             if not removed:
                 await _save_debug(page, debug_dir, "remove_button_not_found")
@@ -621,10 +542,26 @@ class PlaywrightYandexProvider:
                 await browser.close()
                 return False
 
-            confirmed = await _click_confirm_remove(page)
-            await _save_debug(page, debug_dir, f"remove_confirmed_{int(bool(confirmed))}")
+            await _click_confirm_remove(page)
+            await _save_debug(page, debug_dir, "remove_confirmed")
 
             await context.close()
             await browser.close()
 
         return True
+
+
+# ======================================================
+# ✅ ВОТ ЭТОГО НЕ ХВАТАЛО: build_provider()
+# ======================================================
+
+def build_provider() -> YandexProvider:
+    """
+    Фабрика провайдера. Сейчас используем Playwright.
+    Важно: эту функцию импортирует app.services.yandex.service
+    """
+    provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
+    if provider_name == "playwright":
+        return PlaywrightYandexProvider()
+    # на будущее — если добавишь другой провайдер
+    return PlaywrightYandexProvider()
