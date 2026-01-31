@@ -22,6 +22,10 @@ _guard = YandexGuardService()
 
 
 async def run_scheduler() -> None:
+    """
+    Scheduler jobs loop (single replica).
+    Protected by Postgres advisory lock.
+    """
     bot = Bot(token=settings.bot_token)
     log.info("scheduler_start")
 
@@ -37,16 +41,16 @@ async def run_scheduler() -> None:
                 try:
                     await _job_expire_subscriptions(bot)
                     if settings.yandex_enabled:
-                        # 1) синкаем семью и активируем тех, кто вошёл правильно (как было)
+                        # 1) синкаем семью и активируем тех, кто вошёл правильно
                         await _job_yandex_sync_and_activate(bot)
 
-                        # 2) guard: кикаем чужих / страйки / баны
+                        # 2) guard: кикаем чужих / страйки / баны (по expected логину)
                         await _job_yandex_guard(bot)
 
-                        # 3) TTL приглашений (как было)
+                        # 3) TTL приглашений
                         await _job_yandex_invite_ttl(bot)
 
-                        # 4) твой существующий enforcement (как было)
+                        # 4) доп. enforcement (кик "левых" на уровне сервиса)
                         await _job_yandex_enforce_no_foreign(bot)
                 finally:
                     await advisory_unlock(session)
@@ -149,11 +153,11 @@ async def _job_yandex_invite_ttl(bot: Bot) -> None:
 
 async def _job_yandex_guard(bot: Bot) -> None:
     """
-    Проверяем, что в семью действительно вошли теми логинами, которые мы ждём.
-    Если в семью попал кто-то левый — кикаем и выдаём страйк.
+    Guard по expected-логину:
+    если ожидаемый логин НЕ в гостях, но есть другие гости — кикаем их и выдаём страйк ожидающему.
     """
+    # 1) Берём активный YandexAccount
     async with session_scope() as session:
-        # Берём 1 активный админский аккаунт (как вы договаривались)
         q_acc = (
             select(YandexAccount)
             .where(YandexAccount.status == "active")
@@ -161,12 +165,12 @@ async def _job_yandex_guard(bot: Bot) -> None:
             .limit(1)
         )
         acc = (await session.execute(q_acc)).scalar_one_or_none()
-        if not acc:
+        if not acc or not acc.credentials_ref:
             return
 
         storage_state_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
 
-        # Берём всех пользователей, у кого сейчас ожидается вступление
+        # 2) Берём memberships, которые ждут вступление
         q = (
             select(YandexMembership)
             .where(YandexMembership.status.in_(["awaiting_join", "pending"]))
@@ -176,26 +180,19 @@ async def _job_yandex_guard(bot: Bot) -> None:
         res = await session.execute(q)
         items = list(res.scalars().all())
 
-    # вызов guard вне транзакции БД (Playwright может быть долгим)
+    # 3) Вызов guard (Playwright) — вне транзакции БД
     for ym in items:
         try:
             expected = (ym.yandex_login or "").strip().lstrip("@").lower()
             if not expected:
                 continue
 
-            # allowlist = все логины из membership со статусом joined/pending/awaiting_join
-            async with session_scope() as s2:
-                q2 = select(YandexMembership.yandex_login).where(
-                    YandexMembership.status.in_(["joined", "pending", "awaiting_join"])
-                )
-                r2 = await s2.execute(q2)
-                allowed = [x for x in r2.scalars().all() if x]
-
-            await _guard.verify_join_for_user(
-                storage_state_path=storage_state_path,
-                tg_id=ym.tg_id,
+            # ✅ ВАЖНО: используем именно verify_join (он у тебя точно есть)
+            await _guard.verify_join(
+                yandex_account_storage=storage_state_path,
                 expected_login=expected,
-                allowed_logins=allowed,
+                tg_id=ym.tg_id,
             )
+
         except Exception:
             log.exception("yandex_guard_error tg_id=%s", getattr(ym, "tg_id", None))
