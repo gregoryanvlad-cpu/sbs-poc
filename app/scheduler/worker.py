@@ -65,7 +65,7 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
 
 async def _job_yandex_enforce_no_foreign(bot: Bot) -> None:
     async with session_scope() as session:
-        warnings, _debug_dirs = await yandex_service.enforce_no_foreign_logins(session)
+        warnings, _ = await yandex_service.enforce_no_foreign_logins(session)
         if not warnings:
             return
         await session.commit()
@@ -76,7 +76,6 @@ async def _job_yandex_enforce_no_foreign(bot: Bot) -> None:
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
         ]
     )
-
     for tg_id, text in warnings:
         try:
             await bot.send_message(tg_id, text, reply_markup=kb)
@@ -86,7 +85,7 @@ async def _job_yandex_enforce_no_foreign(bot: Bot) -> None:
 
 async def _job_yandex_sync_and_activate(bot: Bot) -> None:
     async with session_scope() as session:
-        activated, _debug_dirs = await yandex_service.sync_family_and_activate(session)
+        activated, _ = await yandex_service.sync_family_and_activate(session)
         if not activated:
             return
         await session.commit()
