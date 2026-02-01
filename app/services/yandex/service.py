@@ -150,19 +150,52 @@ class YandexService:
         """
         now = utcnow()
 
-        # Cancel pending invite on previous account (best-effort).
-        if membership.yandex_account_id and membership.status in ("awaiting_join", "pending"):
+        async def _try_reuse_previous_account() -> YandexAccount | None:
+            """Try to re-issue invite on the same account (allowed).
+
+            We can reuse the previous account if:
+            - it exists and has cookies
+            - Plus lifetime is sufficient (>= min days)
+            - after cancelling pending invite, the account still has a free slot (live probe)
+            """
+            if not membership.yandex_account_id:
+                return None
             prev = await session.get(YandexAccount, membership.yandex_account_id)
-            if prev and prev.credentials_ref:
+            if not prev or not prev.credentials_ref:
+                return None
+            if prev.status != "active" or not _plus_ok_for_invite(prev):
+                return None
+
+            storage_path = self._account_state_path(prev)
+
+            # Cancel pending invite first (best-effort) to free the waiting slot.
+            if membership.status in ("awaiting_join", "pending"):
                 try:
-                    await self.provider.cancel_pending_invite(
-                        storage_state_path=self._account_state_path(prev)
-                    )
+                    await self.provider.cancel_pending_invite(storage_state_path=storage_path)
                 except Exception:
                     pass
 
-        # Pick a fresh eligible account with free slot.
-        acc = await _select_account_for_invite(session)
+            # Re-probe to confirm we still have a free slot (and update counters best-effort).
+            try:
+                snap = await self.provider.probe(storage_state_path=storage_path)
+                fam = snap.family
+                if fam:
+                    try:
+                        prev.used_slots = int(fam.used_slots)
+                    except Exception:
+                        pass
+                    if int(getattr(fam, "free_slots", 0) or 0) > 0:
+                        return prev
+            except Exception:
+                # If probe fails, fall back to selecting a new account.
+                return None
+            return None
+
+        # Prefer re-issuing on the same account if it still has a free slot.
+        acc = await _try_reuse_previous_account()
+        if not acc:
+            # Pick a fresh eligible account with free slot.
+            acc = await _select_account_for_invite(session)
 
         invite_link = await self.provider.create_invite_link(
             storage_state_path=self._account_state_path(acc)
