@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from datetime import timedelta
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.db.models.subscription import Subscription
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_membership import YandexMembership
-from app.db.models.subscription import Subscription
 from app.repo import utcnow
 from app.services.yandex.provider import build_provider
 
@@ -20,7 +19,13 @@ def _plus_ok_for_invite(acc: YandexAccount) -> bool:
     """Account can be used for inviting only if Plus remains active long enough."""
     if not acc.plus_end_at:
         return False
-        min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 30))
+
+    min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 30))
+
+    # If min_days <= 0, treat as disabled check (allow any account with plus_end_at)
+    if min_days <= 0:
+        return True
+
     return acc.plus_end_at >= (datetime.now(timezone.utc) + timedelta(days=min_days))
 
 
@@ -50,17 +55,21 @@ async def _select_account_for_invite(session) -> YandexAccount:
         raise RuntimeError("No YandexAccount with enough Plus lifetime")
 
     # Probe candidates until we find a free slot.
+    provider = build_provider()
+
     for acc in candidates:
         storage_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
-        snap = await build_provider().probe(storage_state_path=storage_path)
+        snap = await provider.probe(storage_state_path=storage_path)
         fam = snap.family
         if not fam:
             continue
+
         # Keep DB counters best-effort.
         try:
             acc.used_slots = int(fam.used_slots)
         except Exception:
             pass
+
         if int(getattr(fam, "free_slots", 0) or 0) > 0:
             return acc
 
