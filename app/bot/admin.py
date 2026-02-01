@@ -213,6 +213,25 @@ async def admin_yandex_probe(cb: CallbackQuery) -> None:
 
     debug_dir = (snap.raw_debug or {}).get("debug_dir")
 
+    # Persist probe results best-effort (used_slots + plus_end_at)
+    try:
+        async with session_scope() as session:
+            db_acc = await session.get(YandexAccount, acc.id)
+            if db_acc:
+                fam = snap.family
+                if fam:
+                    try:
+                        db_acc.used_slots = int(getattr(fam, "used_slots", db_acc.used_slots or 0) or 0)
+                    except Exception:
+                        pass
+                dt = getattr(snap, "plus_end_at", None)
+                if dt:
+                    db_acc.plus_end_at = dt
+                await session.flush()
+    except Exception:
+        pass
+
+
     fam = snap.family
     if not fam:
         # ВАЖНО: если парс не удался — НЕ показываем фейковые слоты
@@ -234,7 +253,9 @@ async def admin_yandex_probe(cb: CallbackQuery) -> None:
         f"Админ: <code>{admins}</code>\n"
         f"Гости: <code>{guests}</code>\n"
         f"Pending: <b>{fam.pending_count}</b>\n"
-        f"Free slots: <b>{fam.free_slots}</b>\n\n"
+        f"Free slots: <b>{fam.free_slots}</b>\n"
+        f"Next charge: <code>{snap.next_charge_text or '—'}</code>\n"
+        f"Plus end at: <code>{getattr(snap, 'plus_end_at', None) or '—'}</code>\n\n"
         f"Debug: <code>{debug_dir or '—'}</code>",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
