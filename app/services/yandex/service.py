@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from datetime import datetime, timezone
 from typing import List, Tuple
 
 from sqlalchemy import select
@@ -8,10 +9,62 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_membership import YandexMembership
+from app.db.models.subscription import Subscription
 from app.repo import utcnow
 from app.services.yandex.provider import build_provider
 
 INVITE_TTL_MINUTES = 15
+
+
+def _plus_ok_for_invite(acc: YandexAccount) -> bool:
+    """Account can be used for inviting only if Plus remains active long enough."""
+    if not acc.plus_end_at:
+        return False
+    min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 30) or 30)
+    return acc.plus_end_at >= (datetime.now(timezone.utc) + timedelta(days=min_days))
+
+
+async def _select_account_for_invite(session) -> YandexAccount:
+    """Pick an account that:
+    - active
+    - has credentials
+    - Plus end_at >= now + min_days
+    - has free slots (based on live probe)
+
+    We probe accounts only at invite time (not continuously).
+    """
+    accounts = (
+        await session.scalars(
+            select(YandexAccount)
+            .where(YandexAccount.status == "active")
+            .order_by(YandexAccount.used_slots.asc(), YandexAccount.id.asc())
+        )
+    ).all()
+
+    if not accounts:
+        raise RuntimeError("No active YandexAccount")
+
+    # First, filter by Plus lifetime and cookies.
+    candidates = [a for a in accounts if a.credentials_ref and _plus_ok_for_invite(a)]
+    if not candidates:
+        raise RuntimeError("No YandexAccount with enough Plus lifetime")
+
+    # Probe candidates until we find a free slot.
+    for acc in candidates:
+        storage_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
+        snap = await build_provider().probe(storage_state_path=storage_path)
+        fam = snap.family
+        if not fam:
+            continue
+        # Keep DB counters best-effort.
+        try:
+            acc.used_slots = int(fam.used_slots)
+        except Exception:
+            pass
+        if int(getattr(fam, "free_slots", 0) or 0) > 0:
+            return acc
+
+    raise RuntimeError("No free slots on eligible Yandex accounts")
 
 
 def _norm_login(x: str | None) -> str:
@@ -50,18 +103,18 @@ class YandexService:
         if existing:
             return existing
 
-        account = await session.scalar(
-            select(YandexAccount)
-            .where(YandexAccount.status == "active")
-            .order_by(YandexAccount.id.asc())
-            .limit(1)
-        )
-        if not account or not account.credentials_ref:
-            raise RuntimeError("No active YandexAccount")
+        # Pick account only when we really need to invite.
+        account = await _select_account_for_invite(session)
 
-        invite_link = await self.provider.create_invite_link(
-            storage_state_path=self._account_state_path(account)
-        )
+        invite_link: str | None = None
+        try:
+            invite_link = await self.provider.create_invite_link(
+                storage_state_path=self._account_state_path(account)
+            )
+        except Exception:
+            # Don't fail user-flow hard: create membership without link.
+            # Scheduler / user re-open can retry later.
+            invite_link = None
 
         now = utcnow()
         membership = YandexMembership(
@@ -69,9 +122,9 @@ class YandexService:
             yandex_account_id=account.id,
             yandex_login=_norm_login(yandex_login),
             invite_link=invite_link,
-            invite_issued_at=now,
-            invite_expires_at=now + timedelta(minutes=INVITE_TTL_MINUTES),
-            status="awaiting_join",
+            invite_issued_at=now if invite_link else None,
+            invite_expires_at=(now + timedelta(minutes=INVITE_TTL_MINUTES)) if invite_link else None,
+            status="awaiting_join" if invite_link else "pending",
             reinvite_used=0,
             abuse_strikes=0,
         )
@@ -79,6 +132,155 @@ class YandexService:
         session.add(membership)
         await session.flush()
         return membership
+
+    async def issue_or_reissue_invite(
+        self,
+        *,
+        session,
+        membership: YandexMembership,
+        count_as_reinvite: bool,
+    ) -> YandexMembership:
+        """(Re)issue invite for an existing membership.
+
+        Used for:
+        - reinvite button (count_as_reinvite=True)
+        - auto reinvite after removal when subscription re-activated (count_as_reinvite=False)
+
+        Always cancels any pending invite on previous account to free the slot.
+        """
+        now = utcnow()
+
+        # Cancel pending invite on previous account (best-effort).
+        if membership.yandex_account_id and membership.status in ("awaiting_join", "pending"):
+            prev = await session.get(YandexAccount, membership.yandex_account_id)
+            if prev and prev.credentials_ref:
+                try:
+                    await self.provider.cancel_pending_invite(
+                        storage_state_path=self._account_state_path(prev)
+                    )
+                except Exception:
+                    pass
+
+        # Pick a fresh eligible account with free slot.
+        acc = await _select_account_for_invite(session)
+
+        invite_link = await self.provider.create_invite_link(
+            storage_state_path=self._account_state_path(acc)
+        )
+
+        membership.yandex_account_id = acc.id
+        membership.invite_link = invite_link
+        membership.invite_issued_at = now
+        membership.invite_expires_at = now + timedelta(minutes=INVITE_TTL_MINUTES)
+        membership.status = "awaiting_join"
+
+        if count_as_reinvite:
+            membership.reinvite_used = int(membership.reinvite_used or 0) + 1
+
+        membership.updated_at = now
+        await session.flush()
+        return membership
+
+    async def remove_user_from_family_if_needed(self, *, session, tg_id: int) -> bool:
+        """Remove user from Yandex family when service subscription expires.
+
+        Returns True if a membership was found and removal attempted.
+        """
+        m = await session.scalar(
+            select(YandexMembership)
+            .where(
+                YandexMembership.tg_id == tg_id,
+                YandexMembership.status == "active",
+                YandexMembership.yandex_account_id.is_not(None),
+            )
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+        if not m or not m.yandex_account_id:
+            return False
+
+        acc = await session.get(YandexAccount, m.yandex_account_id)
+        if not acc or not acc.credentials_ref:
+            # can't operate; still mark as removed logically
+            m.status = "removed"
+            m.updated_at = utcnow()
+            return True
+
+        try:
+            await self.provider.remove_guest(
+                storage_state_path=self._account_state_path(acc),
+                guest_login=_norm_login(m.yandex_login),
+            )
+        except Exception:
+            # best-effort: keep it active; scheduler can retry later if needed
+            return True
+
+        m.status = "removed"
+        m.updated_at = utcnow()
+        return True
+
+    async def issue_missing_invites(self, session) -> List[YandexMembership]:
+        """Issue invites for memberships that were created but have no invite_link yet.
+
+        We only do this for users with an active subscription (end_at > now).
+        This keeps user UX clean: they don't see internal errors, they just receive the invite when ready.
+        """
+        now = utcnow()
+        q = (
+            select(YandexMembership)
+            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
+            .where(
+                YandexMembership.status == "pending",
+                YandexMembership.invite_link.is_(None),
+                YandexMembership.yandex_login.is_not(None),
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .order_by(YandexMembership.id.asc())
+            .limit(50)
+        )
+        items = (await session.scalars(q)).all()
+        issued: List[YandexMembership] = []
+        for m in items:
+            try:
+                await self.issue_or_reissue_invite(
+                    session=session,
+                    membership=m,
+                    count_as_reinvite=False,
+                )
+                issued.append(m)
+            except Exception:
+                # keep it pending; we'll retry later
+                continue
+        return issued
+
+    async def issue_invites_for_reactivated_users(self, session) -> List[YandexMembership]:
+        """If user has active subscription but is not in family (removed), issue a new invite."""
+        now = utcnow()
+        q = (
+            select(YandexMembership)
+            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
+            .where(
+                YandexMembership.status == "removed",
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .order_by(YandexMembership.id.asc())
+            .limit(50)
+        )
+        items = (await session.scalars(q)).all()
+        issued: List[YandexMembership] = []
+        for m in items:
+            try:
+                await self.issue_or_reissue_invite(
+                    session=session,
+                    membership=m,
+                    count_as_reinvite=False,
+                )
+                issued.append(m)
+            except Exception:
+                continue
+        return issued
 
     async def expire_pending_invites(self, session) -> List[int]:
         now = utcnow()
