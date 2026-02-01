@@ -46,6 +46,8 @@ class Settings:
     yandex_enabled: bool = True
     yandex_worker_period_seconds: int = 10
     yandex_pending_ttl_seconds: int = 600  # 10 минут
+    # Only use accounts for inviting if their Plus remains active for at least this many days.
+    yandex_invite_min_remaining_days: int = 30
     yandex_reinvite_max: int = 1
     yandex_max_strikes: int = 2
     yandex_provider: str = "mock"  # mock | playwright (позже)
@@ -83,6 +85,7 @@ def _load_settings() -> Settings:
         yandex_enabled=_env_bool("YANDEX_ENABLED", True),
         yandex_worker_period_seconds=int(os.getenv("YANDEX_WORKER_PERIOD_SECONDS", "10")),
         yandex_pending_ttl_seconds=int(os.getenv("YANDEX_PENDING_TTL_SECONDS", "600")),
+        yandex_invite_min_remaining_days=int(os.getenv("YANDEX_INVITE_MIN_REMAINING_DAYS", "30")),
         yandex_reinvite_max=int(os.getenv("YANDEX_REINVITE_MAX", "1")),
         yandex_max_strikes=int(os.getenv("YANDEX_MAX_STRIKES", "2")),
         yandex_provider=os.getenv("YANDEX_PROVIDER", "mock").strip().lower(),
