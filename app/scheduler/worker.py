@@ -145,8 +145,18 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
                 await yandex_service.remove_user_from_family_if_needed(session=session, tg_id=tg_id)
             except Exception:
                 pass
+
+            # User notification (single message, no extra noise).
+            # We treat Yandex removal as a part of access revocation even if the external action
+            # may be delayed due to temporary errors (captcha/network) — the user access in our
+            # system is already stopped.
             try:
-                await bot.send_message(tg_id, "⛔️ Подписка истекла. Доступ к VPN отключён.")
+                await bot.send_message(
+                    tg_id,
+                    "⛔️ Подписка истекла.\n"
+                    "• Доступ к VPN отключён.\n"
+                    "• Вы исключены из семейной подписки Yandex Plus, так как срок подписки истёк.",
+                )
             except Exception:
                 pass
 
