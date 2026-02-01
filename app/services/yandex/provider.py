@@ -12,12 +12,19 @@ from playwright.async_api import async_playwright, Page
 from app.core.config import settings
 
 PLUS_URL = "https://plus.yandex.ru/my"
+
+# запасной URL (тот, что ты прислал) — иногда у Яндекса разные редиректы/компоненты
+PLUS_URL_ALT = (
+    "https://plus.yandex.ru/my?"
+    "utm_source=plushome&utm_medium=main_button&lk_ret_path=https%3A%2F%2Fplus.yandex.ru%2F&"
+    "utm_campaign=menu&source=yandex_serp_menu_zaloginplus&state=zaloginplus&origin=serp_desktop_plus"
+)
+
 FAMILY_URL = "https://id.yandex.ru/family"
 
 _MONTHS_RU = (
     "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
 )
-
 
 _MONTH_NUM_RU = {
     "января": 1,
@@ -75,14 +82,10 @@ def parse_plus_end_at(next_charge_text: str | None, *, now: datetime | None = No
     except Exception:
         return None
 
+
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
 LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 
-# Если мы попали на логин/ошибочную страницу — парсинг семьи будет мусорным.
-# Эти маркеры подобраны так, чтобы отловить самые частые случаи:
-# 1) редирект на авторизацию
-# 2) капча / подтверждение
-# 3) упавшая/пустая страница
 _BAD_FAMILY_MARKERS_RE = re.compile(
     r"(войти|войдите|вход|подтвердите|captcha|капча|не\s+удалось\s+загрузить|ошибка|error|"
     r"попробуйте\s+позже|временно\s+недоступно|something\s+went\s+wrong)",
@@ -236,29 +239,113 @@ async def _read_body_text(page: Page) -> str:
         return ""
 
 
-def extract_next_charge(text: str) -> Optional[str]:
-    if not text:
-        return None
+# --------------------------
+# NEXT CHARGE extraction
+# --------------------------
 
-    m = re.search(rf"(Спишется\s+\d{{1,2}}\s+(?:{_MONTHS_RU}))", text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+_NEXT_CHARGE_RE = re.compile(
+    rf"(Спишется\s+\d{{1,2}}\s+(?:{_MONTHS_RU})(?:\s+\d{{4}})?)",
+    re.I,
+)
 
-    m2 = re.search(
-        rf"((?:Следующ(?:ий|ая)\s+плат[её]ж)[^\n]*\d{{1,2}}\s+(?:{_MONTHS_RU}))",
-        text,
-        re.IGNORECASE,
-    )
-    if m2:
-        return m2.group(1).strip()
+_CAPTCHA_MARKERS_RE = re.compile(
+    r"(captcha|капча|подтвердите|robot|робот|я\s+не\s+робот|пройдите\s+проверку)",
+    re.I,
+)
+
+async def _find_next_charge_in_frames(page: Page) -> Optional[str]:
+    """
+    Ищем 'Спишется ...' во всех frames (иногда Яндекс рендерит куски в iframe).
+    """
+    for fr in page.frames:
+        try:
+            # 1) locator text= regex
+            loc = fr.locator("text=/Спишется\\s+\\d{1,2}\\s+(" + _MONTHS_RU + ")(\\s+\\d{4})?/i")
+            if await loc.count() > 0:
+                txt = (await loc.first.inner_text()).strip()
+                m = _NEXT_CHARGE_RE.search(txt)
+                return m.group(1).strip() if m else txt
+        except Exception:
+            pass
+
+        try:
+            # 2) body inner text regex
+            body = await fr.locator("body").inner_text()
+            m = _NEXT_CHARGE_RE.search(body or "")
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+
+        try:
+            # 3) html regex
+            html = await fr.content()
+            m = _NEXT_CHARGE_RE.search(html or "")
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
 
     return None
 
 
+async def _extract_next_charge_strict(page: Page, out_dir: Path, *, timeout_ms: int = 20_000) -> Optional[str]:
+    """
+    Строго пытаемся получить 'Спишется ...' с ожиданием.
+    Возвращаем строку или None (если реально не нашли/капча/не тот экран).
+    """
+    # Быстрый детект капчи
+    try:
+        body = await _read_body_text(page)
+        if _CAPTCHA_MARKERS_RE.search(body or ""):
+            await _save_debug(page, out_dir, "plus_captcha_detected")
+            return None
+    except Exception:
+        pass
+
+    # 1) Ждём появления текста по locator (если SPA поздно дорисовывает)
+    try:
+        loc = page.locator("text=/Спишется\\s+\\d{1,2}\\s+(" + _MONTHS_RU + ")(\\s+\\d{4})?/i")
+        await loc.first.wait_for(state="visible", timeout=timeout_ms)
+        txt = (await loc.first.inner_text()).strip()
+        m = _NEXT_CHARGE_RE.search(txt)
+        return m.group(1).strip() if m else txt
+    except Exception:
+        pass
+
+    # 2) Ищем в frames + regex
+    txt2 = await _find_next_charge_in_frames(page)
+    if txt2:
+        return txt2
+
+    # 3) Последняя попытка — прочитать body/html текущей страницы (на случай, если элемент не "visible")
+    try:
+        body = await _read_body_text(page)
+        m = _NEXT_CHARGE_RE.search(body or "")
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+
+    try:
+        html = await page.content()
+        m = _NEXT_CHARGE_RE.search(html or "")
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+
+    await _save_debug(page, out_dir, "plus_next_charge_NOT_FOUND")
+    return None
+
+
+# --------------------------
+# Family parsing
+# --------------------------
+
 def _looks_like_bad_family_page(body: str) -> bool:
     if not body:
         return True
-    # слишком коротко => часто пустая/не прогрузилась
     if len(body.strip()) < 120:
         return True
     if _BAD_FAMILY_MARKERS_RE.search(body):
@@ -269,7 +356,7 @@ def _looks_like_bad_family_page(body: str) -> bool:
 def parse_family_min(text: str) -> Optional[YandexFamilySnapshot]:
     """
     Возвращает None, если по тексту видно что страница не та / не прогрузилась,
-    чтобы не показывать \"4 свободных\" и т.п.
+    чтобы не показывать "4 свободных" и т.п.
     """
     if not text:
         return None
@@ -311,7 +398,6 @@ def parse_family_min(text: str) -> Optional[YandexFamilySnapshot]:
         filtered.append(c)
 
     filtered.sort()
-    # На family максимум 3 гостя, всё что больше — почти всегда мусорный парс.
     if len(filtered) > 3:
         return None
 
@@ -338,10 +424,6 @@ async def _goto(page: Page, url: str, out_dir: Path, prefix: str) -> None:
 
 
 async def _goto_family_with_retry(page: Page, out_dir: Path) -> str:
-    """
-    FAMILY_URL иногда грузится нестабильно (редирект/пустая/не успело).
-    Делаем несколько попыток + сохраняем debug на каждой.
-    """
     last_body = ""
     for attempt in range(1, 4):
         prefix = f"family_try{attempt}"
@@ -351,7 +433,6 @@ async def _goto_family_with_retry(page: Page, out_dir: Path) -> str:
             await _save_debug(page, out_dir, f"{prefix}_goto_error")
 
         try:
-            # чуть помогаем: иногда контент ниже, скроллим
             try:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(250)
@@ -366,13 +447,11 @@ async def _goto_family_with_retry(page: Page, out_dir: Path) -> str:
         except Exception:
             await _save_debug(page, out_dir, f"{prefix}_read_error")
 
-        # небольшая пауза перед ретраем
         try:
             await page.wait_for_timeout(700)
         except Exception:
             pass
 
-        # пробуем reload
         try:
             await page.reload(wait_until="domcontentloaded", timeout=60_000)
             await page.wait_for_load_state("networkidle", timeout=60_000)
@@ -484,6 +563,11 @@ class PlaywrightYandexProvider:
         debug_dir = root / Path(storage_state_path).stem / f"probe_{_now_tag()}"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
+        next_charge_text: Optional[str] = None
+        plus_end_at: Optional[datetime] = None
+        family_snap: Optional[YandexFamilySnapshot] = None
+        raw_debug: dict[str, Any] = {"debug_dir": str(debug_dir)}
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
@@ -492,30 +576,52 @@ class PlaywrightYandexProvider:
             context = await browser.new_context(
                 storage_state=storage_state_path,
                 viewport={"width": 1280, "height": 720},
+                locale="ru-RU",
             )
             page = await context.new_page()
 
-            next_charge_text: Optional[str] = None
-            plus_end_at: Optional[datetime] = None
-            family_snap: Optional[YandexFamilySnapshot] = None
+            # -------- PLUS: строгий поиск "Спишется ..."
+            plus_ok = False
+            for attempt in range(1, 4):
+                try:
+                    url = PLUS_URL if attempt < 3 else PLUS_URL_ALT
+                    await _goto(page, url, debug_dir, f"plus_try{attempt}")
+                    # даём SPA дорисовать (иногда "Спишется" появляется позже networkidle)
+                    await page.wait_for_timeout(1200)
+                    next_charge_text = await _extract_next_charge_strict(page, debug_dir, timeout_ms=20_000)
 
-            # PLUS
-            try:
-                await _goto(page, PLUS_URL, debug_dir, "plus")
-                body = await _read_body_text(page)
-                next_charge_text = extract_next_charge(body or "")
-                plus_end_at = parse_plus_end_at(next_charge_text, now=datetime.now(timezone.utc))
-            except Exception:
-                await _save_debug(page, debug_dir, "plus_error")
+                    raw_debug["plus_attempt"] = attempt
+                    raw_debug["plus_url"] = url
+                    raw_debug["next_charge_text"] = next_charge_text
 
-            # FAMILY (устойчиво)
+                    if next_charge_text:
+                        plus_end_at = parse_plus_end_at(next_charge_text, now=datetime.now(timezone.utc))
+                        raw_debug["plus_end_at"] = plus_end_at.isoformat() if plus_end_at else None
+                        plus_ok = bool(plus_end_at)
+                        if plus_ok:
+                            break
+                except Exception as e:
+                    raw_debug[f"plus_try{attempt}_error"] = str(e)
+                    await _save_debug(page, debug_dir, f"plus_try{attempt}_error")
+
+                # reload между попытками
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_load_state("networkidle", timeout=60_000)
+                    await _save_debug(page, debug_dir, f"plus_try{attempt}_reloaded")
+                except Exception:
+                    pass
+
+            raw_debug["plus_ok"] = plus_ok
+
+            # -------- FAMILY (устойчиво)
             try:
                 body = await _goto_family_with_retry(page, debug_dir)
                 family_snap = parse_family_min(body or "")
-                # если парс не удался — ставим None, чтобы не показывать \"4 свободных\"
                 if family_snap is None:
                     await _save_debug(page, debug_dir, "family_parse_failed")
-            except Exception:
+            except Exception as e:
+                raw_debug["family_error"] = str(e)
                 await _save_debug(page, debug_dir, "family_error")
                 family_snap = None
 
@@ -526,7 +632,7 @@ class PlaywrightYandexProvider:
             next_charge_text=next_charge_text,
             plus_end_at=plus_end_at,
             family=family_snap,
-            raw_debug={"debug_dir": str(debug_dir)},
+            raw_debug=raw_debug,
         )
 
     async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool:
@@ -544,6 +650,7 @@ class PlaywrightYandexProvider:
             context = await browser.new_context(
                 storage_state=storage_state_path,
                 viewport={"width": 1280, "height": 720},
+                locale="ru-RU",
             )
             page = await context.new_page()
 
@@ -586,6 +693,7 @@ class PlaywrightYandexProvider:
             context = await browser.new_context(
                 storage_state=storage_state_path,
                 viewport={"width": 1280, "height": 720},
+                locale="ru-RU",
             )
             page = await context.new_page()
 
@@ -661,6 +769,7 @@ class PlaywrightYandexProvider:
             context = await browser.new_context(
                 storage_state=storage_state_path,
                 viewport={"width": 1280, "height": 720},
+                locale="ru-RU",
             )
             page = await context.new_page()
 
