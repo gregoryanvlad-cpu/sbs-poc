@@ -4,10 +4,13 @@ import json
 import re
 
 from aiogram import Router, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy import select
 
 from app.db.session import session_scope
 from app.db.models.user import User
+from app.db.models.yandex_membership import YandexMembership
+from app.core.config import settings
 from app.services.yandex.service import yandex_service
 
 router = Router()
@@ -24,6 +27,47 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
         ]
     )
+
+
+@router.callback_query(F.data == "yandex:reinvite")
+async def on_yandex_reinvite(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    await cb.answer()
+
+    async with session_scope() as session:
+        ym = await session.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+        if not ym or ym.status != "invite_timeout":
+            return
+
+        used = int(getattr(ym, "reinvite_used", 0) or 0)
+        max_re = int(getattr(settings, "yandex_reinvite_max", 1) or 1)
+        if used >= max_re:
+            return
+
+        try:
+            ym = await yandex_service.issue_or_reissue_invite(
+                session=session,
+                membership=ym,
+                count_as_reinvite=True,
+            )
+            await session.commit()
+        except Exception:
+            return
+
+    if ym.invite_link:
+        await cb.message.answer(
+            "✅ Новое приглашение готово!\n\n"
+            f"Логин: <code>{ym.yandex_login}</code>\n"
+            "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
+            "Нажми кнопку ниже и прими приглашение в семейную подписку.",
+            reply_markup=_kb_open_invite(ym.invite_link),
+            parse_mode="HTML",
+        )
 
 
 async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
