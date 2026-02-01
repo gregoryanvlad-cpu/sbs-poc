@@ -20,7 +20,7 @@ def _plus_ok_for_invite(acc: YandexAccount) -> bool:
     """Account can be used for inviting only if Plus remains active long enough."""
     if not acc.plus_end_at:
         return False
-    min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 0) or 30)
+ min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 30))
     return acc.plus_end_at >= (datetime.now(timezone.utc) + timedelta(days=min_days))
 
 
