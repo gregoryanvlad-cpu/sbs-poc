@@ -41,23 +41,89 @@ async def run_scheduler() -> None:
                 try:
                     await _job_expire_subscriptions(bot)
                     if settings.yandex_enabled:
-                        # 1) синкаем семью и активируем тех, кто вошёл правильно
-                        await _job_yandex_sync_and_activate(bot)
+                        # Yandex jobs are event-driven:
+                        # - Heavy probing (family scans) only while there is an active invite (awaiting_join with link)
+                        # - TTL expiry / missing-invite issuance runs when needed
+                        active_invite = await _has_active_yandex_invites()
+                        expired_invite = await _has_expired_yandex_invites()
+                        needs_invite = await _has_pending_invites_without_link() or await _has_reactivated_removed()
 
-                        # 2) guard: кикаем чужих / страйки / баны (по expected логину)
-                        await _job_yandex_guard(bot)
+                        # 1) TTL: if any invite expired, free the slot
+                        if expired_invite:
+                            await _job_yandex_invite_ttl(bot)
 
-                        # 3) TTL приглашений
-                        await _job_yandex_invite_ttl(bot)
+                        # 2) Issue missing invites (created but link not ready) and reinvite reactivated users
+                        if needs_invite:
+                            await _job_yandex_issue_needed_invites(bot)
 
-                        # 4) доп. enforcement (кик "левых" на уровне сервиса)
-                        await _job_yandex_enforce_no_foreign(bot)
+                        # 3) Only during active invite window we do family scanning & guards.
+                        if active_invite:
+                            await _job_yandex_sync_and_activate(bot)
+                            await _job_yandex_guard(bot)
+                            await _job_yandex_enforce_no_foreign(bot)
                 finally:
                     await advisory_unlock(session)
         except Exception:
             log.exception("scheduler_loop_error")
 
         await asyncio.sleep(sleep_seconds)
+
+
+async def _has_active_yandex_invites() -> bool:
+    """Active invite = awaiting_join with non-empty invite_link and not expired."""
+    from app.repo import utcnow
+
+    now = utcnow()
+    async with session_scope() as session:
+        q = select(YandexMembership.id).where(
+            YandexMembership.status == "awaiting_join",
+            YandexMembership.invite_link.is_not(None),
+            YandexMembership.invite_expires_at.is_not(None),
+            YandexMembership.invite_expires_at > now,
+        ).limit(1)
+        return (await session.scalar(q)) is not None
+
+
+async def _has_expired_yandex_invites() -> bool:
+    from app.repo import utcnow
+
+    now = utcnow()
+    async with session_scope() as session:
+        q = select(YandexMembership.id).where(
+            YandexMembership.status == "awaiting_join",
+            YandexMembership.invite_expires_at.is_not(None),
+            YandexMembership.invite_expires_at <= now,
+        ).limit(1)
+        return (await session.scalar(q)) is not None
+
+
+async def _has_pending_invites_without_link() -> bool:
+    async with session_scope() as session:
+        q = select(YandexMembership.id).where(
+            YandexMembership.status == "pending",
+            YandexMembership.invite_link.is_(None),
+        ).limit(1)
+        return (await session.scalar(q)) is not None
+
+
+async def _has_reactivated_removed() -> bool:
+    """True if there are removed users with active subscription (needs re-invite)."""
+    from app.db.models.subscription import Subscription
+    from app.repo import utcnow
+
+    now = utcnow()
+    async with session_scope() as session:
+        q = (
+            select(YandexMembership.id)
+            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
+            .where(
+                YandexMembership.status == "removed",
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .limit(1)
+        )
+        return (await session.scalar(q)) is not None
 
 
 async def _job_expire_subscriptions(bot: Bot) -> None:
@@ -73,6 +139,12 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
             tg_id = sub.tg_id
             await set_subscription_expired(session, tg_id)
             await deactivate_peers(session, tg_id, reason="subscription_expired")
+
+            # Also remove from Yandex family (best-effort).
+            try:
+                await yandex_service.remove_user_from_family_if_needed(session=session, tg_id=tg_id)
+            except Exception:
+                pass
             try:
                 await bot.send_message(tg_id, "⛔️ Подписка истекла. Доступ к VPN отключён.")
             except Exception:
@@ -146,6 +218,52 @@ async def _job_yandex_invite_ttl(bot: Bot) -> None:
                 "⏳ Время действия приглашения истекло.\n\n"
                 "Откройте раздел 🟡 Yandex Plus — если доступно, вы сможете запросить новое приглашение (1 раз).",
                 reply_markup=kb,
+            )
+        except Exception:
+            pass
+
+
+async def _job_yandex_issue_needed_invites(bot: Bot) -> None:
+    """Issue invites for:
+    - pending memberships with no invite_link yet (created earlier)
+    - removed users who have an active subscription again
+
+    We keep user UX simple: user just receives the invite when ready.
+    """
+    async with session_scope() as session:
+        issued = []
+        try:
+            issued += await yandex_service.issue_missing_invites(session)
+        except Exception:
+            pass
+        try:
+            issued += await yandex_service.issue_invites_for_reactivated_users(session)
+        except Exception:
+            pass
+
+        if not issued:
+            return
+
+        await session.commit()
+
+    for m in issued:
+        if not getattr(m, "invite_link", None):
+            continue
+        try:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔗 Открыть приглашение", url=m.invite_link)],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                ]
+            )
+            await bot.send_message(
+                m.tg_id,
+                "✅ Логин принят.\n\n"
+                f"Логин: <code>{m.yandex_login}</code>\n"
+                "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
+                "Нажми кнопку ниже и прими приглашение:",
+                reply_markup=kb,
+                parse_mode="HTML",
             )
         except Exception:
             pass
