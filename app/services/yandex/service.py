@@ -1,623 +1,709 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+import re
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional, Protocol
 
-from sqlalchemy import select
+from playwright.async_api import async_playwright, Page
 
 from app.core.config import settings
-from app.db.models.subscription import Subscription
-from app.db.models.yandex_account import YandexAccount
-from app.db.models.yandex_membership import YandexMembership
-from app.repo import utcnow
-from app.services.yandex.provider import build_provider
 
-INVITE_TTL_MINUTES = 15
+PLUS_URL = "https://plus.yandex.ru/my"
+FAMILY_URL = "https://id.yandex.ru/family"
 
-
-def _plus_ok_for_invite(acc: YandexAccount) -> bool:
-    """Account can be used for inviting only if Plus remains active long enough."""
-    if not acc.plus_end_at:
-        return False
-
-    min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 30))
-
-    # If min_days <= 0, treat as disabled check (allow any account with plus_end_at)
-    if min_days <= 0:
-        return True
-
-    return acc.plus_end_at >= (datetime.now(timezone.utc) + timedelta(days=min_days))
+_MONTHS_RU = (
+    "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
+)
 
 
-async def _select_account_for_invite(session) -> YandexAccount:
-    """Pick an account that:
-    - active
-    - has credentials
-    - Plus end_at >= now + min_days (AFTER live probe refresh)
-    - has free slots (based on live probe)
+_MONTH_NUM_RU = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
 
-    We probe accounts only at invite time (not continuously).
+
+def parse_plus_end_at(next_charge_text: str | None, *, now: datetime | None = None) -> Optional[datetime]:
+    """Parse 'Спишется 9 февраля' into a timezone-aware datetime (UTC).
+
+    Yandex UI typically shows the *charge date* (billing day). We treat Plus as active
+    through the end of that calendar day, so returned datetime is 23:59:59 UTC.
+
+    If year is not present in the text, we infer it: current year, or next year if the
+    date has already passed.
     """
-    accounts = (
-        await session.scalars(
-            select(YandexAccount)
-            .where(YandexAccount.status == "active")
-            .order_by(YandexAccount.used_slots.asc(), YandexAccount.id.asc())
-        )
-    ).all()
+    if not next_charge_text:
+        return None
 
-    if not accounts:
-        raise RuntimeError("No active YandexAccount")
+    now = now or datetime.now(timezone.utc)
+    text = " ".join(str(next_charge_text).strip().split())
 
-    provider = build_provider()
+    m = re.search(r"Спишется\s+(\d{1,2})\s+([А-Яа-я]+)(?:\s+(\d{4}))?", text, re.IGNORECASE)
+    if not m:
+        return None
 
-    # 1) Only accounts with cookies
-    cookie_accounts = [a for a in accounts if a.credentials_ref]
-    if not cookie_accounts:
-        raise RuntimeError("No active YandexAccount with cookies")
+    day = int(m.group(1))
+    month_name = m.group(2).lower()
+    year_str = m.group(3)
 
-    probed: list[tuple[YandexAccount, object]] = []
+    month = _MONTH_NUM_RU.get(month_name)
+    if not month:
+        return None
 
-    # 2) PROBE first to refresh plus_end_at + used_slots + free slots
-    for acc in cookie_accounts:
-        storage_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
+    if year_str:
+        year = int(year_str)
+    else:
+        year = now.year
+        candidate = datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+        if candidate < now:
+            year += 1
 
-        try:
-            snap = await provider.probe(storage_state_path=storage_path)
-        except Exception:
-            continue
+    try:
+        return datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+    except Exception:
+        return None
 
-        fam = getattr(snap, "family", None)
-        if not fam:
-            continue
+INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
+LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
 
-        # Update DB counters best-effort.
-        try:
-            acc.used_slots = int(getattr(fam, "used_slots", acc.used_slots or 0) or 0)
-        except Exception:
-            pass
+# Если мы попали на логин/ошибочную страницу — парсинг семьи будет мусорным.
+# Эти маркеры подобраны так, чтобы отловить самые частые случаи:
+# 1) редирект на авторизацию
+# 2) капча / подтверждение
+# 3) упавшая/пустая страница
+_BAD_FAMILY_MARKERS_RE = re.compile(
+    r"(войти|войдите|вход|подтвердите|captcha|капча|не\s+удалось\s+загрузить|ошибка|error|"
+    r"попробуйте\s+позже|временно\s+недоступно|something\s+went\s+wrong)",
+    re.I,
+)
 
-        # Refresh Plus lifetime from probe result (IMPORTANT)
-        dt = (
-            getattr(snap, "plus_end_at", None)
-            or getattr(snap, "next_charge_at", None)
-            or getattr(snap, "next_charge_date", None)
-        )
-        if dt:
-            acc.plus_end_at = dt
+# ==========================
+# Debug storage management
+# ==========================
 
-        probed.append((acc, fam))
-
-    if not probed:
-        raise RuntimeError("No eligible Yandex accounts (probe failed or family not found)")
-
-    # 3) Now apply lifetime check + find free slot
-    lifetime_ok_found = False
-    for acc, fam in probed:
-        if not _plus_ok_for_invite(acc):
-            continue
-        lifetime_ok_found = True
-
-        free_slots = int(getattr(fam, "free_slots", 0) or 0)
-        if free_slots > 0:
-            return acc
-
-    if not lifetime_ok_found:
-        raise RuntimeError("No YandexAccount with enough Plus lifetime")
-
-    raise RuntimeError("No free slots on eligible Yandex accounts")
+_DEBUG_KEEP_LAST_PER_ACCOUNT = 20
+_DEBUG_MAX_TOTAL_MB = 250
 
 
-def _norm_login(x: str | None) -> str:
-    return (x or "").strip().lstrip("@").lower()
-
-
-def _allowed_logins_from_env() -> set[str]:
-    raw = getattr(settings, "yandex_allowed_logins", None)
-    if not raw:
-        return set()
-    if isinstance(raw, str):
-        return {x.strip().lstrip("@").lower() for x in raw.split(",") if x.strip()}
-    return set()
-
-
-class YandexService:
-    def __init__(self) -> None:
-        self.provider = build_provider()
-
-    def _account_state_path(self, account: YandexAccount) -> str:
-        return f"{settings.yandex_cookies_dir}/{account.credentials_ref}"
-
-    async def ensure_membership_for_user(
-        self,
-        *,
-        session,
-        tg_id: int,
-        yandex_login: str,
-    ) -> YandexMembership:
-        existing = await session.scalar(
-            select(YandexMembership).where(
-                YandexMembership.tg_id == tg_id,
-                YandexMembership.status.in_(["awaiting_join", "active"]),
-            )
-        )
-        if existing:
-            return existing
-
-        # Pick account only when we really need to invite.
-        account = await _select_account_for_invite(session)
-
-        invite_link: str | None = None
-        try:
-            invite_link = await self.provider.create_invite_link(
-                storage_state_path=self._account_state_path(account)
-            )
-        except Exception:
-            # Don't fail user-flow hard: create membership without link.
-            # Scheduler / user re-open can retry later.
-            invite_link = None
-
-        now = utcnow()
-        membership = YandexMembership(
-            tg_id=tg_id,
-            yandex_account_id=account.id,
-            yandex_login=_norm_login(yandex_login),
-            invite_link=invite_link,
-            invite_issued_at=now if invite_link else None,
-            invite_expires_at=(now + timedelta(minutes=INVITE_TTL_MINUTES)) if invite_link else None,
-            status="awaiting_join" if invite_link else "pending",
-            reinvite_used=0,
-            abuse_strikes=0,
-        )
-
-        session.add(membership)
-        await session.flush()
-        return membership
-
-    async def issue_or_reissue_invite(
-        self,
-        *,
-        session,
-        membership: YandexMembership,
-        count_as_reinvite: bool,
-    ) -> YandexMembership:
-        """(Re)issue invite for an existing membership.
-
-        Used for:
-        - reinvite button (count_as_reinvite=True)
-        - auto reinvite after removal when subscription re-activated (count_as_reinvite=False)
-
-        Always cancels any pending invite on previous account to free the slot.
-        """
-        now = utcnow()
-
-        async def _try_reuse_previous_account() -> YandexAccount | None:
-            """Try to re-issue invite on the same account (allowed).
-
-            We can reuse the previous account if:
-            - it exists and has cookies
-            - Plus lifetime is sufficient (>= min days)
-            - after cancelling pending invite, the account still has a free slot (live probe)
-            """
-            if not membership.yandex_account_id:
-                return None
-            prev = await session.get(YandexAccount, membership.yandex_account_id)
-            if not prev or not prev.credentials_ref:
-                return None
-            if prev.status != "active" or not _plus_ok_for_invite(prev):
-                return None
-
-            storage_path = self._account_state_path(prev)
-
-            # Cancel pending invite first (best-effort) to free the waiting slot.
-            if membership.status in ("awaiting_join", "pending"):
-                try:
-                    await self.provider.cancel_pending_invite(storage_state_path=storage_path)
-                except Exception:
-                    pass
-
-            # Re-probe to confirm we still have a free slot (and update counters best-effort).
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for p in path.rglob("*"):
             try:
-                snap = await self.provider.probe(storage_state_path=storage_path)
-                fam = snap.family
-                if fam:
-                    try:
-                        prev.used_slots = int(fam.used_slots)
-                    except Exception:
-                        pass
-                    if int(getattr(fam, "free_slots", 0) or 0) > 0:
-                        return prev
+                if p.is_file():
+                    total += p.stat().st_size
             except Exception:
-                # If probe fails, fall back to selecting a new account.
-                return None
-            return None
+                pass
+    except Exception:
+        pass
+    return total
 
-        # Prefer re-issuing on the same account if it still has a free slot.
-        acc = await _try_reuse_previous_account()
-        if not acc:
-            # Pick a fresh eligible account with free slot.
-            acc = await _select_account_for_invite(session)
 
-        invite_link = await self.provider.create_invite_link(
-            storage_state_path=self._account_state_path(acc)
-        )
+def _safe_rmtree(path: Path) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
-        membership.yandex_account_id = acc.id
-        membership.invite_link = invite_link
-        membership.invite_issued_at = now
-        membership.invite_expires_at = now + timedelta(minutes=INVITE_TTL_MINUTES)
-        membership.status = "awaiting_join"
 
-        if count_as_reinvite:
-            membership.reinvite_used = int(membership.reinvite_used or 0) + 1
+def _prune_debug_root(root: Path) -> None:
+    """
+    Чистим debug_out, чтобы volume не забивался.
+    1) На каждый аккаунт оставляем N последних папок.
+    2) Если общий размер > лимита — удаляем самые старые до нормального размера.
+    """
+    try:
+        if not root.exists() or not root.is_dir():
+            return
+    except Exception:
+        return
 
-        membership.updated_at = now
-        await session.flush()
-        return membership
+    # 1) keep last per account
+    try:
+        for acc_dir in root.iterdir():
+            try:
+                if not acc_dir.is_dir():
+                    continue
+                runs = [p for p in acc_dir.iterdir() if p.is_dir()]
+                runs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                for old in runs[_DEBUG_KEEP_LAST_PER_ACCOUNT:]:
+                    _safe_rmtree(old)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
-    async def remove_user_from_family_if_needed(self, *, session, tg_id: int) -> bool:
-        """Remove user from Yandex family when service subscription expires.
+    # 2) cap total size
+    try:
+        limit = int(_DEBUG_MAX_TOTAL_MB) * 1024 * 1024
+        total = _dir_size_bytes(root)
+        if total <= limit:
+            return
 
-        Returns True if a membership was found and removal attempted.
-        """
-        m = await session.scalar(
-            select(YandexMembership)
-            .where(
-                YandexMembership.tg_id == tg_id,
-                YandexMembership.status == "active",
-                YandexMembership.yandex_account_id.is_not(None),
-            )
-            .order_by(YandexMembership.id.desc())
-            .limit(1)
-        )
-        if not m or not m.yandex_account_id:
-            return False
+        all_runs: list[Path] = []
+        for acc_dir in root.iterdir():
+            if acc_dir.is_dir():
+                for run in acc_dir.iterdir():
+                    if run.is_dir():
+                        all_runs.append(run)
 
-        acc = await session.get(YandexAccount, m.yandex_account_id)
-        if not acc or not acc.credentials_ref:
-            # can't operate; still mark as removed logically
-            m.status = "removed"
-            m.updated_at = utcnow()
-            return True
+        all_runs.sort(key=lambda p: p.stat().st_mtime)  # старые -> новые
 
-        try:
-            await self.provider.remove_guest(
-                storage_state_path=self._account_state_path(acc),
-                guest_login=_norm_login(m.yandex_login),
-            )
-        except Exception:
-            # best-effort: keep it active; scheduler can retry later if needed
-            return True
+        for run in all_runs:
+            if total <= limit:
+                break
+            before = _dir_size_bytes(run)
+            _safe_rmtree(run)
+            total = max(0, total - before)
+    except Exception:
+        pass
 
-        m.status = "removed"
-        m.updated_at = utcnow()
+
+# ==========================
+# Data models
+# ==========================
+
+@dataclass
+class YandexFamilySnapshot:
+    admins: list[str]
+    guests: list[str]
+    pending_count: int
+    used_slots: int
+    free_slots: int
+
+
+@dataclass
+class YandexProbeSnapshot:
+    next_charge_text: Optional[str]
+    plus_end_at: Optional[datetime]
+    family: Optional[YandexFamilySnapshot]
+    raw_debug: dict[str, Any]
+
+
+class YandexProvider(Protocol):
+    async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot: ...
+    async def create_invite_link(self, *, storage_state_path: str, debug_dir_name: str = "invite", strict: bool = True) -> str: ...
+    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool: ...
+    async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool: ...
+
+
+def _now_tag() -> str:
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+
+def _debug_root() -> Path:
+    base = Path(settings.yandex_cookies_dir or "/data/yandex")
+    return base / "debug_out"
+
+
+async def _save_debug(page: Page, out_dir: Path, prefix: str) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        html = await page.content()
+        (out_dir / f"{prefix}_page.html").write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        body = await page.locator("body").inner_text()
+        (out_dir / f"{prefix}_body.txt").write_text(body, encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        await page.screenshot(path=str(out_dir / f"{prefix}.png"), full_page=True)
+    except Exception:
+        pass
+
+
+async def _read_body_text(page: Page) -> str:
+    try:
+        return await page.locator("body").inner_text()
+    except Exception:
+        return ""
+
+
+def extract_next_charge(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    m = re.search(rf"(Спишется\s+\d{{1,2}}\s+(?:{_MONTHS_RU}))", text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    m2 = re.search(
+        rf"((?:Следующ(?:ий|ая)\s+плат[её]ж)[^\n]*\d{{1,2}}\s+(?:{_MONTHS_RU}))",
+        text,
+        re.IGNORECASE,
+    )
+    if m2:
+        return m2.group(1).strip()
+
+    return None
+
+
+def _looks_like_bad_family_page(body: str) -> bool:
+    if not body:
         return True
+    # слишком коротко => часто пустая/не прогрузилась
+    if len(body.strip()) < 120:
+        return True
+    if _BAD_FAMILY_MARKERS_RE.search(body):
+        return True
+    return False
 
-    async def issue_missing_invites(self, session) -> List[YandexMembership]:
-        """Issue invites for memberships that were created but have no invite_link yet.
 
-        We only do this for users with an active subscription (end_at > now).
-        This keeps user UX clean: they don't see internal errors, they just receive the invite when ready.
-        """
-        now = utcnow()
-        q = (
-            select(YandexMembership)
-            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
-            .where(
-                YandexMembership.status == "pending",
-                YandexMembership.invite_link.is_(None),
-                YandexMembership.yandex_login.is_not(None),
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
-            )
-            .order_by(YandexMembership.id.asc())
-            .limit(50)
-        )
-        items = (await session.scalars(q)).all()
-        issued: List[YandexMembership] = []
-        for m in items:
+def parse_family_min(text: str) -> Optional[YandexFamilySnapshot]:
+    """
+    Возвращает None, если по тексту видно что страница не та / не прогрузилась,
+    чтобы не показывать \"4 свободных\" и т.п.
+    """
+    if not text:
+        return None
+
+    if _looks_like_bad_family_page(text):
+        return None
+
+    admins: list[str] = []
+    guests: list[str] = []
+
+    pending_count = len(re.findall(r"Жд[её]м\s+ответ", text, flags=re.IGNORECASE))
+
+    for m in re.finditer(r"Админ\s*[•·]\s*([a-z0-9][a-z0-9._-]{1,63})", text, re.IGNORECASE):
+        admins.append(m.group(1).lower())
+
+    candidates = set(LOGIN_LOWER_RE.findall(text or ""))
+
+    blacklist = {
+        "yandex", "id", "family", "plus",
+        "login", "admin", "pending", "invite",
+        "https", "http", "ru", "com", "org", "www",
+        "mailto", "support", "help", "account", "settings", "profile",
+        "oauth", "token", "clientsource", "from",
+        "skip", "share", "copy", "button", "link", "open", "close",
+        "ok", "cancel",
+    }
+
+    filtered: list[str] = []
+    for c in candidates:
+        c = c.lower().strip()
+        if c in blacklist:
+            continue
+        if c.isdigit():
+            continue
+        if len(c) < 3:
+            continue
+        if c in admins:
+            continue
+        filtered.append(c)
+
+    filtered.sort()
+    # На family максимум 3 гостя, всё что больше — почти всегда мусорный парс.
+    if len(filtered) > 3:
+        return None
+
+    guests = filtered
+
+    used_slots = (1 if admins else 0) + len(guests)
+    free_slots = 4 - used_slots - pending_count
+    if free_slots < 0:
+        free_slots = 0
+
+    return YandexFamilySnapshot(
+        admins=admins,
+        guests=guests,
+        pending_count=pending_count,
+        used_slots=used_slots,
+        free_slots=free_slots,
+    )
+
+
+async def _goto(page: Page, url: str, out_dir: Path, prefix: str) -> None:
+    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    await page.wait_for_load_state("networkidle", timeout=60_000)
+    await _save_debug(page, out_dir, prefix)
+
+
+async def _goto_family_with_retry(page: Page, out_dir: Path) -> str:
+    """
+    FAMILY_URL иногда грузится нестабильно (редирект/пустая/не успело).
+    Делаем несколько попыток + сохраняем debug на каждой.
+    """
+    last_body = ""
+    for attempt in range(1, 4):
+        prefix = f"family_try{attempt}"
+        try:
+            await _goto(page, FAMILY_URL, out_dir, prefix)
+        except Exception:
+            await _save_debug(page, out_dir, f"{prefix}_goto_error")
+
+        try:
+            # чуть помогаем: иногда контент ниже, скроллим
             try:
-                await self.issue_or_reissue_invite(
-                    session=session,
-                    membership=m,
-                    count_as_reinvite=False,
-                )
-                issued.append(m)
-            except Exception:
-                # keep it pending; we'll retry later
-                continue
-        return issued
-
-    async def issue_invites_for_reactivated_users(self, session) -> List[YandexMembership]:
-        """If user has active subscription but is not in family (removed), issue a new invite."""
-        now = utcnow()
-        q = (
-            select(YandexMembership)
-            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
-            .where(
-                YandexMembership.status == "removed",
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
-            )
-            .order_by(YandexMembership.id.asc())
-            .limit(50)
-        )
-        items = (await session.scalars(q)).all()
-        issued: List[YandexMembership] = []
-        for m in items:
-            try:
-                await self.issue_or_reissue_invite(
-                    session=session,
-                    membership=m,
-                    count_as_reinvite=False,
-                )
-                issued.append(m)
-            except Exception:
-                continue
-        return issued
-
-    async def expire_pending_invites(self, session) -> List[int]:
-        now = utcnow()
-        affected: List[int] = []
-
-        memberships = (
-            await session.scalars(
-                select(YandexMembership).where(
-                    YandexMembership.status == "awaiting_join",
-                    YandexMembership.invite_expires_at.is_not(None),
-                    YandexMembership.invite_expires_at <= now,
-                )
-            )
-        ).all()
-
-        if not memberships:
-            return affected
-
-        for m in memberships:
-            account = await session.get(YandexAccount, m.yandex_account_id) if m.yandex_account_id else None
-            if account and account.credentials_ref:
-                try:
-                    await self.provider.cancel_pending_invite(
-                        storage_state_path=self._account_state_path(account)
-                    )
-                except Exception:
-                    pass
-
-            m.status = "invite_timeout"
-            m.invite_link = None
-            m.invite_issued_at = None
-            m.invite_expires_at = None
-            m.updated_at = now
-
-            affected.append(m.tg_id)
-
-        return affected
-
-    async def sync_family_and_activate(self, session) -> Tuple[List[int], List[str]]:
-        """
-        1) awaiting_join -> active (если логин появился в семье)
-        2) active -> removed (если активный логин ПРОПАЛ из семьи)
-        """
-        activated: List[int] = []
-        debug_dirs: List[str] = []
-
-        accounts = (
-            await session.scalars(
-                select(YandexAccount)
-                .where(YandexAccount.status == "active")
-                .order_by(YandexAccount.id.asc())
-            )
-        ).all()
-
-        if not accounts:
-            return activated, debug_dirs
-
-        now = utcnow()
-
-        for acc in accounts:
-            if not acc.credentials_ref:
-                continue
-
-            storage_path = self._account_state_path(acc)
-
-            try:
-                snap = await self.provider.probe(storage_state_path=storage_path)
-                if snap.raw_debug and snap.raw_debug.get("debug_dir"):
-                    debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
-            except Exception:
-                continue
-
-            fam = snap.family
-            if not fam:
-                continue
-
-            try:
-                acc.used_slots = int(fam.used_slots)
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(250)
             except Exception:
                 pass
 
-            fam_admins = {_norm_login(x) for x in (fam.admins or [])}
-            fam_guests = {_norm_login(x) for x in (fam.guests or [])}
+            body = await _read_body_text(page)
+            last_body = body or ""
+            await _save_debug(page, out_dir, f"{prefix}_after_scroll")
+            if not _looks_like_bad_family_page(last_body):
+                return last_body
+        except Exception:
+            await _save_debug(page, out_dir, f"{prefix}_read_error")
 
-            # awaiting_join -> active
-            pending_memberships = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "awaiting_join",
-                    )
-                )
-            ).all()
+        # небольшая пауза перед ретраем
+        try:
+            await page.wait_for_timeout(700)
+        except Exception:
+            pass
 
-            for m in pending_memberships:
-                login = _norm_login(m.yandex_login)
-                if not login:
-                    continue
+        # пробуем reload
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_load_state("networkidle", timeout=60_000)
+            await _save_debug(page, out_dir, f"{prefix}_reloaded")
+        except Exception:
+            await _save_debug(page, out_dir, f"{prefix}_reload_error")
 
-                if login in fam_guests or login in fam_admins:
-                    m.status = "active"
-                    m.invite_link = None
-                    m.invite_issued_at = None
-                    m.invite_expires_at = None
-                    m.updated_at = now
-                    activated.append(m.tg_id)
+    return last_body
 
-            # active -> removed (если исчез из семьи)
-            active_memberships = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "active",
-                    )
-                )
-            ).all()
 
-            for m in active_memberships:
-                login = _norm_login(m.yandex_login)
-                if not login:
-                    continue
-                if login not in fam_guests and login not in fam_admins:
-                    m.status = "removed"
-                    m.updated_at = now
+async def _click_by_text(page: Page, text: str, out_dir: Path, prefix: str) -> bool:
+    loc = page.get_by_text(text, exact=False)
+    try:
+        await loc.first.wait_for(state="visible", timeout=10_000)
+        await loc.first.click()
+        await page.wait_for_load_state("networkidle", timeout=30_000)
+        await _save_debug(page, out_dir, prefix)
+        return True
+    except Exception:
+        return False
 
-        return activated, debug_dirs
 
-    async def enforce_no_foreign_logins(self, session) -> Tuple[List[tuple[int, str]], List[str]]:
-        """
-        Автоматика "левые логины":
-        - берём состав семьи
-        - строим allowed так, чтобы НЕ пропускать "устаревших active"
-          (active считаем allowed только если он реально сейчас в семье)
-        - кикаем всех гостей НЕ в allowed
-        - strikes выдаём только если есть ровно один awaiting_join
-        - OWNER (settings.owner_tg_id) никогда не получает strikes/ban
-        - allowlist логинов из ENV никогда не кикаем
-        """
-        warnings: List[tuple[int, str]] = []
-        debug_dirs: List[str] = []
+async def _extract_invite_from_page(page: Page) -> Optional[str]:
+    try:
+        body = await page.locator("body").inner_text()
+        m = INVITE_RE.search(body or "")
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
 
-        owner_id = int(getattr(settings, "owner_tg_id", 0) or 0)
-        allowlist = _allowed_logins_from_env()
+    try:
+        html = await page.content()
+        m = INVITE_RE.search(html or "")
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
 
-        accounts = (
-            await session.scalars(
-                select(YandexAccount)
-                .where(YandexAccount.status == "active")
-                .order_by(YandexAccount.id.asc())
-            )
-        ).all()
+    return None
 
-        if not accounts:
-            return warnings, debug_dirs
 
-        now = utcnow()
+async def _click_invite_button_strict(page: Page, out_dir: Path) -> bool:
+    try:
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
 
-        for acc in accounts:
-            if not acc.credentials_ref:
+    patterns = [
+        re.compile(r"Пригласить близкого", re.I),
+        re.compile(r"Пригласить", re.I),
+        re.compile(r"Добавить.*сем(ь|ю)ю", re.I),
+    ]
+
+    candidates = []
+    for pat in patterns:
+        candidates.append(page.get_by_role("button", name=pat))
+        candidates.append(page.get_by_role("link", name=pat))
+
+    candidates.append(page.locator("text=Пригласить близкого"))
+    candidates.append(page.locator("text=Пригласить"))
+
+    for loc in candidates:
+        try:
+            if await loc.count() == 0:
                 continue
-
-            storage_path = self._account_state_path(acc)
-
+            el = loc.first
             try:
-                snap = await self.provider.probe(storage_state_path=storage_path)
-                if snap.raw_debug and snap.raw_debug.get("debug_dir"):
-                    debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
+                await el.scroll_into_view_if_needed(timeout=2_000)
+                await page.wait_for_timeout(150)
             except Exception:
-                continue
+                pass
 
-            fam = snap.family
-            if not fam:
-                continue
+            await el.click(timeout=3_000)
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await _save_debug(page, out_dir, "click_invite_OK")
+            return True
+        except Exception:
+            continue
 
-            fam_admins = {_norm_login(x) for x in (fam.admins or [])}
-            fam_guests = {_norm_login(x) for x in (fam.guests or [])}
+    await _save_debug(page, out_dir, "invite_button_NOT_FOUND")
+    return False
 
-            # Берём active-members из БД, но разрешаем ТОЛЬКО тех, кто реально в семье сейчас
-            active_members = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "active",
-                    )
-                )
-            ).all()
 
-            active_present = set()
-            for m in active_members:
-                login = _norm_login(m.yandex_login)
-                if login and (login in fam_guests or login in fam_admins):
-                    active_present.add(login)
+async def _click_confirm_remove(page: Page) -> bool:
+    patterns = [
+        re.compile(r"Исключить", re.I),
+        re.compile(r"Удалить", re.I),
+        re.compile(r"Подтвердить", re.I),
+    ]
+    for pat in patterns:
+        try:
+            btn = page.get_by_role("button", name=pat)
+            if await btn.count() > 0:
+                await btn.first.click(timeout=3_000)
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+                return True
+        except Exception:
+            continue
+    return False
 
-            allowed = set(fam_admins) | set(allowlist) | active_present
 
-            foreign = sorted([g for g in fam_guests if g and g not in allowed])
-            if not foreign:
-                continue
+class PlaywrightYandexProvider:
+    async def probe(self, *, storage_state_path: str) -> YandexProbeSnapshot:
+        root = _debug_root()
+        _prune_debug_root(root)
 
-            # виновник только если есть ровно один awaiting_join
-            awaiting = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "awaiting_join",
-                    )
-                )
-            ).all()
-            culprit = awaiting[0] if len(awaiting) == 1 else None
+        debug_dir = root / Path(storage_state_path).stem / f"probe_{_now_tag()}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-            kicked: list[str] = []
-            for guest_login in foreign:
-                if guest_login in allowlist:
-                    continue
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+
+            next_charge_text: Optional[str] = None
+            plus_end_at: Optional[datetime] = None
+            family_snap: Optional[YandexFamilySnapshot] = None
+
+            # PLUS
+            try:
+                await _goto(page, PLUS_URL, debug_dir, "plus")
+                body = await _read_body_text(page)
+                next_charge_text = extract_next_charge(body or "")
+                plus_end_at = parse_plus_end_at(next_charge_text, now=datetime.now(timezone.utc))
+            except Exception:
+                await _save_debug(page, debug_dir, "plus_error")
+
+            # FAMILY (устойчиво)
+            try:
+                body = await _goto_family_with_retry(page, debug_dir)
+                family_snap = parse_family_min(body or "")
+                # если парс не удался — ставим None, чтобы не показывать \"4 свободных\"
+                if family_snap is None:
+                    await _save_debug(page, debug_dir, "family_parse_failed")
+            except Exception:
+                await _save_debug(page, debug_dir, "family_error")
+                family_snap = None
+
+            await context.close()
+            await browser.close()
+
+        return YandexProbeSnapshot(
+            next_charge_text=next_charge_text,
+            plus_end_at=plus_end_at,
+            family=family_snap,
+            raw_debug={"debug_dir": str(debug_dir)},
+        )
+
+    async def cancel_pending_invite(self, *, storage_state_path: str, debug_dir_name: str = "cancel_pending") -> bool:
+        root = _debug_root()
+        _prune_debug_root(root)
+
+        debug_dir = root / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+
+            await _goto(page, FAMILY_URL, debug_dir, "family_open")
+
+            pending_loc = page.get_by_text("Ждём ответ", exact=False)
+            try:
+                await pending_loc.first.wait_for(state="visible", timeout=5_000)
+                await pending_loc.first.click()
+                await _save_debug(page, debug_dir, "pending_opened")
+            except Exception:
+                await _save_debug(page, debug_dir, "no_pending")
+                await context.close()
+                await browser.close()
+                return False
+
+            cancelled = await _click_by_text(page, "Отменить приглашение", debug_dir, "cancel_clicked")
+            await context.close()
+            await browser.close()
+            return bool(cancelled)
+
+    async def create_invite_link(
+        self,
+        *,
+        storage_state_path: str,
+        debug_dir_name: str = "invite",
+        strict: bool = True,
+    ) -> str:
+        root = _debug_root()
+        _prune_debug_root(root)
+
+        debug_dir = root / Path(storage_state_path).stem / f"{debug_dir_name}_{_now_tag()}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+
+            await _goto(page, FAMILY_URL, debug_dir, "family_open")
+
+            # если уже есть pending — отменяем
+            try:
+                pending = page.get_by_text("Ждём ответ", exact=False)
+                if await pending.count() > 0:
+                    await pending.first.click()
+                    await _save_debug(page, debug_dir, "pending_modal_opened")
+                    await _click_by_text(page, "Отменить приглашение", debug_dir, "pending_cancelled")
+                    await _goto(page, FAMILY_URL, debug_dir, "family_after_cancel")
+            except Exception:
+                pass
+
+            ok = await _click_invite_button_strict(page, debug_dir)
+            if not ok:
+                await context.close()
+                await browser.close()
+                if strict:
+                    raise RuntimeError(f"Invite button not found. Debug: {debug_dir}")
+                return ""
+
+            await _click_by_text(page, "Пропустить", debug_dir, "relation_skipped")
+
+            share_clicked = await _click_by_text(page, "Поделиться ссылкой", debug_dir, "share_clicked")
+            if not share_clicked:
+                await _save_debug(page, debug_dir, "share_button_not_found")
+                await context.close()
+                await browser.close()
+                if strict:
+                    raise RuntimeError(f"Share button not found. Debug: {debug_dir}")
+                return ""
+
+            invite_link: Optional[str] = None
+            for _ in range(10):
+                invite_link = await _extract_invite_from_page(page)
+                if invite_link:
+                    break
                 try:
-                    ok = await self.provider.remove_guest(
-                        storage_state_path=storage_path,
-                        guest_login=guest_login,
-                    )
-                    if ok:
-                        kicked.append(guest_login)
+                    await page.wait_for_timeout(800)
                 except Exception:
                     pass
 
-            if not kicked:
-                continue
+            await _save_debug(page, debug_dir, "invite_final")
 
-            # OWNER не наказываем
-            if culprit and int(culprit.tg_id) == owner_id:
-                warnings.append(
-                    (
-                        owner_id,
-                        "ℹ️ Обнаружены лишние логины в семье.\n\n"
-                        f"Удалены: {', '.join(kicked)}\n\n"
-                        "⚠️ Это только уведомление. Strikes владельцу НЕ выдаются.",
-                    )
-                )
-                continue
+            await context.close()
+            await browser.close()
 
-            if culprit:
-                culprit.abuse_strikes = int(culprit.abuse_strikes or 0) + 1
-                culprit.updated_at = now
+        if not invite_link:
+            if strict:
+                raise RuntimeError(f"Invite link not found (strict). Debug: {debug_dir}")
+            return ""
+        return invite_link
 
-                if culprit.abuse_strikes >= 2:
-                    culprit.reinvite_used = 1
-                    culprit.status = "invite_timeout"
-                    culprit.invite_link = None
-                    culprit.invite_issued_at = None
-                    culprit.invite_expires_at = None
+    async def remove_guest(self, *, storage_state_path: str, guest_login: str) -> bool:
+        guest_login = (guest_login or "").strip().lstrip("@").lower()
+        if not guest_login:
+            return False
 
-                msg = (
-                    "⚠️ Обнаружена попытка подключения по вашей ссылке другого аккаунта.\n\n"
-                    f"Удалены лишние логины: {', '.join(kicked)}\n\n"
-                    f"Strikes: {culprit.abuse_strikes}/2\n"
-                )
-                if culprit.abuse_strikes >= 2:
-                    msg += "\n🚫 Повторное приглашение заблокировано. Напишите в поддержку."
-                else:
-                    msg += "\nИспользуйте приглашение только для вашего логина."
+        root = _debug_root()
+        _prune_debug_root(root)
 
-                warnings.append((culprit.tg_id, msg))
+        debug_dir = root / Path(storage_state_path).stem / f"kick_{guest_login}_{_now_tag()}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-        return warnings, debug_dirs
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+
+            await _goto(page, FAMILY_URL, debug_dir, "family_open")
+
+            clicked_card = False
+            try:
+                loc = page.get_by_text(guest_login, exact=False)
+                if await loc.count() > 0:
+                    await loc.first.scroll_into_view_if_needed(timeout=5_000)
+                    await loc.first.click(timeout=5_000)
+                    await _save_debug(page, debug_dir, "guest_card_opened")
+                    clicked_card = True
+            except Exception:
+                clicked_card = False
+
+            if not clicked_card:
+                await _save_debug(page, debug_dir, "guest_card_not_found")
+                await context.close()
+                await browser.close()
+                return False
+
+            removed = await _click_by_text(page, "Исключить из семьи", debug_dir, "click_remove")
+            if not removed:
+                removed = await _click_by_text(page, "Исключить", debug_dir, "click_remove_2")
+
+            if not removed:
+                await _save_debug(page, debug_dir, "remove_button_not_found")
+                await context.close()
+                await browser.close()
+                return False
+
+            await _click_confirm_remove(page)
+            await _save_debug(page, debug_dir, "remove_confirmed")
+
+            await context.close()
+            await browser.close()
+
+        return True
 
 
-yandex_service = YandexService()
+def build_provider() -> YandexProvider:
+    provider_name = (getattr(settings, "yandex_provider", None) or "playwright").lower()
+    if provider_name == "playwright":
+        return PlaywrightYandexProvider()
+    return PlaywrightYandexProvider()
