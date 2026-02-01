@@ -33,7 +33,7 @@ async def _select_account_for_invite(session) -> YandexAccount:
     """Pick an account that:
     - active
     - has credentials
-    - Plus end_at >= now + min_days
+    - Plus end_at >= now + min_days (AFTER live probe refresh)
     - has free slots (based on live probe)
 
     We probe accounts only at invite time (not continuously).
@@ -49,29 +49,61 @@ async def _select_account_for_invite(session) -> YandexAccount:
     if not accounts:
         raise RuntimeError("No active YandexAccount")
 
-    # First, filter by Plus lifetime and cookies.
-    candidates = [a for a in accounts if a.credentials_ref and _plus_ok_for_invite(a)]
-    if not candidates:
-        raise RuntimeError("No YandexAccount with enough Plus lifetime")
-
-    # Probe candidates until we find a free slot.
     provider = build_provider()
 
-    for acc in candidates:
+    # 1) Only accounts with cookies
+    cookie_accounts = [a for a in accounts if a.credentials_ref]
+    if not cookie_accounts:
+        raise RuntimeError("No active YandexAccount with cookies")
+
+    probed: list[tuple[YandexAccount, object]] = []
+
+    # 2) PROBE first to refresh plus_end_at + used_slots + free slots
+    for acc in cookie_accounts:
         storage_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
-        snap = await provider.probe(storage_state_path=storage_path)
-        fam = snap.family
+
+        try:
+            snap = await provider.probe(storage_state_path=storage_path)
+        except Exception:
+            continue
+
+        fam = getattr(snap, "family", None)
         if not fam:
             continue
 
-        # Keep DB counters best-effort.
+        # Update DB counters best-effort.
         try:
-            acc.used_slots = int(fam.used_slots)
+            acc.used_slots = int(getattr(fam, "used_slots", acc.used_slots or 0) or 0)
         except Exception:
             pass
 
-        if int(getattr(fam, "free_slots", 0) or 0) > 0:
+        # Refresh Plus lifetime from probe result (IMPORTANT)
+        dt = (
+            getattr(snap, "plus_end_at", None)
+            or getattr(snap, "next_charge_at", None)
+            or getattr(snap, "next_charge_date", None)
+        )
+        if dt:
+            acc.plus_end_at = dt
+
+        probed.append((acc, fam))
+
+    if not probed:
+        raise RuntimeError("No eligible Yandex accounts (probe failed or family not found)")
+
+    # 3) Now apply lifetime check + find free slot
+    lifetime_ok_found = False
+    for acc, fam in probed:
+        if not _plus_ok_for_invite(acc):
+            continue
+        lifetime_ok_found = True
+
+        free_slots = int(getattr(fam, "free_slots", 0) or 0)
+        if free_slots > 0:
             return acc
+
+    if not lifetime_ok_found:
+        raise RuntimeError("No YandexAccount with enough Plus lifetime")
 
     raise RuntimeError("No free slots on eligible Yandex accounts")
 
@@ -445,7 +477,6 @@ class YandexService:
                 if not login:
                     continue
                 if login not in fam_guests and login not in fam_admins:
-                    # его реально нет в семье сейчас -> считаем удалённым
                     m.status = "removed"
                     m.updated_at = now
 
