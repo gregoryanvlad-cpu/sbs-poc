@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -17,6 +17,63 @@ FAMILY_URL = "https://id.yandex.ru/family"
 _MONTHS_RU = (
     "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
 )
+
+
+_MONTH_NUM_RU = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+
+
+def parse_plus_end_at(next_charge_text: str | None, *, now: datetime | None = None) -> Optional[datetime]:
+    """Parse 'Спишется 9 февраля' into a timezone-aware datetime (UTC).
+
+    Yandex UI typically shows the *charge date* (billing day). We treat Plus as active
+    through the end of that calendar day, so returned datetime is 23:59:59 UTC.
+
+    If year is not present in the text, we infer it: current year, or next year if the
+    date has already passed.
+    """
+    if not next_charge_text:
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    text = " ".join(str(next_charge_text).strip().split())
+
+    m = re.search(r"Спишется\s+(\d{1,2})\s+([А-Яа-я]+)(?:\s+(\d{4}))?", text, re.IGNORECASE)
+    if not m:
+        return None
+
+    day = int(m.group(1))
+    month_name = m.group(2).lower()
+    year_str = m.group(3)
+
+    month = _MONTH_NUM_RU.get(month_name)
+    if not month:
+        return None
+
+    if year_str:
+        year = int(year_str)
+    else:
+        year = now.year
+        candidate = datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+        if candidate < now:
+            year += 1
+
+    try:
+        return datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 INVITE_RE = re.compile(r"https://id\.yandex\.ru/family/invite\?invite-id=[a-f0-9-]{8,}", re.I)
 LOGIN_LOWER_RE = re.compile(r"\b([a-z0-9][a-z0-9._-]{1,63})\b")
@@ -130,6 +187,7 @@ class YandexFamilySnapshot:
 @dataclass
 class YandexProbeSnapshot:
     next_charge_text: Optional[str]
+    plus_end_at: Optional[datetime]
     family: Optional[YandexFamilySnapshot]
     raw_debug: dict[str, Any]
 
@@ -438,6 +496,7 @@ class PlaywrightYandexProvider:
             page = await context.new_page()
 
             next_charge_text: Optional[str] = None
+            plus_end_at: Optional[datetime] = None
             family_snap: Optional[YandexFamilySnapshot] = None
 
             # PLUS
@@ -445,6 +504,7 @@ class PlaywrightYandexProvider:
                 await _goto(page, PLUS_URL, debug_dir, "plus")
                 body = await _read_body_text(page)
                 next_charge_text = extract_next_charge(body or "")
+                plus_end_at = parse_plus_end_at(next_charge_text, now=datetime.now(timezone.utc))
             except Exception:
                 await _save_debug(page, debug_dir, "plus_error")
 
@@ -464,6 +524,7 @@ class PlaywrightYandexProvider:
 
         return YandexProbeSnapshot(
             next_charge_text=next_charge_text,
+            plus_end_at=plus_end_at,
             family=family_snap,
             raw_debug={"debug_dir": str(debug_dir)},
         )
