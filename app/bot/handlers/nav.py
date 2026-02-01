@@ -166,6 +166,12 @@ async def on_nav(cb: CallbackQuery) -> None:
             buttons = []
             if ym.status in ("awaiting_join", "pending") and ym.invite_link:
                 buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
+            # Show reinvite option if invite timed out and user still has remaining reinvites.
+            if (
+                ym.status == "invite_timeout"
+                and int(getattr(ym, "reinvite_used", 0) or 0) < int(getattr(settings, "yandex_reinvite_max", 1) or 1)
+            ):
+                buttons.append([InlineKeyboardButton(text="🔁 Реинвайт", callback_data="yandex:reinvite")])
             buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
 
             kb = InlineKeyboardMarkup(inline_keyboard=buttons)
