@@ -57,9 +57,36 @@ def ensure_yandex_membership_notification_columns() -> None:
             )
 
 
+def ensure_job_state_table() -> None:
+    """Ensure small key/value table used by scheduler to de-duplicate daily jobs.
+
+    The scheduler reads/writes this table best-effort. Without it, the bot still works,
+    but the daily admin report can be sent more than once.
+    """
+    url = _get_sync_db_url()
+    if not url:
+        return
+
+    engine = create_engine(url, future=True)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS job_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+        )
+
+
 def main() -> None:
     try:
         ensure_yandex_membership_notification_columns()
+        ensure_job_state_table()
     except Exception:
         return
 
