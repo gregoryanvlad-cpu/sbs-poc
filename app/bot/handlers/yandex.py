@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -9,8 +10,8 @@ from sqlalchemy import select
 
 from app.db.session import session_scope
 from app.db.models.user import User
+from app.bot.keyboards import kb_main
 from app.db.models.yandex_membership import YandexMembership
-from app.core.config import settings
 from app.services.yandex.service import yandex_service
 
 router = Router()
@@ -29,45 +30,7 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
     )
 
 
-@router.callback_query(F.data == "yandex:reinvite")
-async def on_yandex_reinvite(cb: CallbackQuery) -> None:
-    tg_id = cb.from_user.id
-    await cb.answer()
-
-    async with session_scope() as session:
-        ym = await session.scalar(
-            select(YandexMembership)
-            .where(YandexMembership.tg_id == tg_id)
-            .order_by(YandexMembership.id.desc())
-            .limit(1)
-        )
-        if not ym or ym.status != "invite_timeout":
-            return
-
-        used = int(getattr(ym, "reinvite_used", 0) or 0)
-        max_re = int(getattr(settings, "yandex_reinvite_max", 1) or 1)
-        if used >= max_re:
-            return
-
-        try:
-            ym = await yandex_service.issue_or_reissue_invite(
-                session=session,
-                membership=ym,
-                count_as_reinvite=True,
-            )
-            await session.commit()
-        except Exception:
-            return
-
-    if ym.invite_link:
-        await cb.message.answer(
-            "✅ Новое приглашение готово!\n\n"
-            f"Логин: <code>{ym.yandex_login}</code>\n"
-            "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
-            "Нажми кнопку ниже и прими приглашение в семейную подписку.",
-            reply_markup=_kb_open_invite(ym.invite_link),
-            parse_mode="HTML",
-        )
+# Реинвайт/TTL больше не используется: ссылки загружаются вручную и выдаются один раз.
 
 
 async def _cleanup_hint_messages(bot, chat_id: int, user: User) -> None:
@@ -117,7 +80,7 @@ async def on_yandex_login_input(message: Message) -> None:
             )
             return
 
-        await message.answer("⏳ Создаю приглашение в семейную подписку…")
+        await message.answer("⏳ Выдаю ссылку приглашения…")
 
         try:
             membership = await yandex_service.ensure_membership_for_user(
@@ -142,14 +105,29 @@ async def on_yandex_login_input(message: Message) -> None:
 
     # отправляем ссылку
     if membership.invite_link:
-        await message.answer(
-            "✅ Логин принят.\n\n"
-            f"Логин: <code>{membership.yandex_login}</code>\n"
-            "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
-            "Нажми кнопку ниже и прими приглашение:",
+        sent = await message.answer(
+            "✅ Ссылка приглашения готова.\n\n"
+            f"Логин: <code>{membership.yandex_login}</code>\n\n"
+            "Нажми кнопку ниже и прими приглашение.\n"
+            "Если не успел — ссылка всегда доступна в 🟡 Yandex Plus.",
             reply_markup=_kb_open_invite(membership.invite_link),
             parse_mode="HTML",
         )
+
+        # Через минуту возвращаем карточку к главному меню, но ссылка останется в разделе Yandex Plus.
+        async def _auto_back() -> None:
+            try:
+                await asyncio.sleep(60)
+                await message.bot.edit_message_text(
+                    chat_id=sent.chat.id,
+                    message_id=sent.message_id,
+                    text="Главное меню:",
+                    reply_markup=kb_main(),
+                )
+            except Exception:
+                pass
+
+        asyncio.create_task(_auto_back())
     else:
         await message.answer(
             "✅ Логин сохранён, но ссылка приглашения не найдена.\n"
