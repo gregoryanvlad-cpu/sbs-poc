@@ -1,127 +1,92 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import List, Tuple
 
-from sqlalchemy import select
+from dateutil.relativedelta import relativedelta
+from sqlalchemy import and_, select
 
-from app.core.config import settings
 from app.db.models.subscription import Subscription
 from app.db.models.yandex_account import YandexAccount
+from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.repo import utcnow
-from app.services.yandex.provider import build_provider
-
-INVITE_TTL_MINUTES = 15
 
 
-def _plus_ok_for_invite(acc: YandexAccount) -> bool:
-    """Account can be used for inviting only if Plus remains active long enough."""
+@dataclass
+class ManualInviteIssueResult:
+    membership: YandexMembership
+    invite_link: str
+
+
+def _ensure_tz(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _plus_has_one_month_left(acc: YandexAccount, *, now: datetime) -> bool:
+    """Manual rule: allow issuing to this account only if it will live >= 1 calendar month.
+
+    plus_end_at is entered manually in admin.
+    """
     if not acc.plus_end_at:
         return False
-
-    min_days = int(getattr(settings, "yandex_invite_min_remaining_days", 30))
-
-    # If min_days <= 0, treat as disabled check (allow any account with plus_end_at)
-    if min_days <= 0:
-        return True
-
-    return acc.plus_end_at >= (datetime.now(timezone.utc) + timedelta(days=min_days))
+    end_at = _ensure_tz(acc.plus_end_at)
+    return end_at >= (now + relativedelta(months=1))
 
 
-async def _select_account_for_invite(session) -> YandexAccount:
+async def _pick_slot_for_issue(session, *, now: datetime) -> Tuple[YandexAccount, YandexInviteSlot]:
+    """Pick an eligible account + first free slot.
+
+    Strategy S1:
+    - slot/link is used at most once
+    - we never re-use freed slots
     """
-    Pick an account that:
-    - active
-    - has credentials
-    - Plus end_at >= now + min_days (AFTER live probe refresh)
-    - has free slots (based on live probe)
-
-    We probe accounts ONLY at invite time (not continuously).
-    """
+    # eligible accounts: active, with enough lifetime
     accounts = (
         await session.scalars(
-            select(YandexAccount)
-            .where(YandexAccount.status == "active")
-            .order_by(YandexAccount.used_slots.asc(), YandexAccount.id.asc())
+            select(YandexAccount).where(YandexAccount.status == "active").order_by(YandexAccount.id.asc())
         )
     ).all()
-
     if not accounts:
         raise RuntimeError("No active YandexAccount")
 
-    # only those with cookies
-    accounts = [a for a in accounts if a.credentials_ref]
-    if not accounts:
-        raise RuntimeError("No active YandexAccount with cookies")
-
-    provider = build_provider()
-
-    # 1) First: probe every account once to refresh plus_end_at + slots
-    probed: list[tuple[YandexAccount, int]] = []
-    for acc in accounts:
-        storage_path = f"{settings.yandex_cookies_dir}/{acc.credentials_ref}"
-
-        try:
-            snap = await provider.probe(storage_state_path=storage_path)
-        except Exception:
-            continue
-
-        fam = getattr(snap, "family", None)
-        if not fam:
-            continue
-
-        # refresh plus_end_at from probe
-        dt = getattr(snap, "plus_end_at", None)
-        if dt:
-            acc.plus_end_at = dt
-
-        # refresh used_slots from probe
-        try:
-            acc.used_slots = int(getattr(fam, "used_slots", acc.used_slots or 0) or 0)
-        except Exception:
-            pass
-
-        free_slots = int(getattr(fam, "free_slots", 0) or 0)
-        probed.append((acc, free_slots))
-
-    if not probed:
-        raise RuntimeError("No eligible Yandex accounts (probe failed or family not found)")
-
-    # 2) Second: apply lifetime filter and pick first with free slot
-    lifetime_ok_found = False
-    for acc, free_slots in probed:
-        if not _plus_ok_for_invite(acc):
-            continue
-        lifetime_ok_found = True
-        if free_slots > 0:
-            return acc
-
-    if not lifetime_ok_found:
+    eligible_ids = [a.id for a in accounts if _plus_has_one_month_left(a, now=now)]
+    if not eligible_ids:
         raise RuntimeError("No YandexAccount with enough Plus lifetime")
 
-    raise RuntimeError("No free slots on eligible Yandex accounts")
+    # pick first free slot in the earliest eligible account (stable ordering)
+    q = (
+        select(YandexInviteSlot)
+        .where(
+            and_(
+                YandexInviteSlot.yandex_account_id.in_(eligible_ids),
+                YandexInviteSlot.status == "free",
+            )
+        )
+        .order_by(YandexInviteSlot.yandex_account_id.asc(), YandexInviteSlot.slot_index.asc(), YandexInviteSlot.id.asc())
+        .limit(1)
+    )
+    slot = await session.scalar(q)
+    if not slot:
+        raise RuntimeError("No free invite slots")
 
-
-def _norm_login(x: str | None) -> str:
-    return (x or "").strip().lstrip("@").lower()
-
-
-def _allowed_logins_from_env() -> set[str]:
-    raw = getattr(settings, "yandex_allowed_logins", None)
-    if not raw:
-        return set()
-    if isinstance(raw, str):
-        return {x.strip().lstrip("@").lower() for x in raw.split(",") if x.strip()}
-    return set()
+    acc = await session.get(YandexAccount, slot.yandex_account_id)
+    if not acc:
+        raise RuntimeError("YandexAccount not found for slot")
+    return acc, slot
 
 
 class YandexService:
-    def __init__(self) -> None:
-        self.provider = build_provider()
+    """Manual Yandex invites (no Playwright).
 
-    def _account_state_path(self, account: YandexAccount) -> str:
-        return f"{settings.yandex_cookies_dir}/{account.credentials_ref}"
+    Public contract is intentionally compatible with existing handlers:
+    - ensure_membership_for_user(...)
+
+    Everything else (Playwright, TTL, family scans) is no longer used.
+    """
 
     async def ensure_membership_for_user(
         self,
@@ -130,457 +95,91 @@ class YandexService:
         tg_id: int,
         yandex_login: str,
     ) -> YandexMembership:
+        """Return existing membership with invite_link, or issue a new one from the pool."""
+        now = utcnow()
+
+        # latest membership for user
         existing = await session.scalar(
-            select(YandexMembership).where(
-                YandexMembership.tg_id == tg_id,
-                YandexMembership.status.in_(["awaiting_join", "active"]),
-            )
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
         )
-        if existing:
+        if existing and existing.invite_link:
             return existing
 
-        account = await _select_account_for_invite(session)
+        # subscription must be active
+        sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
+        if not sub or not sub.end_at or _ensure_tz(sub.end_at) <= now:
+            raise RuntimeError("Subscription is not active")
 
-        invite_link: str | None = None
-        try:
-            invite_link = await self.provider.create_invite_link(
-                storage_state_path=self._account_state_path(account)
-            )
-        except Exception:
-            invite_link = None
+        acc, slot = await _pick_slot_for_issue(session, now=now)
 
-        now = utcnow()
+        # mark slot as issued (and thus burned)
+        slot.status = "issued"
+        slot.issued_to_tg_id = tg_id
+        slot.issued_at = now
+
         membership = YandexMembership(
             tg_id=tg_id,
-            yandex_account_id=account.id,
-            yandex_login=_norm_login(yandex_login),
-            invite_link=invite_link,
-            invite_issued_at=now if invite_link else None,
-            invite_expires_at=(now + timedelta(minutes=INVITE_TTL_MINUTES)) if invite_link else None,
-            status="awaiting_join" if invite_link else "pending",
-            reinvite_used=0,
-            abuse_strikes=0,
+            yandex_account_id=acc.id,
+            invite_slot_id=slot.id,
+            account_label=acc.label,
+            slot_index=int(slot.slot_index),
+            yandex_login=(yandex_login or "").strip().lstrip("@").lower(),
+            status="issued",
+            invite_link=slot.invite_link,
+            invite_issued_at=now,
+            coverage_end_at=_ensure_tz(sub.end_at),  # freeze coverage for this issued slot
         )
-
         session.add(membership)
         await session.flush()
         return membership
 
-    async def issue_or_reissue_invite(
-        self,
-        *,
-        session,
-        membership: YandexMembership,
-        count_as_reinvite: bool,
-    ) -> YandexMembership:
+    async def rotate_due_memberships(self, session) -> List[Tuple[int, str]]:
+        """Issue a new invite for users whose frozen coverage ended but subscription is still active.
+
+        Returns list of (tg_id, invite_link) to notify.
+        """
         now = utcnow()
-
-        async def _try_reuse_previous_account() -> YandexAccount | None:
-            if not membership.yandex_account_id:
-                return None
-            prev = await session.get(YandexAccount, membership.yandex_account_id)
-            if not prev or not prev.credentials_ref:
-                return None
-
-            if prev.status != "active":
-                return None
-
-            # IMPORTANT: refresh prev.plus_end_at from probe before checking
-            storage_path = self._account_state_path(prev)
-            try:
-                snap = await self.provider.probe(storage_state_path=storage_path)
-                dt = getattr(snap, "plus_end_at", None)
-                if dt:
-                    prev.plus_end_at = dt
-            except Exception:
-                return None
-
-            if not _plus_ok_for_invite(prev):
-                return None
-
-            # Cancel pending invite first (best-effort) to free the waiting slot.
-            if membership.status in ("awaiting_join", "pending"):
-                try:
-                    await self.provider.cancel_pending_invite(storage_state_path=storage_path)
-                except Exception:
-                    pass
-
-            # Re-probe to confirm we still have a free slot (and update counters best-effort).
-            try:
-                snap2 = await self.provider.probe(storage_state_path=storage_path)
-                fam2 = snap2.family
-                if fam2:
-                    try:
-                        prev.used_slots = int(fam2.used_slots)
-                    except Exception:
-                        pass
-                    if int(getattr(fam2, "free_slots", 0) or 0) > 0:
-                        return prev
-            except Exception:
-                return None
-
-            return None
-
-        acc = await _try_reuse_previous_account()
-        if not acc:
-            acc = await _select_account_for_invite(session)
-
-        invite_link = await self.provider.create_invite_link(
-            storage_state_path=self._account_state_path(acc)
+        q = (
+            select(YandexMembership, Subscription)
+            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
+            .where(
+                YandexMembership.coverage_end_at.is_not(None),
+                YandexMembership.coverage_end_at <= now,
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .order_by(YandexMembership.id.asc())
+            .limit(50)
         )
+        rows = (await session.execute(q)).all()
+        if not rows:
+            return []
 
-        membership.yandex_account_id = acc.id
-        membership.invite_link = invite_link
-        membership.invite_issued_at = now
-        membership.invite_expires_at = now + timedelta(minutes=INVITE_TTL_MINUTES)
-        membership.status = "awaiting_join"
+        notifications: List[Tuple[int, str]] = []
+        for membership, sub in rows:
+            # issue new slot, keep yandex_login as-is
+            acc, slot = await _pick_slot_for_issue(session, now=now)
+            slot.status = "issued"
+            slot.issued_to_tg_id = membership.tg_id
+            slot.issued_at = now
 
-        if count_as_reinvite:
-            membership.reinvite_used = int(membership.reinvite_used or 0) + 1
+            membership.yandex_account_id = acc.id
+            membership.invite_slot_id = slot.id
+            membership.account_label = acc.label
+            membership.slot_index = int(slot.slot_index)
+            membership.invite_link = slot.invite_link
+            membership.invite_issued_at = now
+            membership.coverage_end_at = _ensure_tz(sub.end_at)  # re-freeze to the new paid end
+            membership.status = "issued"
+            membership.updated_at = now
 
-        membership.updated_at = now
+            notifications.append((membership.tg_id, slot.invite_link))
+
         await session.flush()
-        return membership
-
-    async def remove_user_from_family_if_needed(self, *, session, tg_id: int) -> bool:
-        m = await session.scalar(
-            select(YandexMembership)
-            .where(
-                YandexMembership.tg_id == tg_id,
-                YandexMembership.status == "active",
-                YandexMembership.yandex_account_id.is_not(None),
-            )
-            .order_by(YandexMembership.id.desc())
-            .limit(1)
-        )
-        if not m or not m.yandex_account_id:
-            return False
-
-        acc = await session.get(YandexAccount, m.yandex_account_id)
-        if not acc or not acc.credentials_ref:
-            m.status = "removed"
-            m.updated_at = utcnow()
-            return True
-
-        try:
-            await self.provider.remove_guest(
-                storage_state_path=self._account_state_path(acc),
-                guest_login=_norm_login(m.yandex_login),
-            )
-        except Exception:
-            return True
-
-        m.status = "removed"
-        m.updated_at = utcnow()
-        return True
-
-    async def issue_missing_invites(self, session) -> List[YandexMembership]:
-        now = utcnow()
-        q = (
-            select(YandexMembership)
-            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
-            .where(
-                YandexMembership.status == "pending",
-                YandexMembership.invite_link.is_(None),
-                YandexMembership.yandex_login.is_not(None),
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
-            )
-            .order_by(YandexMembership.id.asc())
-            .limit(50)
-        )
-        items = (await session.scalars(q)).all()
-        issued: List[YandexMembership] = []
-        for m in items:
-            try:
-                await self.issue_or_reissue_invite(
-                    session=session,
-                    membership=m,
-                    count_as_reinvite=False,
-                )
-                issued.append(m)
-            except Exception:
-                continue
-        return issued
-
-    async def issue_invites_for_reactivated_users(self, session) -> List[YandexMembership]:
-        now = utcnow()
-        q = (
-            select(YandexMembership)
-            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
-            .where(
-                YandexMembership.status == "removed",
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
-            )
-            .order_by(YandexMembership.id.asc())
-            .limit(50)
-        )
-        items = (await session.scalars(q)).all()
-        issued: List[YandexMembership] = []
-        for m in items:
-            try:
-                await self.issue_or_reissue_invite(
-                    session=session,
-                    membership=m,
-                    count_as_reinvite=False,
-                )
-                issued.append(m)
-            except Exception:
-                continue
-        return issued
-
-    async def expire_pending_invites(self, session) -> List[int]:
-        now = utcnow()
-        affected: List[int] = []
-
-        memberships = (
-            await session.scalars(
-                select(YandexMembership).where(
-                    YandexMembership.status == "awaiting_join",
-                    YandexMembership.invite_expires_at.is_not(None),
-                    YandexMembership.invite_expires_at <= now,
-                )
-            )
-        ).all()
-
-        if not memberships:
-            return affected
-
-        for m in memberships:
-            account = await session.get(YandexAccount, m.yandex_account_id) if m.yandex_account_id else None
-            if account and account.credentials_ref:
-                try:
-                    await self.provider.cancel_pending_invite(
-                        storage_state_path=self._account_state_path(account)
-                    )
-                except Exception:
-                    pass
-
-            m.status = "invite_timeout"
-            m.invite_link = None
-            m.invite_issued_at = None
-            m.invite_expires_at = None
-            m.updated_at = now
-
-            affected.append(m.tg_id)
-
-        return affected
-
-    async def sync_family_and_activate(self, session) -> Tuple[List[int], List[str]]:
-        activated: List[int] = []
-        debug_dirs: List[str] = []
-
-        accounts = (
-            await session.scalars(
-                select(YandexAccount)
-                .where(YandexAccount.status == "active")
-                .order_by(YandexAccount.id.asc())
-            )
-        ).all()
-
-        if not accounts:
-            return activated, debug_dirs
-
-        now = utcnow()
-
-        for acc in accounts:
-            if not acc.credentials_ref:
-                continue
-
-            storage_path = self._account_state_path(acc)
-
-            try:
-                snap = await self.provider.probe(storage_state_path=storage_path)
-                if snap.raw_debug and snap.raw_debug.get("debug_dir"):
-                    debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
-            except Exception:
-                continue
-
-            fam = snap.family
-            if not fam:
-                continue
-
-            # refresh plus_end_at best-effort here too
-            try:
-                dt = getattr(snap, "plus_end_at", None)
-                if dt:
-                    acc.plus_end_at = dt
-            except Exception:
-                pass
-
-            try:
-                acc.used_slots = int(fam.used_slots)
-            except Exception:
-                pass
-
-            fam_admins = {_norm_login(x) for x in (fam.admins or [])}
-            fam_guests = {_norm_login(x) for x in (fam.guests or [])}
-
-            pending_memberships = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "awaiting_join",
-                    )
-                )
-            ).all()
-
-            for m in pending_memberships:
-                login = _norm_login(m.yandex_login)
-                if not login:
-                    continue
-
-                if login in fam_guests or login in fam_admins:
-                    m.status = "active"
-                    m.invite_link = None
-                    m.invite_issued_at = None
-                    m.invite_expires_at = None
-                    m.updated_at = now
-                    activated.append(m.tg_id)
-
-            active_memberships = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "active",
-                    )
-                )
-            ).all()
-
-            for m in active_memberships:
-                login = _norm_login(m.yandex_login)
-                if not login:
-                    continue
-                if login not in fam_guests and login not in fam_admins:
-                    m.status = "removed"
-                    m.updated_at = now
-
-        return activated, debug_dirs
-
-    async def enforce_no_foreign_logins(self, session) -> Tuple[List[tuple[int, str]], List[str]]:
-        warnings: List[tuple[int, str]] = []
-        debug_dirs: List[str] = []
-
-        owner_id = int(getattr(settings, "owner_tg_id", 0) or 0)
-        allowlist = _allowed_logins_from_env()
-
-        accounts = (
-            await session.scalars(
-                select(YandexAccount)
-                .where(YandexAccount.status == "active")
-                .order_by(YandexAccount.id.asc())
-            )
-        ).all()
-
-        if not accounts:
-            return warnings, debug_dirs
-
-        now = utcnow()
-
-        for acc in accounts:
-            if not acc.credentials_ref:
-                continue
-
-            storage_path = self._account_state_path(acc)
-
-            try:
-                snap = await self.provider.probe(storage_state_path=storage_path)
-                if snap.raw_debug and snap.raw_debug.get("debug_dir"):
-                    debug_dirs.append(str(snap.raw_debug.get("debug_dir")))
-            except Exception:
-                continue
-
-            fam = snap.family
-            if not fam:
-                continue
-
-            fam_admins = {_norm_login(x) for x in (fam.admins or [])}
-            fam_guests = {_norm_login(x) for x in (fam.guests or [])}
-
-            active_members = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "active",
-                    )
-                )
-            ).all()
-
-            active_present = set()
-            for m in active_members:
-                login = _norm_login(m.yandex_login)
-                if login and (login in fam_guests or login in fam_admins):
-                    active_present.add(login)
-
-            allowed = set(fam_admins) | set(allowlist) | active_present
-
-            foreign = sorted([g for g in fam_guests if g and g not in allowed])
-            if not foreign:
-                continue
-
-            awaiting = (
-                await session.scalars(
-                    select(YandexMembership).where(
-                        YandexMembership.yandex_account_id == acc.id,
-                        YandexMembership.status == "awaiting_join",
-                    )
-                )
-            ).all()
-            culprit = awaiting[0] if len(awaiting) == 1 else None
-
-            kicked: list[str] = []
-            for guest_login in foreign:
-                if guest_login in allowlist:
-                    continue
-                try:
-                    ok = await self.provider.remove_guest(
-                        storage_state_path=storage_path,
-                        guest_login=guest_login,
-                    )
-                    if ok:
-                        kicked.append(guest_login)
-                except Exception:
-                    pass
-
-            if not kicked:
-                continue
-
-            if culprit and int(culprit.tg_id) == owner_id:
-                warnings.append(
-                    (
-                        owner_id,
-                        "ℹ️ Обнаружены лишние логины в семье.\n\n"
-                        f"Удалены: {', '.join(kicked)}\n\n"
-                        "⚠️ Это только уведомление. Strikes владельцу НЕ выдаются.",
-                    )
-                )
-                continue
-
-            if culprit:
-                culprit.abuse_strikes = int(culprit.abuse_strikes or 0) + 1
-                culprit.updated_at = now
-
-                if culprit.abuse_strikes >= 2:
-                    culprit.reinvite_used = 1
-                    culprit.status = "invite_timeout"
-                    culprit.invite_link = None
-                    culprit.invite_issued_at = None
-                    culprit.invite_expires_at = None
-
-                msg = (
-                    "⚠️ Обнаружена попытка подключения по вашей ссылке другого аккаунта.\n\n"
-                    f"Удалены лишние логины: {', '.join(kicked)}\n\n"
-                    f"Strikes: {culprit.abuse_strikes}/2\n"
-                )
-                if culprit.abuse_strikes >= 2:
-                    msg += "\n🚫 Повторное приглашение заблокировано. Напишите в поддержку."
-                else:
-                    msg += "\nИспользуйте приглашение только для вашего логина."
-
-                warnings.append((culprit.tg_id, msg))
-
-        return warnings, debug_dirs
+        return notifications
 
 
 yandex_service = YandexService()
