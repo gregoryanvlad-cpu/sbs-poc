@@ -61,14 +61,16 @@ def kb_confirm_reset() -> InlineKeyboardMarkup:
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+
+    # Новый ручной поток:
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
-    b.button(text="🔗 Загрузить 3 ссылки", callback_data="admin:yandex:slots:add")
     b.button(text="📋 Список аккаунтов/слотов", callback_data="admin:yandex:list")
 
-    # (старые кнопки оставляем, чтобы не ломать привычный интерфейс)
+    # Легаси/тест кнопки можно оставить, но strikes уже не нужны
     b.button(text="🧽 Снять страйки Yandex", callback_data="admin:forgive:user")
-
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
+
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
+
