@@ -7,20 +7,23 @@ from typing import Optional
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
+from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
+from app.worker import build_kick_report_text
+from app.repo import utcnow as repo_utcnow
 
 router = Router()
 
-# ==========================
-# RU date parsing: "9 февраля 2026"
-# ==========================
+# =========================================================
+# RU DATE PARSING: "9 февраля 2026"
+# =========================================================
 
 _MONTH_NUM_RU = {
     "января": 1,
@@ -40,21 +43,18 @@ _RU_DATE_RE = re.compile(r"^\s*(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*$", re.IGNOR
 
 
 def _parse_ru_date_to_utc_end_of_day(s: str) -> Optional[datetime]:
-    """
-    Parse "9 февраля 2026" -> 2026-02-09 23:59:59 UTC
-    """
     s = (s or "").strip().lower().replace("ё", "е")
     m = _RU_DATE_RE.match(s)
     if not m:
         return None
-    day = int(m.group(1))
-    month_name = m.group(2).lower()
-    year = int(m.group(3))
-    month = _MONTH_NUM_RU.get(month_name)
-    if not month:
-        return None
     try:
-        return datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+        return datetime(
+            int(m.group(3)),
+            _MONTH_NUM_RU[m.group(2)],
+            int(m.group(1)),
+            23, 59, 59,
+            tzinfo=timezone.utc,
+        )
     except Exception:
         return None
 
@@ -69,419 +69,223 @@ def _normalize_label(label: str) -> str:
 def _fmt_plus_end_at(dt: datetime | None) -> str:
     if not dt:
         return "—"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
     return dt.date().isoformat()
 
 
-# ==========================
+# =========================================================
 # FSM
-# ==========================
+# =========================================================
 
 class AdminYandexFSM(StatesGroup):
-    waiting_label = State()        # add: label
-    waiting_plus_end = State()     # add: plus_end_at
-    waiting_links = State()        # add: 3 links
+    waiting_label = State()
+    waiting_plus_end = State()
+    waiting_links = State()
 
-    edit_waiting_label = State()   # edit: which account label
-    edit_waiting_plus_end = State()  # edit: new date or skip
-    edit_waiting_links = State()   # edit: new links (optional)
+    edit_waiting_label = State()
+    edit_waiting_plus_end = State()
+    edit_waiting_links = State()
 
 
-# ==========================
+class AdminKickFSM(StatesGroup):
+    waiting_tg_id = State()
+
+
+# =========================================================
 # ADMIN MENU
-# ==========================
+# =========================================================
 
 @router.callback_query(lambda c: c.data == "admin:menu")
 async def admin_menu(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
-        await cb.answer()
         return
 
     await cb.message.edit_text(
         "🛠 <b>Админка</b>\n\n"
         "🟡 <b>Yandex Plus (ручной режим)</b>\n"
-        "— добавляешь аккаунт и дату окончания Plus\n"
-        "— загружаешь 3 готовые ссылки-приглашения (слоты 1..3)\n"
-        "— бот выдаёт ссылки пользователям автоматически\n\n"
-        "⚠️ Исключение пользователей из семьи делается вручную.\n",
+        "— добавляешь аккаунт + дату окончания Plus\n"
+        "— загружаешь 3 инвайт-ссылки\n"
+        "— бот выдаёт их автоматически\n\n"
+        "⚠️ Исключение из семей — вручную.",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
-    await cb.answer()
 
 
 # =========================================================
-# ADD ACCOUNT (step-by-step): label -> plus_end_at -> 3 links
+# ADD ACCOUNT
 # =========================================================
 
 @router.callback_query(lambda c: c.data == "admin:yandex:add")
-async def admin_yandex_add(cb: CallbackQuery, state: FSMContext) -> None:
+async def add_account(cb: CallbackQuery, state: FSMContext):
     if not is_owner(cb.from_user.id):
-        await cb.answer()
         return
 
     await state.clear()
     await state.set_state(AdminYandexFSM.waiting_label)
 
     await cb.message.edit_text(
-        "➕ <b>Добавление Yandex-аккаунта</b>\n\n"
-        "1) Отправь <b>название аккаунта</b> (LABEL)\n"
-        "Пример: <code>YA_ACC_1</code>\n\n"
-        "Дальше я спрошу дату окончания Plus и 3 ссылки.",
-        reply_markup=kb_admin_menu(),
+        "➕ Введи <b>LABEL</b> аккаунта\nПример: <code>YA_ACC_1</code>",
         parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
     )
-    await cb.answer()
 
 
 @router.message(AdminYandexFSM.waiting_label)
-async def admin_yandex_waiting_label(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    label = _normalize_label(message.text or "")
+async def add_label(msg: Message, state: FSMContext):
+    label = _normalize_label(msg.text)
     if not label:
-        await message.answer(
-            "❌ Не понял label. Пример: <code>YA_ACC_1</code>",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
-        )
+        await msg.answer("❌ Неверный label", reply_markup=kb_admin_menu())
         return
 
     await state.update_data(label=label)
     await state.set_state(AdminYandexFSM.waiting_plus_end)
 
-    await message.answer(
-        "📅 <b>До какого числа подписка активна?</b>\n\n"
-        "Введи в формате:\n"
-        "<code>9 февраля 2026</code>\n\n"
-        "Это дата окончания Plus на этом аккаунте (вводишь вручную).",
+    await msg.answer(
+        "📅 До какого числа Plus активен?\nПример: <code>9 февраля 2026</code>",
         parse_mode="HTML",
         reply_markup=kb_admin_menu(),
     )
 
 
 @router.message(AdminYandexFSM.waiting_plus_end)
-async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    plus_end_at = _parse_ru_date_to_utc_end_of_day(message.text or "")
-    if not plus_end_at:
-        await message.answer(
-            "❌ Формат даты неверный.\n\n"
-            "Нужно: <code>9 февраля 2026</code>\n"
-            "Попробуй ещё раз.",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
-        )
+async def add_plus_end(msg: Message, state: FSMContext):
+    plus_end = _parse_ru_date_to_utc_end_of_day(msg.text)
+    if not plus_end:
+        await msg.answer("❌ Неверный формат даты", reply_markup=kb_admin_menu())
         return
 
     data = await state.get_data()
-    label = data.get("label")
-    if not label:
-        await state.clear()
-        await message.answer("❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.", reply_markup=kb_admin_menu())
-        return
+    label = data["label"]
 
-    async with session_scope() as session:
-        acc = await session.scalar(select(YandexAccount).where(YandexAccount.label == label).limit(1))
+    async with session_scope() as s:
+        acc = await s.scalar(select(YandexAccount).where(YandexAccount.label == label))
         if not acc:
-            acc = YandexAccount(
-                label=label,
-                status="active",
-                max_slots=4,   # legacy field, keep
-                used_slots=0,
-            )
-            session.add(acc)
-            await session.flush()
+            acc = YandexAccount(label=label, status="active")
+            s.add(acc)
+            await s.flush()
 
-        acc.plus_end_at = plus_end_at
-        acc.status = "active"
-        await session.commit()
+        acc.plus_end_at = plus_end
+        await s.commit()
 
-    await state.update_data(plus_end_at_iso=plus_end_at.isoformat())
     await state.set_state(AdminYandexFSM.waiting_links)
-
-    await message.answer(
-        "🔗 <b>Теперь отправь 3 ссылки (слоты 1..3)</b>\n\n"
-        "Одна ссылка — одна строка:\n"
-        "<code>LINK_SLOT_1</code>\n"
-        "<code>LINK_SLOT_2</code>\n"
-        "<code>LINK_SLOT_3</code>\n\n"
-        f"Аккаунт: <code>{label}</code>\n"
-        f"Plus до: <code>{plus_end_at.date().isoformat()}</code>",
-        parse_mode="HTML",
+    await msg.answer(
+        "🔗 Отправь 3 ссылки (каждая с новой строки)",
         reply_markup=kb_admin_menu(),
     )
 
 
 @router.message(AdminYandexFSM.waiting_links)
-async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    lines = [ln.strip() for ln in (message.text or "").splitlines() if ln.strip()]
+async def add_links(msg: Message, state: FSMContext):
+    lines = [x.strip() for x in msg.text.splitlines() if x.strip()]
     if len(lines) != 3:
-        await message.answer(
-            "❌ Нужно ровно 3 строки — три ссылки (слоты 1..3).",
-            reply_markup=kb_admin_menu(),
-        )
+        await msg.answer("❌ Нужно ровно 3 ссылки", reply_markup=kb_admin_menu())
         return
 
     data = await state.get_data()
-    label = data.get("label")
-    if not label:
-        await state.clear()
-        await message.answer("❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.", reply_markup=kb_admin_menu())
-        return
+    label = data["label"]
 
-    async with session_scope() as session:
-        acc = await session.scalar(select(YandexAccount).where(YandexAccount.label == label).limit(1))
-        if not acc:
-            await state.clear()
-            await message.answer("❌ Аккаунт не найден. Начни добавление заново.", reply_markup=kb_admin_menu())
-            return
-
-        # Upsert 3 slots. IMPORTANT: do not overwrite issued/burned (S1).
-        for idx, link in enumerate(lines, start=1):
-            slot = await session.scalar(
+    async with session_scope() as s:
+        acc = await s.scalar(select(YandexAccount).where(YandexAccount.label == label))
+        for i, link in enumerate(lines, start=1):
+            slot = await s.scalar(
                 select(YandexInviteSlot)
-                .where(YandexInviteSlot.yandex_account_id == acc.id, YandexInviteSlot.slot_index == idx)
-                .limit(1)
+                .where(YandexInviteSlot.yandex_account_id == acc.id,
+                       YandexInviteSlot.slot_index == i)
             )
             if not slot:
-                slot = YandexInviteSlot(
+                s.add(YandexInviteSlot(
                     yandex_account_id=acc.id,
-                    slot_index=idx,
+                    slot_index=i,
                     invite_link=link,
                     status="free",
-                )
-                session.add(slot)
-            else:
-                if (slot.status or "free") == "free":
-                    slot.invite_link = link
-
-        await session.commit()
+                ))
+        await s.commit()
 
     await state.clear()
-
-    await message.answer(
-        "✅ <b>Готово!</b>\n\n"
-        f"Аккаунт: <code>{label}</code>\n"
-        "Слоты 1..3 загружены (free слоты обновлены, issued/burned не тронуты).",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
+    await msg.answer("✅ Аккаунт добавлен", reply_markup=kb_admin_menu())
 
 
-# ==========================
-# LIST ACCOUNTS/SLOTS
-# ==========================
+# =========================================================
+# LIST ACCOUNTS
+# =========================================================
 
 @router.callback_query(lambda c: c.data == "admin:yandex:list")
-async def admin_yandex_list(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
+async def list_accounts(cb: CallbackQuery):
+    async with session_scope() as s:
+        accs = (await s.scalars(select(YandexAccount))).all()
+
+    if not accs:
+        await cb.message.edit_text("Пока пусто", reply_markup=kb_admin_menu())
         return
 
-    async with session_scope() as session:
-        accounts = (await session.scalars(select(YandexAccount).order_by(YandexAccount.id.asc()))).all()
-        if not accounts:
-            await cb.message.edit_text(
-                "📋 <b>Yandex аккаунты</b>\n\nПока пусто. Нажми «➕ Добавить Yandex-аккаунт».",
-                reply_markup=kb_admin_menu(),
-                parse_mode="HTML",
-            )
-            await cb.answer()
-            return
-
-        lines = ["📋 <b>Yandex аккаунты / слоты</b>\n"]
-        for acc in accounts:
-            free_cnt = await session.scalar(
-                select(func.count(YandexInviteSlot.id)).where(
-                    YandexInviteSlot.yandex_account_id == acc.id,
+    text = ["📋 <b>Аккаунты</b>\n"]
+    async with session_scope() as s:
+        for a in accs:
+            free = await s.scalar(
+                select(func.count()).where(
+                    YandexInviteSlot.yandex_account_id == a.id,
                     YandexInviteSlot.status == "free",
                 )
             )
-            issued_cnt = await session.scalar(
-                select(func.count(YandexInviteSlot.id)).where(
-                    YandexInviteSlot.yandex_account_id == acc.id,
-                    YandexInviteSlot.status != "free",
-                )
-            )
-            plus_str = _fmt_plus_end_at(acc.plus_end_at)
-            lines.append(
-                f"• <code>{acc.label}</code> — {acc.status} | Plus до: <code>{plus_str}</code> | "
-                f"slots free/issued: <b>{int(free_cnt or 0)}</b>/<b>{int(issued_cnt or 0)}</b>"
+            text.append(
+                f"• <code>{a.label}</code> | Plus до: <code>{_fmt_plus_end_at(a.plus_end_at)}</code> | free: {free}"
             )
 
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
-    await cb.answer()
+    await cb.message.edit_text("\n".join(text), parse_mode="HTML", reply_markup=kb_admin_menu())
 
 
-# ==========================
-# EDIT ACCOUNT (label -> new date -> optional links)
-# ==========================
+# =========================================================
+# DAILY KICK REPORT
+# =========================================================
 
-@router.callback_query(lambda c: c.data == "admin:yandex:edit")
-async def admin_yandex_edit(cb: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
+@router.callback_query(lambda c: c.data == "admin:kick:report")
+async def kick_report(cb: CallbackQuery):
+    async with session_scope() as s:
+        text = await build_kick_report_text(s)
 
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_admin_menu())
+
+
+# =========================================================
+# MARK USER REMOVED
+# =========================================================
+
+@router.callback_query(lambda c: c.data == "admin:kick:mark")
+async def kick_mark_start(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await state.set_state(AdminYandexFSM.edit_waiting_label)
+    await state.set_state(AdminKickFSM.waiting_tg_id)
 
     await cb.message.edit_text(
-        "✏️ <b>Редактирование Yandex-аккаунта</b>\n\n"
-        "Отправь <b>LABEL</b> аккаунта, который хочешь изменить.\n"
-        "Пример: <code>YA_ACC_1</code>",
-        reply_markup=kb_admin_menu(),
+        "🧾 Введи <b>Telegram ID</b> исключённого пользователя",
         parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
     )
-    await cb.answer()
 
 
-@router.message(AdminYandexFSM.edit_waiting_label)
-async def admin_yandex_edit_waiting_label(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
+@router.message(AdminKickFSM.waiting_tg_id)
+async def kick_mark_apply(msg: Message, state: FSMContext):
+    if not msg.text.isdigit():
+        await msg.answer("❌ Нужен TG ID", reply_markup=kb_admin_menu())
         return
 
-    label = _normalize_label(message.text or "")
-    if not label:
-        await message.answer("❌ Не понял label. Пример: <code>YA_ACC_1</code>", parse_mode="HTML", reply_markup=kb_admin_menu())
-        return
+    tg_id = int(msg.text)
 
-    async with session_scope() as session:
-        acc = await session.scalar(select(YandexAccount).where(YandexAccount.label == label).limit(1))
-        if not acc:
-            await message.answer("❌ Аккаунт не найден. Проверь LABEL.", reply_markup=kb_admin_menu())
-            return
-
-        await state.update_data(edit_label=label)
-
-        await state.set_state(AdminYandexFSM.edit_waiting_plus_end)
-        await message.answer(
-            "📅 <b>Новая дата окончания Plus</b>\n\n"
-            f"Сейчас: <code>{_fmt_plus_end_at(acc.plus_end_at)}</code>\n\n"
-            "Введи новую дату в формате:\n"
-            "<code>9 февраля 2026</code>\n\n"
-            "Или отправь <code>-</code> чтобы не менять дату.",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
+    async with session_scope() as s:
+        m = await s.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
         )
-
-
-@router.message(AdminYandexFSM.edit_waiting_plus_end)
-async def admin_yandex_edit_waiting_plus_end(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    txt = (message.text or "").strip()
-    data = await state.get_data()
-    label = data.get("edit_label")
-    if not label:
-        await state.clear()
-        await message.answer("❌ Сессия сбилась. Начни редактирование заново.", reply_markup=kb_admin_menu())
-        return
-
-    new_dt: datetime | None = None
-    if txt != "-":
-        new_dt = _parse_ru_date_to_utc_end_of_day(txt)
-        if not new_dt:
-            await message.answer(
-                "❌ Формат даты неверный.\nНужно: <code>9 февраля 2026</code> или <code>-</code>",
-                parse_mode="HTML",
-                reply_markup=kb_admin_menu(),
-            )
+        if not m:
+            await msg.answer("❌ Не найдено", reply_markup=kb_admin_menu())
             return
 
-    async with session_scope() as session:
-        acc = await session.scalar(select(YandexAccount).where(YandexAccount.label == label).limit(1))
-        if not acc:
-            await state.clear()
-            await message.answer("❌ Аккаунт не найден.", reply_markup=kb_admin_menu())
+        if m.removed_at:
+            await msg.answer("ℹ️ Уже отмечен", reply_markup=kb_admin_menu())
             return
 
-        if new_dt:
-            acc.plus_end_at = new_dt
-        await session.commit()
-
-    await state.set_state(AdminYandexFSM.edit_waiting_links)
-    await message.answer(
-        "🔗 <b>Обновить ссылки слотов (опционально)</b>\n\n"
-        "Если хочешь заменить ссылки — отправь 3 строки (слоты 1..3).\n"
-        "⚠️ Будут обновлены только слоты со статусом <b>free</b>.\n"
-        "Issued/Burned слоты не трогаем (S1).\n\n"
-        "Если не нужно — отправь <code>-</code>.",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
-
-
-@router.message(AdminYandexFSM.edit_waiting_links)
-async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    txt = (message.text or "").strip()
-    data = await state.get_data()
-    label = data.get("edit_label")
-    if not label:
-        await state.clear()
-        await message.answer("❌ Сессия сбилась. Начни редактирование заново.", reply_markup=kb_admin_menu())
-        return
-
-    if txt == "-":
-        await state.clear()
-        await message.answer("✅ Изменения сохранены.", reply_markup=kb_admin_menu())
-        return
-
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    if len(lines) != 3:
-        await message.answer("❌ Нужно ровно 3 строки (или отправь <code>-</code>).", parse_mode="HTML", reply_markup=kb_admin_menu())
-        return
-
-    async with session_scope() as session:
-        acc = await session.scalar(select(YandexAccount).where(YandexAccount.label == label).limit(1))
-        if not acc:
-            await state.clear()
-            await message.answer("❌ Аккаунт не найден.", reply_markup=kb_admin_menu())
-            return
-
-        updated = 0
-        skipped = 0
-        for idx, link in enumerate(lines, start=1):
-            slot = await session.scalar(
-                select(YandexInviteSlot)
-                .where(YandexInviteSlot.yandex_account_id == acc.id, YandexInviteSlot.slot_index == idx)
-                .limit(1)
-            )
-            if not slot:
-                # create missing slots as free
-                slot = YandexInviteSlot(
-                    yandex_account_id=acc.id,
-                    slot_index=idx,
-                    invite_link=link,
-                    status="free",
-                )
-                session.add(slot)
-                updated += 1
-            else:
-                if (slot.status or "free") == "free":
-                    slot.invite_link = link
-                    updated += 1
-                else:
-                    skipped += 1
-
-        await session.commit()
+        m.removed_at = repo_utcnow()
+        await s.commit()
 
     await state.clear()
-    await message.answer(
-        "✅ Аккаунт обновлён.\n\n"
-        f"Ссылки обновлены (free): {updated}\n"
-        f"Пропущено (issued/burned): {skipped}",
-        reply_markup=kb_admin_menu(),
-    )
+    await msg.answer("✅ Пользователь отмечен как исключённый", reply_markup=kb_admin_menu())
