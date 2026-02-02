@@ -62,13 +62,10 @@ def kb_confirm_reset() -> InlineKeyboardMarkup:
 def kb_admin_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
-    b.button(text="📋 Список аккаунтов", callback_data="admin:yandex:list")
-    b.button(text="🔍 Проверить Yandex аккаунт", callback_data="admin:yandex:probe")
+    b.button(text="🔗 Загрузить 3 ссылки", callback_data="admin:yandex:slots:add")
+    b.button(text="📋 Список аккаунтов/слотов", callback_data="admin:yandex:list")
 
-    # 📦 Скачать последний debug (скрин/HTML) по проверке/инвайту
-    b.button(text="📦 Скачать последний debug", callback_data="admin:yandex:debug:last")
-
-    # ✅ НОВОЕ: снять страйки / разблокировать reinvite
+    # (старые кнопки оставляем, чтобы не ломать привычный интерфейс)
     b.button(text="🧽 Снять страйки Yandex", callback_data="admin:forgive:user")
 
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
