@@ -57,6 +57,10 @@ async def _get_yandex_membership(session, tg_id: int) -> YandexMembership | None
 
 
 async def _cleanup_flow_messages_for_user(bot, chat_id: int, tg_id: int) -> None:
+    """
+    Legacy cleanup: раньше тут были подсказки/скрины для ввода логина.
+    Сейчас логин не вводим, но чистилка остаётся безопасной.
+    """
     async with session_scope() as session:
         user = await session.get(User, tg_id)
         if not user or not user.flow_data:
@@ -104,11 +108,18 @@ async def on_nav(cb: CallbackQuery) -> None:
             res = await session.execute(q)
             payments = list(res.scalars().all())
 
-        y_status = ym.status if ym else "не подключено"
-        y_login = ym.yandex_login if (ym and ym.yandex_login) else "—"
-
         pay_lines = [f"• {p.amount} {p.currency} / {p.provider} / {p.status}" for p in payments]
         pay_text = "\n".join(pay_lines) if pay_lines else "• оплат пока нет"
+
+        # Новый статус Yandex: без логинов, показываем семью/слот/наличие ссылки.
+        if ym and ym.invite_link:
+            y_text = (
+                f"— Семья: <code>{getattr(ym, 'account_label', '—') or '—'}</code>\n"
+                f"— Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n"
+                "— Приглашение: ✅ есть"
+            )
+        else:
+            y_text = "— Приглашение: ❌ не выдано"
 
         text = (
             "👤 <b>Личный кабинет</b>\n\n"
@@ -117,8 +128,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             f"📅 До: {fmt_dt(sub.end_at)}\n"
             f"⏳ Осталось: {days_left(sub.end_at)} дн.\n\n"
             "🟡 <b>Yandex Plus</b>\n"
-            f"— Статус: <b>{y_status}</b>\n"
-            f"— Логин: <code>{y_login}</code>\n\n"
+            f"{y_text}\n\n"
             "🧾 <b>Последние оплаты</b>\n"
             f"{pay_text}"
         )
@@ -161,67 +171,38 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        # Если membership уже есть — показываем статус + ссылку, если ожидает вступления
-        if ym and ym.yandex_login:
-            buttons = []
-            if ym.status in ("awaiting_join", "pending") and ym.invite_link:
-                buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
-            # Show reinvite option if invite timed out and user still has remaining reinvites.
-            if (
-                ym.status == "invite_timeout"
-                and int(getattr(ym, "reinvite_used", 0) or 0) < int(getattr(settings, "yandex_reinvite_max", 1) or 1)
-            ):
-                buttons.append([InlineKeyboardButton(text="🔁 Реинвайт", callback_data="yandex:reinvite")])
-            buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+        buttons: list[list[InlineKeyboardButton]] = []
 
-            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-            await cb.message.edit_text(
+        # Если ссылка уже есть — показываем кнопку открыть.
+        if ym and ym.invite_link:
+            buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
+            # Главное — ссылка всегда доступна здесь.
+            info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
-                f"Ваш логин: <code>{ym.yandex_login}</code>\n"
-                f"Статус: <b>{ym.status}</b>\n\n"
-                "Логин подтверждён и не может быть изменён.",
-                reply_markup=kb,
-                parse_mode="HTML",
+                "✅ Приглашение уже выдано и доступно по кнопке ниже.\n\n"
+                f"Семья: <code>{getattr(ym, 'account_label', '—') or '—'}</code>\n"
+                f"Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n\n"
+                "Если ты не успел перейти — просто открой приглашение отсюда."
             )
-            await cb.answer()
-            return
+        else:
+            # Ссылки ещё не было — выдаём по кнопке.
+            buttons.append([InlineKeyboardButton(text="Получить приглашение", callback_data="yandex:issue")])
+            info = (
+                "🟡 <b>Yandex Plus</b>\n\n"
+                "Нажми кнопку ниже — я выдам тебе приглашение в семейную подписку.\n"
+                "После выдачи ссылка останется в этом разделе."
+            )
 
-        # переходим в режим ожидания логина (ввод сообщением)
-        async with session_scope() as session:
-            user = await session.get(User, cb.from_user.id)
-            if user:
-                user.flow_state = "await_yandex_login"
-                user.flow_data = None
-                await session.commit()
+        buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
 
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔎 Посмотреть свой логин", url="https://id.yandex.ru")],
-                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-            ]
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-        await cb.message.edit_text(
-            "🟡 <b>Yandex Plus</b>\n\n"
-            "Введите ваш логин Yandex ID.\n"
-            "⚠️ После подтверждения изменить логин нельзя.",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
+        try:
+            await cb.message.edit_text(info, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+
         await cb.answer()
-
-        # ✅ возвращаем подсказку-картинку (как было)
-        photo = FSInputFile("app/bot/assets/yandex_login_hint.jpg")
-        hint_msg = await cb.message.answer_photo(photo=photo)
-        prompt_msg = await cb.message.answer("👇 Введите логин сообщением ниже")
-
-        async with session_scope() as session:
-            user = await session.get(User, cb.from_user.id)
-            if user:
-                user.flow_data = json.dumps({"hint_msg_ids": [hint_msg.message_id, prompt_msg.message_id]})
-                await session.commit()
-
         return
 
     if where == "faq":
