@@ -114,6 +114,7 @@ class AdminYandexFSM(StatesGroup):
     edit_waiting_links = State()   # edit: new links (optional)
 
     kick_waiting_tg_id = State()   # mark removal: tg_id input
+    reset_waiting_tg_id = State()  # reset user: tg_id input
 
 
 # ==========================
@@ -260,14 +261,165 @@ async def admin_kick_mark_tg_id(message: Message, state: FSMContext) -> None:
 
         vpn_on = await _vpn_is_enabled(session, tg_id)
 
+        fam_label = m.account_label or "—"
+        slot_idx = m.slot_index or "—"
+
     await state.clear()
     await message.answer(
         "✅ Отмечено.\n\n"
         f"TG ID: <code>{tg_id}</code>\n"
-        f"Семья: <code>{m.account_label or '—'}</code>\n"
-        f"Слот: <code>{m.slot_index or '—'}</code>\n"
+        f"Семья: <code>{fam_label}</code>\n"
+        f"Слот: <code>{slot_idx}</code>\n"
         f"VPN: <b>{'Включен' if vpn_on else 'Отключен'}</b>\n"
         f"removed_at: <code>{_fmt_dt(now)}</code>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+# ==========================
+# Admin: RESET USER (TEST)
+# ==========================
+
+@router.callback_query(lambda c: c.data == "admin:reset:user")
+async def admin_reset_user(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.clear()
+    await state.set_state(AdminYandexFSM.reset_waiting_tg_id)
+
+    await cb.message.edit_text(
+        "🧨 <b>Сбросить пользователя (TEST)</b>\n\n"
+        "Отправь <b>Telegram ID</b> пользователя (числом).\n\n"
+        "Я сделаю:\n"
+        "— отключу VPN (peer'ы)\n"
+        "— завершу подписку (end_at = сейчас)\n"
+        "— помечу YandexMembership как removed\n\n"
+        "Пример:\n<code>123456789</code>",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.message(AdminYandexFSM.reset_waiting_tg_id)
+async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer(
+            "❌ Нужен числовой Telegram ID. Пример: <code>123456789</code>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    tg_id = int(raw)
+    now = utcnow()
+
+    # best-effort: если User модели нет — просто пропускаем
+    UserModel = None
+    try:
+        from app.db.models import User  # type: ignore
+        UserModel = User  # type: ignore
+    except Exception:
+        UserModel = None
+
+    y_info = {"label": "—", "slot": "—"}
+
+    async with session_scope() as session:
+        # 1) VPN: деактивируем все peer'ы пользователя (best-effort)
+        try:
+            peers = (
+                await session.scalars(
+                    select(VpnPeer).where(VpnPeer.tg_id == tg_id).order_by(VpnPeer.id.desc())
+                )
+            ).all()
+            for p in peers:
+                try:
+                    p.is_active = False
+                except Exception:
+                    pass
+                try:
+                    p.revoked_at = now
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2) Subscription: завершаем (best-effort)
+        try:
+            sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
+            if sub:
+                try:
+                    sub.end_at = now
+                except Exception:
+                    pass
+                try:
+                    sub.is_active = False
+                except Exception:
+                    pass
+                try:
+                    sub.status = "expired"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3) YandexMembership: помечаем removed (best-effort)
+        try:
+            m = await session.scalar(
+                select(YandexMembership)
+                .where(YandexMembership.tg_id == tg_id)
+                .order_by(YandexMembership.id.desc())
+                .limit(1)
+            )
+            if m:
+                y_info["label"] = getattr(m, "account_label", None) or "—"
+                y_info["slot"] = str(getattr(m, "slot_index", None) or "—")
+
+                try:
+                    m.status = "removed"
+                except Exception:
+                    pass
+                try:
+                    m.removed_at = now
+                except Exception:
+                    pass
+                try:
+                    m.updated_at = now
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 4) User: чистим flow_state/flow_data (best-effort)
+        if UserModel is not None:
+            try:
+                u = await session.get(UserModel, tg_id)
+                if u:
+                    try:
+                        u.flow_state = None
+                        u.flow_data = None
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        await session.commit()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Сброс выполнен</b>\n\n"
+        f"TG ID: <code>{tg_id}</code>\n"
+        f"Yandex семья: <code>{y_info['label']}</code>\n"
+        f"Yandex слот: <code>{y_info['slot']}</code>\n"
+        f"Время: <code>{_fmt_dt(now)}</code>",
         parse_mode="HTML",
         reply_markup=kb_admin_menu(),
     )
@@ -356,7 +508,10 @@ async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> 
     label = data.get("label")
     if not label:
         await state.clear()
-        await message.answer("❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.", reply_markup=kb_admin_menu())
+        await message.answer(
+            "❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.",
+            reply_markup=kb_admin_menu(),
+        )
         return
 
     async with session_scope() as session:
@@ -365,7 +520,7 @@ async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> 
             acc = YandexAccount(
                 label=label,
                 status="active",
-                max_slots=4,   # legacy field, keep
+                max_slots=4,  # legacy field, keep
                 used_slots=0,
             )
             session.add(acc)
@@ -408,7 +563,10 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
     label = data.get("label")
     if not label:
         await state.clear()
-        await message.answer("❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.", reply_markup=kb_admin_menu())
+        await message.answer(
+            "❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.",
+            reply_markup=kb_admin_menu(),
+        )
         return
 
     async with session_scope() as session:
@@ -525,7 +683,11 @@ async def admin_yandex_edit_waiting_label(message: Message, state: FSMContext) -
 
     label = _normalize_label(message.text or "")
     if not label:
-        await message.answer("❌ Не понял label. Пример: <code>YA_ACC_1</code>", parse_mode="HTML", reply_markup=kb_admin_menu())
+        await message.answer(
+            "❌ Не понял label. Пример: <code>YA_ACC_1</code>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
         return
 
     async with session_scope() as session:
@@ -615,7 +777,11 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
 
     lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
     if len(lines) != 3:
-        await message.answer("❌ Нужно ровно 3 строки (или отправь <code>-</code>).", parse_mode="HTML", reply_markup=kb_admin_menu())
+        await message.answer(
+            "❌ Нужно ровно 3 строки (или отправь <code>-</code>).",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
         return
 
     async with session_scope() as session:
