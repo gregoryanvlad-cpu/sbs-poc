@@ -51,6 +51,9 @@ class YandexMembership(Base):
     # ✅ УЧЁТ ИСКЛЮЧЕНИЯ ИЗ СЕМЬИ (вручную админом)
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ✅ ОТЛОЖИТЬ НА ЗАВТРА (best-effort учёт, без Playwright)
+    kick_snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
