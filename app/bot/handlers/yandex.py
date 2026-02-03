@@ -20,9 +20,39 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Открыть приглашение", url=invite_link)],
+            [InlineKeyboardButton(text="📋 Скопировать приглашение", callback_data="yandex:copy")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
         ]
     )
+
+
+@router.callback_query(lambda c: c.data == "yandex:copy")
+async def yandex_copy_invite(cb: CallbackQuery) -> None:
+    """Send invite link as plain text so user can copy it."""
+    tg_id = cb.from_user.id
+
+    async with session_scope() as session:
+        ym = await session.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+
+    link = getattr(ym, "invite_link", None) if ym else None
+    if not link:
+        await cb.answer("Ссылка ещё не выдана", show_alert=True)
+        return
+
+    try:
+        await cb.message.answer(
+            "📋 Скопируй ссылку приглашения:\n\n" f"<code>{link}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await cb.answer("Ссылка отправлена")
 
 
 @router.callback_query(F.data == "yandex:issue")
