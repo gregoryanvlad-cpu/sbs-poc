@@ -44,6 +44,7 @@ def ensure_yandex_membership_notification_columns() -> None:
         "notified_3d_at": "TIMESTAMPTZ",
         "notified_1d_at": "TIMESTAMPTZ",
         "removed_at": "TIMESTAMPTZ",
+        "kick_snoozed_until": "TIMESTAMPTZ",
     }
 
     missing = [name for name in wanted.keys() if name not in cols]
