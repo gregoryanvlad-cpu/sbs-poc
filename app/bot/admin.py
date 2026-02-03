@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from aiogram import Router
@@ -162,6 +162,8 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
                 YandexMembership.coverage_end_at.is_not(None),
                 YandexMembership.coverage_end_at <= now,
                 YandexMembership.removed_at.is_(None),
+                # если отложили — не напоминаем до указанной даты
+                (YandexMembership.kick_snoozed_until.is_(None) | (YandexMembership.kick_snoozed_until <= now)),
             )
             .order_by(YandexMembership.coverage_end_at.asc(), YandexMembership.id.asc())
             .limit(100)
@@ -177,6 +179,7 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             return
 
         lines = ["📋 <b>Сегодня пора исключить следующих участников:</b>\n"]
+        kb_rows: list[list[InlineKeyboardButton]] = []
         for i, (m, sub) in enumerate(rows, start=1):
             vpn_on = await _vpn_is_enabled(session, int(m.tg_id))
             sub_end = getattr(sub, "end_at", None) if sub else None
@@ -198,8 +201,80 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             lines.append(f"Подписка: <b>{'Продлевалась' if renewed else 'Не продлевалась'}</b>")
             lines.append("")
 
-    await cb.message.edit_text("\n".join(lines).strip(), reply_markup=kb_admin_menu(), parse_mode="HTML")
+            # Быстрые кнопки учёта (best-effort): отметить кик / отложить
+            tg_id = int(m.tg_id)
+            kb_rows.append([
+                InlineKeyboardButton(text=f"✅ Я исключил #{i}", callback_data=f"admin:kick:done:{tg_id}"),
+                InlineKeyboardButton(text=f"⏳ Отложить #{i}", callback_data=f"admin:kick:snooze:{tg_id}"),
+            ])
+
+        kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await cb.message.edit_text("\n".join(lines).strip(), reply_markup=kb, parse_mode="HTML")
     await cb.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin:kick:done:"))
+async def admin_kick_done_quick(cb: CallbackQuery) -> None:
+    """Quick action: mark user as removed (so bot won't remind again)."""
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        tg_id = int(cb.data.split(":", 3)[3])
+    except Exception:
+        await cb.answer("Некорректный ID", show_alert=True)
+        return
+
+    async with session_scope() as session:
+        m = await session.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+        if not m:
+            await cb.answer("Не найдено", show_alert=True)
+            return
+        m.removed_at = utcnow()
+        m.kick_snoozed_until = None
+        await session.commit()
+
+    await cb.answer("Отмечено ✅")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin:kick:snooze:"))
+async def admin_kick_snooze_quick(cb: CallbackQuery) -> None:
+    """Quick action: snooze reminders for this user until tomorrow."""
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        tg_id = int(cb.data.split(":", 3)[3])
+    except Exception:
+        await cb.answer("Некорректный ID", show_alert=True)
+        return
+
+    now = utcnow()
+    until = now + timedelta(days=1)
+
+    async with session_scope() as session:
+        m = await session.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+        if not m:
+            await cb.answer("Не найдено", show_alert=True)
+            return
+        m.kick_snoozed_until = until
+        await session.commit()
+
+    await cb.answer("Отложено до завтра ⏳")
 
 
 # ==========================
