@@ -24,6 +24,7 @@ def kb_back_home() -> InlineKeyboardMarkup:
 def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
+    b.button(text="👥 Рефералы", callback_data="nav:referrals")
     if is_owner:
         b.button(text="🛠 Админка", callback_data="admin:menu")
     b.button(text="⬅️ Назад", callback_data="nav:home")
@@ -70,6 +71,8 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     # ✅ NEW: отчёт на сегодня + отметка исключения
     b.button(text="📋 Кого исключить сегодня", callback_data="admin:kick:report")
     b.button(text="🧾 Отметить пользователя исключённым", callback_data="admin:kick:mark")
+
+    b.button(text="💸 Заявки на вывод", callback_data="admin:payouts:list")
 
     # legacy/test (оставляем как просил)
     b.button(text="🧽 Снять страйки Yandex", callback_data="admin:forgive:user")
