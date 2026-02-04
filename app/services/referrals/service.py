@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from app.core.config import settings
 from app.db.models import Payment, Referral, ReferralEarning, User
@@ -17,8 +17,7 @@ def _utcnow() -> datetime:
 
 
 def _level_percent(active_referrals: int) -> int:
-    """
-    3-level commission:
+    """3-level commission:
     1..3 -> 5%
     4..9 -> 11%
     10+  -> 17%
@@ -48,6 +47,7 @@ class ReferralService:
         return _level_percent(await self.count_active_referrals(session, tg_id))
 
     async def get_balance(self, session, tg_id: int) -> tuple[int, int]:
+        """Returns (pending_sum, available_sum) in RUB integers."""
         pending = await session.scalar(
             select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(
                 ReferralEarning.referrer_tg_id == int(tg_id),
@@ -63,6 +63,7 @@ class ReferralService:
         return int(pending or 0), int(available or 0)
 
     async def get_balances(self, session, tg_id: int) -> tuple[int, int, int]:
+        """Returns (available_sum, pending_sum, paid_sum) in RUB integers."""
         pending, available = await self.get_balance(session, tg_id)
 
         paid = await session.scalar(
@@ -75,27 +76,28 @@ class ReferralService:
 
     async def available_balance(self, session, *, tg_id: int) -> Decimal:
         _, avail = await self.get_balance(session, tg_id)
-        return Decimal(avail)
+        return Decimal(int(avail))
 
     # =====================================================
     # WHO INVITED ME
     # =====================================================
 
     async def get_inviter_tg_id(self, session, *, tg_id: int) -> int | None:
+        """Return inviter TG id if this user became an ACTIVE referral (after first payment)."""
         inviter = await session.scalar(
             select(Referral.referrer_tg_id).where(
                 Referral.referred_tg_id == int(tg_id),
                 Referral.status == "active",
             ).limit(1)
         )
-        return int(inviter) if inviter else None
+        return int(inviter) if inviter is not None else None
 
     async def get_my_referrer_label(self, session, *, tg_id: int) -> str:
         inviter = await self.get_inviter_tg_id(session, tg_id=int(tg_id))
         return f"ID {inviter}" if inviter else "самостоятельно"
 
     # =====================================================
-    # CABINET: REFERRALS LIST  ✅ FIXED
+    # CABINET: REFERRALS LIST (matches nav.py expectations)
     # =====================================================
 
     async def list_referrals_summary(
@@ -105,12 +107,44 @@ class ReferralService:
         tg_id: int,
         limit: int = 50,
     ) -> list[dict]:
+        """Return per-referral earnings breakdown.
+
+        nav.py expects keys:
+          total, available, pending, paid
+        """
         q = (
             select(
-                Referral.referred_tg_id,
-                Referral.status,
-                Referral.activated_at,
-                func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("earned_rub"),
+                Referral.referred_tg_id.label("referred_tg_id"),
+                Referral.status.label("ref_status"),
+                Referral.activated_at.label("activated_at"),
+                func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("total"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (ReferralEarning.status == "available", ReferralEarning.earned_rub),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("available"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (ReferralEarning.status == "pending", ReferralEarning.earned_rub),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("pending"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (ReferralEarning.status == "paid", ReferralEarning.earned_rub),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("paid"),
                 func.max(Referral.id).label("rid"),
             )
             .outerjoin(
@@ -119,34 +153,34 @@ class ReferralService:
                 & (ReferralEarning.referrer_tg_id == Referral.referrer_tg_id),
             )
             .where(Referral.referrer_tg_id == int(tg_id))
-            .group_by(
-                Referral.referred_tg_id,
-                Referral.status,
-                Referral.activated_at,
-            )
-            .order_by(
-                Referral.activated_at.desc().nullslast(),
-                func.max(Referral.id).desc(),  # ✅ ВАЖНО: агрегат, а не referrals.id
-            )
+            .group_by(Referral.referred_tg_id, Referral.status, Referral.activated_at)
+            .order_by(Referral.activated_at.desc().nullslast(), func.max(Referral.id).desc())
             .limit(int(limit))
         )
 
         rows = (await session.execute(q)).all()
-        return [
-            {
-                "referred_tg_id": int(r.referred_tg_id),
-                "status": str(r.status or "active"),
-                "activated_at": r.activated_at,
-                "earned_rub": int(r.earned_rub or 0),
-            }
-            for r in rows
-        ]
+        out: list[dict] = []
+        for row in rows:
+            m = row._mapping  # SQLAlchemy RowMapping
+            out.append(
+                {
+                    "referred_tg_id": int(m["referred_tg_id"]),
+                    "status": str(m["ref_status"] or "active"),
+                    "activated_at": m["activated_at"],
+                    "total": int(m["total"] or 0),
+                    "available": int(m["available"] or 0),
+                    "pending": int(m["pending"] or 0),
+                    "paid": int(m["paid"] or 0),
+                }
+            )
+        return out
 
     # =====================================================
     # REF CODE / CLICK
     # =====================================================
 
     async def ensure_ref_code(self, session, tg_id_or_user: Any) -> str:
+        """Accepts either tg_id:int OR User instance."""
         tg_id = int(tg_id_or_user.tg_id if isinstance(tg_id_or_user, User) else tg_id_or_user)
 
         user = await session.get(User, tg_id)
@@ -160,9 +194,7 @@ class ReferralService:
 
         for _ in range(10):
             code = secrets.token_urlsafe(8).rstrip("=")
-            exists = await session.scalar(
-                select(User.tg_id).where(User.ref_code == code).limit(1)
-            )
+            exists = await session.scalar(select(User.tg_id).where(User.ref_code == code).limit(1))
             if not exists:
                 user.ref_code = code
                 await session.flush()
@@ -173,12 +205,11 @@ class ReferralService:
         return user.ref_code
 
     async def attach_pending_referrer(self, session, *, referred_tg_id: int, ref_code: str) -> None:
+        """Save referral click (pending) if this user wasn't referred before."""
         if not ref_code:
             return
 
-        referrer = await session.scalar(
-            select(User).where(User.ref_code == ref_code).limit(1)
-        )
+        referrer = await session.scalar(select(User).where(User.ref_code == ref_code).limit(1))
         if not referrer or int(referrer.tg_id) == int(referred_tg_id):
             return
 
@@ -188,6 +219,7 @@ class ReferralService:
             session.add(user)
             await session.flush()
 
+        # do not overwrite
         if user.referred_by_tg_id:
             return
 
@@ -200,6 +232,7 @@ class ReferralService:
     # =====================================================
 
     async def on_payment_success(self, session, *, payment: Payment) -> None:
+        """Process referral activation + commission for this successful payment."""
         if not payment or payment.status != "success":
             return
 
@@ -210,9 +243,8 @@ class ReferralService:
 
         referrer_id = int(user.referred_by_tg_id)
 
-        referral = await session.scalar(
-            select(Referral).where(Referral.referred_tg_id == payer_id).limit(1)
-        )
+        # Create referral if first payment
+        referral = await session.scalar(select(Referral).where(Referral.referred_tg_id == payer_id).limit(1))
         if not referral:
             referral = Referral(
                 referrer_tg_id=referrer_id,
@@ -225,8 +257,10 @@ class ReferralService:
             await session.flush()
 
         percent = _level_percent(await self.count_active_referrals(session, referrer_id))
-        earned = int(round(int(payment.amount or 0) * percent / 100))
+        pay_amount = int(payment.amount or 0)
+        earned = int(round(pay_amount * percent / 100.0))
 
+        # Idempotency: one earning per (payment_id, referrer)
         exists = await session.scalar(
             select(ReferralEarning.id).where(
                 ReferralEarning.payment_id == payment.id,
@@ -244,7 +278,7 @@ class ReferralService:
                 referrer_tg_id=referrer_id,
                 referred_tg_id=payer_id,
                 payment_id=payment.id,
-                payment_amount_rub=int(payment.amount or 0),
+                payment_amount_rub=pay_amount,
                 percent=percent,
                 earned_rub=earned,
                 status="pending" if hold_days else "available",
@@ -253,18 +287,25 @@ class ReferralService:
         )
         await session.flush()
 
+    # Backward-compat: nav.py calls on_successful_payment(session, payment)
+    async def on_successful_payment(self, session, payment: Payment) -> None:
+        await self.on_payment_success(session, payment=payment)
+
     # =====================================================
     # RELEASE HOLD
     # =====================================================
 
     async def release_pending(self, session) -> int:
         now = _utcnow()
-        items = (await session.scalars(
-            select(ReferralEarning).where(
-                ReferralEarning.status == "pending",
-                ReferralEarning.available_at <= now,
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.status == "pending",
+                    ReferralEarning.available_at.is_not(None),
+                    ReferralEarning.available_at <= now,
+                )
             )
-        )).all()
+        ).all()
 
         for e in items:
             e.status = "available"
@@ -284,77 +325,84 @@ class ReferralService:
         requisites: str,
     ) -> PayoutRequest:
         min_amt = int(getattr(settings, "referral_min_payout_rub", 50) or 50)
-        if amount_rub < min_amt:
+        if int(amount_rub) < min_amt:
             raise ValueError("amount_below_min")
 
-        _, available = await self.get_balance(session, tg_id)
-        if amount_rub > available:
+        _, available = await self.get_balance(session, int(tg_id))
+        if int(amount_rub) > int(available):
             raise ValueError("amount_exceeds_balance")
 
         req = PayoutRequest(
             tg_id=int(tg_id),
             amount_rub=int(amount_rub),
-            requisites=requisites.strip(),
+            requisites=(requisites or "").strip(),
             status="created",
         )
         session.add(req)
-        await session.flush()
+        await session.flush()  # get id
 
-        remaining = amount_rub
+        remaining = int(amount_rub)
 
-        items = (await session.scalars(
-            select(ReferralEarning)
-            .where(
-                ReferralEarning.referrer_tg_id == int(tg_id),
-                ReferralEarning.status == "available",
+        items = (
+            await session.scalars(
+                select(ReferralEarning)
+                .where(
+                    ReferralEarning.referrer_tg_id == int(tg_id),
+                    ReferralEarning.status == "available",
+                )
+                .order_by(ReferralEarning.id.asc())
             )
-            .order_by(ReferralEarning.id.asc())
-        )).all()
+        ).all()
 
         for e in items:
             if remaining <= 0:
                 break
 
-            if e.earned_rub <= remaining:
+            e_amt = int(e.earned_rub or 0)
+            if e_amt <= remaining:
                 e.status = "reserved"
                 e.payout_request_id = req.id
-                remaining -= e.earned_rub
+                remaining -= e_amt
             else:
+                # Split line
                 session.add(
                     ReferralEarning(
                         referrer_tg_id=e.referrer_tg_id,
                         referred_tg_id=e.referred_tg_id,
                         payment_id=e.payment_id,
-                        payment_amount_rub=e.payment_amount_rub,
-                        percent=e.percent,
+                        payment_amount_rub=int(e.payment_amount_rub or 0),
+                        percent=int(e.percent or 0),
                         earned_rub=remaining,
                         status="reserved",
                         payout_request_id=req.id,
                     )
                 )
-                e.earned_rub -= remaining
+                e.earned_rub = int(e.earned_rub or 0) - remaining
                 remaining = 0
+                break
 
-        if remaining:
+        if remaining != 0:
             raise RuntimeError("reserve_failed")
 
         await session.flush()
         return req
 
     async def mark_payout_paid(self, session, *, request_id: int) -> None:
-        req = await session.get(PayoutRequest, request_id)
+        req = await session.get(PayoutRequest, int(request_id))
         if not req:
             raise ValueError("not_found")
 
         req.status = "paid"
         req.processed_at = _utcnow()
 
-        items = (await session.scalars(
-            select(ReferralEarning).where(
-                ReferralEarning.payout_request_id == request_id,
-                ReferralEarning.status == "reserved",
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.payout_request_id == int(request_id),
+                    ReferralEarning.status == "reserved",
+                )
             )
-        )).all()
+        ).all()
 
         for e in items:
             e.status = "paid"
@@ -362,20 +410,22 @@ class ReferralService:
         await session.flush()
 
     async def reject_payout(self, session, *, request_id: int, note: str | None = None) -> None:
-        req = await session.get(PayoutRequest, request_id)
+        req = await session.get(PayoutRequest, int(request_id))
         if not req:
             raise ValueError("not_found")
 
         req.status = "rejected"
-        req.note = note
+        req.note = (note or "").strip() or None
         req.processed_at = _utcnow()
 
-        items = (await session.scalars(
-            select(ReferralEarning).where(
-                ReferralEarning.payout_request_id == request_id,
-                ReferralEarning.status == "reserved",
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.payout_request_id == int(request_id),
+                    ReferralEarning.status == "reserved",
+                )
             )
-        )).all()
+        ).all()
 
         for e in items:
             e.status = "available"
