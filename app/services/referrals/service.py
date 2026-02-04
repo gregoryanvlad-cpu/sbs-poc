@@ -95,7 +95,7 @@ class ReferralService:
         return f"ID {inviter}" if inviter else "самостоятельно"
 
     # =====================================================
-    # CABINET: REFERRALS LIST  ✅ FIXED SQL
+    # CABINET: REFERRALS LIST  ✅ FIX (no ORDER BY referrals.id)
     # =====================================================
 
     async def list_referrals_summary(
@@ -105,13 +105,28 @@ class ReferralService:
         tg_id: int,
         limit: int = 50,
     ) -> list[dict]:
+        """
+        Returns list of dicts:
+        {
+          "referred_tg_id": int,
+          "status": str,
+          "activated_at": datetime|None,
+          "earned_rub": int,
+        }
+        """
+
+        # ВАЖНО:
+        # Нельзя делать ORDER BY referrals.id при GROUP BY (Postgres ругается).
+        # Делаем rid = MAX(referrals.id) и сортируем по rid.
+        rid = func.max(Referral.id).label("rid")
+
         q = (
             select(
-                Referral.referred_tg_id,
-                Referral.status,
-                Referral.activated_at,
+                Referral.referred_tg_id.label("referred_tg_id"),
+                Referral.status.label("status"),
+                Referral.activated_at.label("activated_at"),
                 func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("earned_rub"),
-                func.max(Referral.id).label("rid"),
+                rid,
             )
             .outerjoin(
                 ReferralEarning,
@@ -126,21 +141,24 @@ class ReferralService:
             )
             .order_by(
                 Referral.activated_at.desc().nullslast(),
-                func.max(Referral.id).desc(),
+                rid.desc(),
             )
             .limit(int(limit))
         )
 
         rows = (await session.execute(q)).all()
-        return [
-            {
-                "referred_tg_id": int(r.referred_tg_id),
-                "status": str(r.status or "active"),
-                "activated_at": r.activated_at,
-                "earned_rub": int(r.earned_rub or 0),
-            }
-            for r in rows
-        ]
+        out: list[dict] = []
+        for r in rows:
+            # r is a Row object with keys above
+            out.append(
+                {
+                    "referred_tg_id": int(r.referred_tg_id),
+                    "status": str(r.status or "active"),
+                    "activated_at": r.activated_at,
+                    "earned_rub": int(r.earned_rub or 0),
+                }
+            )
+        return out
 
     # =====================================================
     # REF CODE / CLICK
@@ -160,9 +178,7 @@ class ReferralService:
 
         for _ in range(10):
             code = secrets.token_urlsafe(8).rstrip("=")
-            exists = await session.scalar(
-                select(User.tg_id).where(User.ref_code == code).limit(1)
-            )
+            exists = await session.scalar(select(User.tg_id).where(User.ref_code == code).limit(1))
             if not exists:
                 user.ref_code = code
                 await session.flush()
@@ -176,9 +192,7 @@ class ReferralService:
         if not ref_code:
             return
 
-        referrer = await session.scalar(
-            select(User).where(User.ref_code == ref_code).limit(1)
-        )
+        referrer = await session.scalar(select(User).where(User.ref_code == ref_code).limit(1))
         if not referrer or int(referrer.tg_id) == int(referred_tg_id):
             return
 
@@ -210,9 +224,7 @@ class ReferralService:
 
         referrer_id = int(user.referred_by_tg_id)
 
-        referral = await session.scalar(
-            select(Referral).where(Referral.referred_tg_id == payer_id).limit(1)
-        )
+        referral = await session.scalar(select(Referral).where(Referral.referred_tg_id == payer_id).limit(1))
         if not referral:
             referral = Referral(
                 referrer_tg_id=referrer_id,
@@ -259,12 +271,15 @@ class ReferralService:
 
     async def release_pending(self, session) -> int:
         now = _utcnow()
-        items = (await session.scalars(
-            select(ReferralEarning).where(
-                ReferralEarning.status == "pending",
-                ReferralEarning.available_at <= now,
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.status == "pending",
+                    ReferralEarning.available_at.is_not(None),
+                    ReferralEarning.available_at <= now,
+                )
             )
-        )).all()
+        ).all()
 
         for e in items:
             e.status = "available"
@@ -294,32 +309,36 @@ class ReferralService:
         req = PayoutRequest(
             tg_id=int(tg_id),
             amount_rub=int(amount_rub),
-            requisites=requisites.strip(),
+            requisites=(requisites or "").strip(),
             status="created",
         )
         session.add(req)
         await session.flush()
 
-        remaining = amount_rub
+        remaining = int(amount_rub)
 
-        items = (await session.scalars(
-            select(ReferralEarning)
-            .where(
-                ReferralEarning.referrer_tg_id == int(tg_id),
-                ReferralEarning.status == "available",
+        items = (
+            await session.scalars(
+                select(ReferralEarning)
+                .where(
+                    ReferralEarning.referrer_tg_id == int(tg_id),
+                    ReferralEarning.status == "available",
+                )
+                .order_by(ReferralEarning.id.asc())
             )
-            .order_by(ReferralEarning.id.asc())
-        )).all()
+        ).all()
 
         for e in items:
             if remaining <= 0:
                 break
 
-            if e.earned_rub <= remaining:
+            e_amt = int(e.earned_rub or 0)
+            if e_amt <= remaining:
                 e.status = "reserved"
                 e.payout_request_id = req.id
-                remaining -= e.earned_rub
+                remaining -= e_amt
             else:
+                # split row
                 session.add(
                     ReferralEarning(
                         referrer_tg_id=e.referrer_tg_id,
@@ -332,7 +351,7 @@ class ReferralService:
                         payout_request_id=req.id,
                     )
                 )
-                e.earned_rub -= remaining
+                e.earned_rub = int(e.earned_rub or 0) - remaining
                 remaining = 0
 
         if remaining:
@@ -342,19 +361,21 @@ class ReferralService:
         return req
 
     async def mark_payout_paid(self, session, *, request_id: int) -> None:
-        req = await session.get(PayoutRequest, request_id)
+        req = await session.get(PayoutRequest, int(request_id))
         if not req:
             raise ValueError("not_found")
 
         req.status = "paid"
         req.processed_at = _utcnow()
 
-        items = (await session.scalars(
-            select(ReferralEarning).where(
-                ReferralEarning.payout_request_id == request_id,
-                ReferralEarning.status == "reserved",
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.payout_request_id == int(request_id),
+                    ReferralEarning.status == "reserved",
+                )
             )
-        )).all()
+        ).all()
 
         for e in items:
             e.status = "paid"
@@ -362,20 +383,22 @@ class ReferralService:
         await session.flush()
 
     async def reject_payout(self, session, *, request_id: int, note: str | None = None) -> None:
-        req = await session.get(PayoutRequest, request_id)
+        req = await session.get(PayoutRequest, int(request_id))
         if not req:
             raise ValueError("not_found")
 
         req.status = "rejected"
-        req.note = note
+        req.note = (note or "").strip() or None
         req.processed_at = _utcnow()
 
-        items = (await session.scalars(
-            select(ReferralEarning).where(
-                ReferralEarning.payout_request_id == request_id,
-                ReferralEarning.status == "reserved",
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.payout_request_id == int(request_id),
+                    ReferralEarning.status == "reserved",
+                )
             )
-        )).all()
+        ).all()
 
         for e in items:
             e.status = "available"
