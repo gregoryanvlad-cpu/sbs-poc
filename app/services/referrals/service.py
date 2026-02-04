@@ -124,15 +124,13 @@ class ReferralService:
         Returns list of dicts:
         {
           "referred_tg_id": int,
-          "status": str,
-          "earned_rub": int,
+          "status": str,          # active/pending/etc (but we mostly have active)
+          "earned_rub": int,      # total earned from this referred user (all statuses)
           "activated_at": datetime|None
         }
         """
-        # ✅ FIX: since we ORDER BY Referral.id, we must SELECT + GROUP BY it.
         q = (
             select(
-                Referral.id,
                 Referral.referred_tg_id,
                 Referral.status,
                 Referral.activated_at,
@@ -144,7 +142,7 @@ class ReferralService:
                 & (ReferralEarning.referrer_tg_id == Referral.referrer_tg_id),
             )
             .where(Referral.referrer_tg_id == int(tg_id))
-            .group_by(Referral.id, Referral.referred_tg_id, Referral.status, Referral.activated_at)
+            .group_by(Referral.referred_tg_id, Referral.status, Referral.activated_at)
             .order_by(Referral.activated_at.desc().nullslast(), Referral.id.desc())
             .limit(int(limit))
         )
@@ -152,10 +150,10 @@ class ReferralService:
         rows = (await session.execute(q)).all()
         return [
             {
-                "referred_tg_id": int(r[1]),
-                "status": str(r[2] or "active"),
-                "activated_at": r[3],
-                "earned_rub": int(r[4] or 0),
+                "referred_tg_id": int(r[0]),
+                "status": str(r[1] or "active"),
+                "activated_at": r[2],
+                "earned_rub": int(r[3] or 0),
             }
             for r in rows
         ]
@@ -282,6 +280,14 @@ class ReferralService:
         )
         session.add(e)
         await session.flush()
+
+    async def on_successful_payment(self, session, payment: Payment) -> None:
+        """Backward-compatible alias for older bot code.
+
+        Some handlers call `referral_service.on_successful_payment(session, payment)`.
+        The canonical method is `on_payment_success(session, payment=...)`.
+        """
+        await self.on_payment_success(session, payment=payment)
 
     async def release_pending(self, session) -> int:
         """Move pending earnings to available when hold period passed."""
