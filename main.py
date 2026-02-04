@@ -9,42 +9,69 @@ Bot + scheduler can run in one process (default), or separately.
 
 import asyncio
 import contextlib
-import subprocess
-import sys
+
+from sqlalchemy import text
 
 from app.bot.app import run_bot
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.migrations.repair import main as repair_schema
-from app.db.session import init_engine
+from app.db.session import init_engine, async_session
 from app.scheduler.worker import run_scheduler
 
 
-def run_alembic() -> None:
+async def ensure_referral_schema() -> None:
     """
-    Railway-safe alembic runner.
-    Applies ALL migrations on startup.
+    Railway-safe schema repair.
+    Ensures referral columns exist even if Alembic didn't run.
     """
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "alembic", "upgrade", "head"]
-        )
-    except subprocess.CalledProcessError as e:
-        print("❌ Alembic migration failed")
-        raise e
+    async with async_session() as session:
+        # referrals.status
+        await session.execute(text("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'referrals'
+                  AND column_name = 'status'
+            ) THEN
+                ALTER TABLE referrals
+                ADD COLUMN status VARCHAR NOT NULL DEFAULT 'pending';
+            END IF;
+        END$$;
+        """))
+
+        # referral_earnings.payment_amount_rub
+        await session.execute(text("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'referral_earnings'
+                  AND column_name = 'payment_amount_rub'
+            ) THEN
+                ALTER TABLE referral_earnings
+                ADD COLUMN payment_amount_rub INTEGER NOT NULL DEFAULT 0;
+            END IF;
+        END$$;
+        """))
+
+        await session.commit()
 
 
 async def main() -> None:
     setup_logging()
 
-    # 1️⃣ Apply alembic migrations (CRITICAL)
-    run_alembic()
+    # Init DB engine
+    init_engine(settings.database_url)
 
-    # 2️⃣ Idempotent schema safety net
+    # Alembic safety net (idempotent)
     repair_schema()
 
-    # 3️⃣ Init DB engine
-    init_engine(settings.database_url)
+    # 🔥 Critical: fix schema BEFORE bot/scheduler
+    await ensure_referral_schema()
 
     scheduler_task = None
     if settings.scheduler_enabled:
