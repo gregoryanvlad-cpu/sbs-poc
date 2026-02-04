@@ -251,7 +251,6 @@ async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
             currency="RUB",
             provider="admin_mint",
             status="success",
-            created_at=now,
             paid_at=now,
         )
         session.add(pay)
