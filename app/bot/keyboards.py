@@ -74,6 +74,9 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
 
     b.button(text="💸 Заявки на вывод", callback_data="admin:payouts:list")
 
+    # TEST: накрутить реферальные начисления, чтобы проверить выводы
+    b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
+
     # legacy/test (оставляем как просил)
     b.button(text="🧽 Снять страйки Yandex", callback_data="admin:forgive:user")
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
