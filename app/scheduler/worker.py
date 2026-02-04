@@ -16,6 +16,7 @@ from app.db.models import Payment, Subscription, VpnPeer
 from app.db.models.yandex_membership import YandexMembership
 from app.repo import list_expired_subscriptions, set_subscription_expired
 from app.services.yandex.service import yandex_service
+from app.services.referrals.service import referral_service
 
 log = logging.getLogger(__name__)
 
@@ -236,6 +237,13 @@ async def run_scheduler() -> None:
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
                     await _job_user_subscription_notifications(bot)
+                    # Make pending referral earnings available when hold expires.
+                    try:
+                        released = await referral_service.release_pending(session)
+                        if released:
+                            await session.commit()
+                    except Exception:
+                        pass
                     await _send_admin_kick_report(bot, force=False)
                 finally:
                     await advisory_unlock(session)
