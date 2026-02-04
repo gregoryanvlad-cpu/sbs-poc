@@ -102,6 +102,63 @@ class ReferralService:
         )
         return int(inviter) if inviter is not None else None
 
+    async def get_my_referrer_label(self, session, *, tg_id: int) -> str:
+        """
+        Convenience for UI:
+        - returns "ID <tg_id>" if invited
+        - returns "самостоятельно" if not invited
+        """
+        inviter = await self.get_inviter_tg_id(session, tg_id=int(tg_id))
+        if not inviter:
+            return "самостоятельно"
+        return f"ID {inviter}"
+
+    # -------------------------
+    # cabinet UI: list of referrals
+    # -------------------------
+
+    async def list_referrals_summary(self, session, *, tg_id: int, limit: int = 50) -> list[dict]:
+        """
+        Used by cabinet UI (nav.py) to render the referrals list.
+
+        Returns list of dicts:
+        {
+          "referred_tg_id": int,
+          "status": str,          # active/pending/etc (but we mostly have active)
+          "earned_rub": int,      # total earned from this referred user (all statuses)
+          "activated_at": datetime|None
+        }
+        """
+        # total earned from this referred user across all earning statuses
+        q = (
+            select(
+                Referral.referred_tg_id,
+                Referral.status,
+                Referral.activated_at,
+                func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("earned_rub"),
+            )
+            .outerjoin(
+                ReferralEarning,
+                (ReferralEarning.referred_tg_id == Referral.referred_tg_id)
+                & (ReferralEarning.referrer_tg_id == Referral.referrer_tg_id),
+            )
+            .where(Referral.referrer_tg_id == int(tg_id))
+            .group_by(Referral.referred_tg_id, Referral.status, Referral.activated_at)
+            .order_by(Referral.activated_at.desc().nullslast(), Referral.id.desc())
+            .limit(int(limit))
+        )
+
+        rows = (await session.execute(q)).all()
+        return [
+            {
+                "referred_tg_id": int(r[0]),
+                "status": str(r[1] or "active"),
+                "activated_at": r[2],
+                "earned_rub": int(r[3] or 0),
+            }
+            for r in rows
+        ]
+
     # -------------------------
     # code creation / click attach
     # -------------------------
