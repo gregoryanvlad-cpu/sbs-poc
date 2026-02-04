@@ -33,6 +33,7 @@ from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription
 from app.services.vpn.service import vpn_service
+from app.services.referrals.service import referral_service
 
 router = Router()
 
@@ -98,6 +99,9 @@ async def on_nav(cb: CallbackQuery) -> None:
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
+            ref_code = await referral_service.ensure_ref_code(session, cb.from_user.id)
+            active_refs = await referral_service.count_active_referrals(session, cb.from_user.id)
+            bal_av, bal_pend, bal_paid = await referral_service.get_balances(session, tg_id=cb.from_user.id)
 
             q = (
                 select(Payment)
@@ -131,6 +135,10 @@ async def on_nav(cb: CallbackQuery) -> None:
             f"{y_text}\n\n"
             "🧾 <b>Последние оплаты</b>\n"
             f"{pay_text}"
+            "\n\n👥 <b>Рефералы</b>\n"
+            f"— Активных: <b>{active_refs}</b>\n"
+            f"— Баланс: <b>{bal_av} ₽</b> (ожидание {bal_pend} ₽)\n"
+            "— Реферал засчитывается после первой оплаты другом.\n"
         )
         try:
             await cb.message.edit_text(
@@ -138,6 +146,51 @@ async def on_nav(cb: CallbackQuery) -> None:
                 reply_markup=kb_cabinet(is_owner=is_owner(cb.from_user.id)),
                 parse_mode="HTML",
             )
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    if where == "referrals":
+        async with session_scope() as session:
+            user = await session.get(User, cb.from_user.id)
+            if not user:
+                user = await ensure_user(session, cb.from_user.id)
+                await session.commit()
+            code = await referral_service.ensure_ref_code(session, user)
+
+            active_cnt = await referral_service.count_active_referrals(session, cb.from_user.id)
+            pending_sum, avail_sum = await referral_service.get_balance(session, cb.from_user.id)
+            pct = await referral_service.current_percent(session, cb.from_user.id)
+
+            # bot username (optional)
+            bot_username = getattr(settings, "bot_username", None)
+            deep_link = (
+                f"https://t.me/{bot_username}?start=ref_{code}"
+                if bot_username
+                else f"/start ref_{code}"
+            )
+
+            text = (
+                "👥 <b>Реферальная программа</b>\n\n"
+                "Реферал засчитывается <b>после первой оплаты</b> вашим другом.\n\n"
+                f"Ваша ссылка:\n<code>{deep_link}</code>\n\n"
+                f"Активных рефералов: <b>{active_cnt}</b>\n"
+                f"Ваш текущий уровень: <b>{pct}%</b>\n\n"
+                f"Баланс (ожидает): <b>{pending_sum} ₽</b>\n"
+                f"Баланс (доступно): <b>{avail_sum} ₽</b>\n\n"
+                f"Минимум на вывод: <b>{int(getattr(settings, 'referral_min_payout_rub', 50) or 50)} ₽</b>"
+            )
+
+        buttons = []
+        if bot_username:
+            buttons.append([InlineKeyboardButton(text="📣 Поделиться ссылкой", url=f"https://t.me/share/url?url={deep_link}")])
+        buttons.append([InlineKeyboardButton(text="💸 Вывести", callback_data="ref:withdraw")])
+        buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:cabinet")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        try:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception:
             pass
         await cb.answer()
@@ -171,31 +224,24 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        # UX: таймер и плашка, завязанная на окончание подписки НА СЕРВИС.
-        d_left = days_left(sub.end_at)
-        timer_line = f"⏳ Доступ закончится через <b>{d_left}</b> дн." if d_left > 0 else "⏳ Доступ закончился."
-        tomorrow_banner = "\n\n🟨 <b>Завтра будет выдана новая ссылка на семью</b>" if d_left == 1 else ""
-
         buttons: list[list[InlineKeyboardButton]] = []
 
-        # Если ссылка уже есть — показываем открыть + копировать.
+        # Если ссылка уже есть — показываем кнопку открыть.
         if ym and ym.invite_link:
             buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
-            buttons.append([InlineKeyboardButton(text="📋 Скопировать приглашение", callback_data="yandex:copy")])
+            # Главное — ссылка всегда доступна здесь.
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
-                f"{timer_line}{tomorrow_banner}\n\n"
-                "✅ Приглашение доступно по кнопке ниже.\n\n"
+                "✅ Приглашение уже выдано и доступно по кнопке ниже.\n\n"
                 f"Семья: <code>{getattr(ym, 'account_label', '—') or '—'}</code>\n"
                 f"Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n\n"
-                "Если ты не успел перейти — просто открой или скопируй приглашение отсюда."
+                "Если ты не успел перейти — просто открой приглашение отсюда."
             )
         else:
             # Ссылки ещё не было — выдаём по кнопке.
             buttons.append([InlineKeyboardButton(text="Получить приглашение", callback_data="yandex:issue")])
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
-                f"{timer_line}{tomorrow_banner}\n\n"
                 "Нажми кнопку ниже — я выдам тебе приглашение в семейную подписку.\n"
                 "После выдачи ссылка останется в этом разделе."
             )
@@ -255,6 +301,16 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
             months=settings.period_months,
             days_legacy=settings.period_days,
         )
+
+        # process referral earnings (first payment activates referral)
+        pay = await session.scalar(
+            select(Payment)
+            .where(Payment.tg_id == tg_id)
+            .order_by(Payment.id.desc())
+            .limit(1)
+        )
+        if pay:
+            await referral_service.on_successful_payment(session, pay)
 
         sub.end_at = new_end
         sub.is_active = True
