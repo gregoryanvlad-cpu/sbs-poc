@@ -7,7 +7,7 @@ from typing import Optional
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
@@ -110,15 +110,14 @@ async def _vpn_is_enabled(session, tg_id: int) -> bool:
 # ==========================
 
 class AdminYandexFSM(StatesGroup):
-    waiting_label = State()        # add: label
-    waiting_plus_end = State()     # add: plus_end_at
-    waiting_links = State()        # add: 3 links
+    waiting_label = State()          # add: label
+    waiting_plus_end = State()       # add: plus_end_at
+    waiting_links = State()          # add: 3 links
 
-    edit_waiting_label = State()   # edit: which account label
+    edit_waiting_label = State()     # edit: which account label
     edit_waiting_plus_end = State()  # edit: new date or skip
-    edit_waiting_links = State()   # edit: new links (optional)
+    edit_waiting_links = State()     # edit: new links (optional)
 
-    # misc admin ops (used elsewhere in this file)
     kick_waiting_tg_id = State()
     reset_waiting_tg_id = State()
 
@@ -155,7 +154,6 @@ async def admin_menu(cb: CallbackQuery) -> None:
 # ==========================
 # TEST: MINT REFERRAL BALANCE
 # ==========================
-
 
 @router.callback_query(lambda c: c.data == "admin:ref:mint")
 async def admin_ref_mint(cb: CallbackQuery, state: FSMContext) -> None:
@@ -244,7 +242,6 @@ async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
     dummy_referred = int(f"9{target}") if len(str(target)) < 9 else target + 9_000_000_000
 
     async with session_scope() as session:
-        # Create a dummy successful payment (no gateway), used as a stable anchor for earnings.
         pay = Payment(
             tg_id=dummy_referred,
             amount=amount,
@@ -256,7 +253,6 @@ async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
         session.add(pay)
         await session.flush()
 
-        # Ensure a Referral row exists so cabinet shows a referral entry too.
         ref = await session.scalar(select(Referral).where(Referral.referred_tg_id == dummy_referred).limit(1))
         if not ref:
             ref = Referral(
@@ -269,9 +265,6 @@ async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
             session.add(ref)
             await session.flush()
 
-        hold_days = int(getattr(settings, "referral_hold_days", 7) or 7)
-        available_at = (now + timedelta(days=hold_days)) if status == "pending" else None
-
         e = ReferralEarning(
             referrer_tg_id=target,
             referred_tg_id=dummy_referred,
@@ -280,7 +273,7 @@ async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
             percent=100,
             earned_rub=amount,
             status=status,
-            available_at=available_at,
+            available_at=(now + timedelta(days=7)) if status == "pending" else None,
             paid_at=now if status == "paid" else None,
         )
         session.add(e)
@@ -310,8 +303,6 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
     now = utcnow()
 
     async with session_scope() as session:
-        # Берём всех, у кого coverage_end_at уже наступил, и админ ещё не отметил removed_at.
-        # Если юзер продлил подписку — coverage_end_at уже будет сдвинут (ротацией/логикой сервиса).
         q = (
             select(YandexMembership, Subscription)
             .join(Subscription, Subscription.tg_id == YandexMembership.tg_id, isouter=True)
@@ -338,7 +329,6 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             vpn_on = await _vpn_is_enabled(session, int(m.tg_id))
             sub_end = getattr(sub, "end_at", None) if sub else None
 
-            # "Продлевалась": если текущий end_at подписки сервиса > coverage_end_at записи
             renewed = False
             if sub_end and m.coverage_end_at:
                 try:
@@ -417,7 +407,6 @@ async def admin_kick_mark_tg_id(message: Message, state: FSMContext) -> None:
         await session.commit()
 
         vpn_on = await _vpn_is_enabled(session, tg_id)
-
         fam_label = m.account_label or "—"
         slot_idx = m.slot_index or "—"
 
@@ -478,7 +467,6 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
     tg_id = int(raw)
     now = utcnow()
 
-    # best-effort: если User модели нет — просто пропускаем
     UserModel = None
     try:
         from app.db.models import User  # type: ignore
@@ -489,13 +477,9 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
     y_info = {"label": "—", "slot": "—"}
 
     async with session_scope() as session:
-        # 1) VPN: деактивируем все peer'ы пользователя (best-effort)
+        # 1) VPN: deactivate all peers
         try:
-            peers = (
-                await session.scalars(
-                    select(VpnPeer).where(VpnPeer.tg_id == tg_id).order_by(VpnPeer.id.desc())
-                )
-            ).all()
+            peers = (await session.scalars(select(VpnPeer).where(VpnPeer.tg_id == tg_id))).all()
             for p in peers:
                 try:
                     p.is_active = False
@@ -508,7 +492,7 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
 
-        # 2) Subscription: завершаем (best-effort)
+        # 2) Subscription: expire now
         try:
             sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
             if sub:
@@ -527,7 +511,7 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
 
-        # 3) YandexMembership: помечаем removed (best-effort)
+        # 3) YandexMembership: mark removed
         try:
             m = await session.scalar(
                 select(YandexMembership)
@@ -538,7 +522,6 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
             if m:
                 y_info["label"] = getattr(m, "account_label", None) or "—"
                 y_info["slot"] = str(getattr(m, "slot_index", None) or "—")
-
                 try:
                     m.status = "removed"
                 except Exception:
@@ -554,7 +537,7 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
 
-        # 4) User: чистим flow_state/flow_data (best-effort)
+        # 4) User: clear flows
         if UserModel is not None:
             try:
                 u = await session.get(UserModel, tg_id)
@@ -570,7 +553,6 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
         await session.commit()
 
     await state.clear()
-
     await message.answer(
         "✅ <b>Сброс выполнен</b>\n\n"
         f"TG ID: <code>{tg_id}</code>\n"
@@ -583,7 +565,7 @@ async def admin_reset_user_tg_id(message: Message, state: FSMContext) -> None:
 
 
 # ==========================
-# Legacy strikes button — now stub (чтобы не зависало)
+# Legacy strikes button — stub
 # ==========================
 
 @router.callback_query(lambda c: c.data == "admin:forgive:user")
@@ -595,7 +577,7 @@ async def admin_forgive_stub(cb: CallbackQuery) -> None:
 
 
 # =========================================================
-# ADD ACCOUNT (step-by-step): label -> plus_end_at -> 3 links
+# ADD ACCOUNT (label -> plus_end_at -> 3 links)
 # =========================================================
 
 @router.callback_query(lambda c: c.data == "admin:yandex:add")
@@ -677,7 +659,7 @@ async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> 
             acc = YandexAccount(
                 label=label,
                 status="active",
-                max_slots=4,  # legacy field, keep
+                max_slots=4,
                 used_slots=0,
             )
             session.add(acc)
@@ -733,7 +715,6 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
             await message.answer("❌ Аккаунт не найден. Начни добавление заново.", reply_markup=kb_admin_menu())
             return
 
-        # Upsert 3 slots. IMPORTANT: do not overwrite issued/burned (S1).
         for idx, link in enumerate(lines, start=1):
             slot = await session.scalar(
                 select(YandexInviteSlot)
@@ -755,7 +736,6 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
         await session.commit()
 
     await state.clear()
-
     await message.answer(
         "✅ <b>Готово!</b>\n\n"
         f"Аккаунт: <code>{label}</code>\n"
@@ -957,7 +937,6 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
                 .limit(1)
             )
             if not slot:
-                # create missing slots as free
                 slot = YandexInviteSlot(
                     yandex_account_id=acc.id,
                     slot_index=idx,
@@ -988,7 +967,6 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
 # PAYOUT REQUESTS (manual processing)
 # ==========================
 
-
 @router.callback_query(lambda c: c.data == "admin:payouts:list")
 async def admin_payouts_list(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
@@ -1013,15 +991,15 @@ async def admin_payouts_list(cb: CallbackQuery) -> None:
 
     lines = ["💸 <b>Заявки на вывод (последние)</b>\n"]
     kb_rows: list[list[InlineKeyboardButton]] = []
+
     for r in reqs:
-        lines.append(
-            f"#{r.id} | tg: <code>{r.tg_id}</code> | {r.amount_rub}₽ | <b>{r.status}</b>"
-        )
+        lines.append(f"#{r.id} | tg: <code>{r.tg_id}</code> | {r.amount_rub}₽ | <b>{r.status}</b>")
         if r.status in ("created", "approved"):
             kb_rows.append([
                 InlineKeyboardButton(text=f"✅ Approve #{r.id}", callback_data=f"admin:payouts:approve:{r.id}"),
                 InlineKeyboardButton(text=f"💰 Paid #{r.id}", callback_data=f"admin:payouts:paid:{r.id}"),
             ])
+
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
@@ -1034,6 +1012,7 @@ async def admin_payouts_approve(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
+
     req_id = int(cb.data.split(":")[-1])
     async with session_scope() as session:
         req = await session.get(PayoutRequest, req_id)
@@ -1045,6 +1024,7 @@ async def admin_payouts_approve(cb: CallbackQuery) -> None:
             return
         req.status = "approved"
         await session.commit()
+
     await cb.answer("✅ Approved")
 
 
@@ -1053,6 +1033,7 @@ async def admin_payouts_paid(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
+
     req_id = int(cb.data.split(":")[-1])
     async with session_scope() as session:
         req = await session.get(PayoutRequest, req_id)
@@ -1062,6 +1043,9 @@ async def admin_payouts_paid(cb: CallbackQuery) -> None:
         if req.status not in ("created", "approved"):
             await cb.answer("Нельзя отметить оплаченным", show_alert=True)
             return
-        await referral_service.mark_payout_paid(session, payout_request_id=req_id)
+
+        # ✅ FIX: правильный аргумент
+        await referral_service.mark_payout_paid(session, request_id=req_id)
         await session.commit()
+
     await cb.answer("💰 Marked as paid")
