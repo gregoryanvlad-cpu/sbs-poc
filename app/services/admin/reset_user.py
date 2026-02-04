@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from app.db.session import session_scope
 from app.db.models.user import User
 from app.db.models.subscription import Subscription
 from app.db.models.payment import Payment
 from app.db.models.vpn_peer import VpnPeer
+from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 
 log = logging.getLogger(__name__)
@@ -27,8 +28,19 @@ class AdminResetUserService:
     async def reset_user(self, *, tg_id: int) -> None:
         async with session_scope() as session:
             # 1) удаляем yandex_membership по tg_id (ВАЖНО: НЕ user_id)
+            await session.execute(delete(YandexMembership).where(YandexMembership.tg_id == tg_id))
+
+            # 1.1) В ручном режиме слоты не переиспользуются (S1), но после "reset" мы должны
+            # убрать привязку слота к пользователю, чтобы в ЛК больше не отображались "семья/слот".
+            # Сам слот остаётся issued/burned (мы его не возвращаем в free).
             await session.execute(
-                delete(YandexMembership).where(YandexMembership.tg_id == tg_id)
+                update(YandexInviteSlot)
+                .where(YandexInviteSlot.issued_to_tg_id == tg_id)
+                .values(
+                    issued_to_tg_id=None,
+                    issued_at=None,
+                    service_end_at=None,
+                )
             )
 
             # 2) удаляем vpn peers
