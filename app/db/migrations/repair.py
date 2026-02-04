@@ -1,174 +1,144 @@
-"""Small idempotent schema repair run at boot.
-
-We use this as a safety net in case the database was previously *stamped* to a
-new alembic revision without executing the DDL. In that case the DB can be
-missing columns expected by the application and the bot crashes.
-
-This module is safe to run multiple times.
-"""
-
 from __future__ import annotations
 
-import os
-
-from sqlalchemy import create_engine, inspect, text
-
-
-def _get_sync_db_url() -> str | None:
-    raw = (os.getenv("DATABASE_URL") or "").strip()
-    if not raw:
-        return None
-    if raw.startswith("postgres://"):
-        raw = "postgresql://" + raw[len("postgres://") :]
-    if raw.startswith("postgresql+asyncpg://"):
-        raw = "postgresql://" + raw[len("postgresql+asyncpg://") :]
-    return raw
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
-def ensure_yandex_membership_notification_columns() -> None:
-    """Ensure notification tracking columns exist on yandex_memberships."""
-    url = _get_sync_db_url()
-    if not url:
-        return
+async def ensure_referrals_schema(session: AsyncSession) -> None:
+    """Idempotent schema repair for referral tables.
 
-    engine = create_engine(url, future=True)
-    insp = inspect(engine)
+    Why this exists:
+    - project sometimes relies on "repair" (not Alembic) on startup
+    - older repair created referral_earnings.amount_rub (wrong)
+    - current code expects referral_earnings.payment_amount_rub
 
-    try:
-        cols = {c["name"] for c in insp.get_columns("yandex_memberships")}
-    except Exception:
-        return
+    This function:
+    1) Creates tables if missing (with current columns)
+    2) If referral_earnings exists but has old schema, heals it
+    3) Ensures indexes exist
 
-    wanted = {
-        "notified_7d_at": "TIMESTAMPTZ",
-        "notified_3d_at": "TIMESTAMPTZ",
-        "notified_1d_at": "TIMESTAMPTZ",
-        "removed_at": "TIMESTAMPTZ",
-    }
-
-    missing = [name for name in wanted.keys() if name not in cols]
-    if not missing:
-        return
-
-    with engine.begin() as conn:
-        for name in missing:
-            conn.execute(
-                text(f'ALTER TABLE yandex_memberships ADD COLUMN IF NOT EXISTS "{name}" {wanted[name]}')
-            )
-
-
-def ensure_job_state_table() -> None:
-    """Ensure small key/value table used by scheduler to de-duplicate daily jobs.
-
-    The scheduler reads/writes this table best-effort. Without it, the bot still works,
-    but the daily admin report can be sent more than once.
+    Safe to run on every startup.
     """
-    url = _get_sync_db_url()
-    if not url:
-        return
 
-    engine = create_engine(url, future=True)
-
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS job_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMPTZ DEFAULT now()
-                )
-                """
+    async def _table_exists(name: str) -> bool:
+        q = text(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema='public' AND table_name=:name
             )
+            """
         )
+        return bool((await session.execute(q, {"name": name})).scalar())
 
-
-def ensure_referrals_schema() -> None:
-    """Best-effort schema fixer for referrals.
-
-    This runs on startup in some deployments where alembic migrations may not
-    have been applied yet.
-    """
-    url = os.getenv("DATABASE_URL") or os.getenv("RAILWAY_DATABASE_URL")
-    if not url:
-        return
-
-    engine = create_engine(url, future=True)
-
-    with engine.begin() as conn:
-        # users columns
-        try:
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code VARCHAR(32)"))
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_tg_id BIGINT"))
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_at TIMESTAMPTZ"))
-        except Exception:
-            pass
-
-        # referrals
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS referrals (
-                    id SERIAL PRIMARY KEY,
-                    referrer_tg_id BIGINT NOT NULL,
-                    referred_tg_id BIGINT NOT NULL UNIQUE,
-                    first_payment_id INTEGER,
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    activated_at TIMESTAMPTZ
-                )
-                """
+    async def _column_exists(table: str, col: str) -> bool:
+        q = text(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name=:t AND column_name=:c
             )
+            """
         )
+        return bool((await session.execute(q, {"t": table, "c": col})).scalar())
 
-        # payout requests
-        conn.execute(
+    # ---------- referrals ----------
+    if not await _table_exists("referrals"):
+        await session.execute(
             text(
                 """
-                CREATE TABLE IF NOT EXISTS payout_requests (
-                    id SERIAL PRIMARY KEY,
-                    tg_id BIGINT NOT NULL,
-                    amount_rub INTEGER NOT NULL,
-                    requisites TEXT,
-                    status VARCHAR(16) DEFAULT 'created',
-                    note TEXT,
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    processed_at TIMESTAMPTZ
-                )
-                """
-            )
-        )
-
-        # referral earnings
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS referral_earnings (
+                CREATE TABLE referrals (
                     id SERIAL PRIMARY KEY,
                     referrer_tg_id BIGINT NOT NULL,
                     referred_tg_id BIGINT NOT NULL,
-                    payment_id INTEGER NOT NULL,
-                    amount_rub INTEGER NOT NULL,
-                    percent INTEGER NOT NULL,
-                    earned_rub INTEGER NOT NULL,
-                    status VARCHAR(16) DEFAULT 'pending',
-                    available_at TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ DEFAULT now(),
-                    paid_at TIMESTAMPTZ,
-                    payout_request_id INTEGER
-                )
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    activated_at TIMESTAMPTZ NULL,
+                    UNIQUE (referred_tg_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_referrals_referrer ON referrals(referrer_tg_id);
+                CREATE INDEX IF NOT EXISTS ix_referrals_referred ON referrals(referred_tg_id);
                 """
             )
         )
 
+    # ---------- referral_earnings ----------
+    if not await _table_exists("referral_earnings"):
+        await session.execute(
+            text(
+                """
+                CREATE TABLE referral_earnings (
+                    id SERIAL PRIMARY KEY,
+                    referrer_tg_id BIGINT NOT NULL,
+                    referred_tg_id BIGINT NOT NULL,
+                    payment_id BIGINT NULL,
+                    payment_amount_rub INTEGER NOT NULL DEFAULT 0,
+                    percent INTEGER NOT NULL DEFAULT 0,
+                    amount_rub INTEGER NOT NULL DEFAULT 0,
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    hold_until TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS ix_referral_earnings_referrer ON referral_earnings(referrer_tg_id);
+                CREATE INDEX IF NOT EXISTS ix_referral_earnings_referred ON referral_earnings(referred_tg_id);
+                CREATE INDEX IF NOT EXISTS ix_referral_earnings_status ON referral_earnings(status);
+                """
+            )
+        )
+    else:
+        # heal old schema: add payment_amount_rub if missing
+        has_payment_amount = await _column_exists("referral_earnings", "payment_amount_rub")
+        if not has_payment_amount:
+            await session.execute(
+                text("ALTER TABLE referral_earnings ADD COLUMN IF NOT EXISTS payment_amount_rub INTEGER NULL")
+            )
 
-def main() -> None:
-    try:
-        ensure_yandex_membership_notification_columns()
-        ensure_job_state_table()
-        ensure_referrals_schema()
-    except Exception:
-        return
+            # If old column exists, copy. In old repair the column amount_rub was effectively "payment amount".
+            if await _column_exists("referral_earnings", "amount_rub"):
+                await session.execute(
+                    text(
+                        """
+                        UPDATE referral_earnings
+                        SET payment_amount_rub = COALESCE(payment_amount_rub, amount_rub)
+                        WHERE payment_amount_rub IS NULL;
+                        """
+                    )
+                )
 
+            await session.execute(text("ALTER TABLE referral_earnings ALTER COLUMN payment_amount_rub SET DEFAULT 0"))
+            await session.execute(text("UPDATE referral_earnings SET payment_amount_rub = 0 WHERE payment_amount_rub IS NULL"))
+            await session.execute(text("ALTER TABLE referral_earnings ALTER COLUMN payment_amount_rub SET NOT NULL"))
 
-if __name__ == "__main__":
-    main()
+        # indexes (safe)
+        await session.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_earnings_referrer ON referral_earnings(referrer_tg_id)"))
+        await session.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_earnings_referred ON referral_earnings(referred_tg_id)"))
+        await session.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_earnings_status ON referral_earnings(status)"))
+
+    # ---------- payout_requests ----------
+    if not await _table_exists("payout_requests"):
+        await session.execute(
+            text(
+                """
+                CREATE TABLE payout_requests (
+                    id SERIAL PRIMARY KEY,
+                    tg_id BIGINT NOT NULL,
+                    amount_rub INTEGER NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    payout_method VARCHAR(64) NULL,
+                    payout_details TEXT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    decided_at TIMESTAMPTZ NULL,
+                    decided_by_tg_id BIGINT NULL,
+                    admin_comment TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_payout_requests_tg_id ON payout_requests(tg_id);
+                CREATE INDEX IF NOT EXISTS ix_payout_requests_status ON payout_requests(status);
+                """
+            )
+        )
+    else:
+        await session.execute(text("CREATE INDEX IF NOT EXISTS ix_payout_requests_tg_id ON payout_requests(tg_id)"))
+        await session.execute(text("CREATE INDEX IF NOT EXISTS ix_payout_requests_status ON payout_requests(status)"))
+
+    await session.commit()
