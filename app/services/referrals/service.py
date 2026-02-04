@@ -62,6 +62,26 @@ class ReferralService:
         )
         return int(pending or 0), int(available or 0)
 
+    async def get_balances(self, session, tg_id: int) -> tuple[int, int, int]:
+        """Returns (available_sum, pending_sum, paid_sum) in RUB integers.
+
+        Used by the cabinet UI to show:
+        - available: can be withdrawn
+        - pending: hold/antifraud period
+        - paid: already paid out
+        """
+
+        pending, available = await self.get_balance(session, tg_id)
+
+        paid = await session.scalar(
+            select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(
+                ReferralEarning.referrer_tg_id == tg_id,
+                ReferralEarning.status == "paid",
+            )
+        )
+
+        return int(available or 0), int(pending or 0), int(paid or 0)
+
     async def available_balance(self, session, *, tg_id: int) -> Decimal:
         """Used by withdrawals flow (returns Decimal for comparisons)."""
         _, avail = await self.get_balance(session, tg_id)
