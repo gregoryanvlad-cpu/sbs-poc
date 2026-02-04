@@ -35,6 +35,15 @@ async def ensure_user(session: AsyncSession, tg_id: int) -> User:
         session.add(sub)
         await session.flush()
 
+    # Ensure the user has a referral code
+    try:
+        from app.services.referrals.service import referral_service
+
+        await referral_service.ensure_ref_code(session, tg_id)
+    except Exception:
+        # best-effort
+        pass
+
     return user
 
 
