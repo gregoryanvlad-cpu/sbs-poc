@@ -70,12 +70,11 @@ class ReferralService:
         - pending: hold/antifraud period
         - paid: already paid out
         """
-
         pending, available = await self.get_balance(session, tg_id)
 
         paid = await session.scalar(
             select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(
-                ReferralEarning.referrer_tg_id == tg_id,
+                ReferralEarning.referrer_tg_id == int(tg_id),
                 ReferralEarning.status == "paid",
             )
         )
@@ -86,6 +85,22 @@ class ReferralService:
         """Used by withdrawals flow (returns Decimal for comparisons)."""
         _, avail = await self.get_balance(session, tg_id)
         return Decimal(int(avail))
+
+    async def get_inviter_tg_id(self, session, *, tg_id: int) -> int | None:
+        """
+        Returns inviter TG id for a given user (who invited this user).
+        If nobody invited (came organically) -> None.
+
+        Important: since you count referrals only after FIRST payment,
+        we consider "inviter" to be the active Referral row, not just click.
+        """
+        inviter = await session.scalar(
+            select(Referral.referrer_tg_id).where(
+                Referral.referred_tg_id == int(tg_id),
+                Referral.status == "active",
+            ).limit(1)
+        )
+        return int(inviter) if inviter is not None else None
 
     # -------------------------
     # code creation / click attach
