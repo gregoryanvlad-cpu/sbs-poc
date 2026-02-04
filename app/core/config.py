@@ -23,6 +23,7 @@ def make_async_db_url(url: str) -> str:
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
+    bot_username: str | None
     database_url: str
     scheduler_enabled: bool
     auto_delete_seconds: int
@@ -55,6 +56,10 @@ class Settings:
     # where to store Playwright storage_state json files
     yandex_cookies_dir: str = "/data/yandex"
 
+    # Referrals
+    referral_hold_days: int = 7
+    referral_min_payout_rub: int = 50
+
 
 def _load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
@@ -72,6 +77,7 @@ def _load_settings() -> Settings:
 
     return Settings(
         bot_token=bot_token,
+        bot_username=(os.getenv("BOT_USERNAME") or "").strip() or None,
         database_url=make_async_db_url(database_url_raw),
         scheduler_enabled=_env_bool("SCHEDULER_ENABLED", True),
         auto_delete_seconds=int(os.getenv("AUTO_DELETE_SECONDS", "60")),
@@ -90,6 +96,10 @@ def _load_settings() -> Settings:
         yandex_max_strikes=int(os.getenv("YANDEX_MAX_STRIKES", "2")),
         yandex_provider=os.getenv("YANDEX_PROVIDER", "mock").strip().lower(),
         yandex_cookies_dir=os.getenv("YANDEX_COOKIES_DIR", "/data/yandex").strip(),
+
+        # Referrals
+        referral_hold_days=int(os.getenv("REFERRAL_HOLD_DAYS", "7")),
+        referral_min_payout_rub=int(os.getenv("REFERRAL_MIN_PAYOUT_RUB", "50")),
     )
 
 
