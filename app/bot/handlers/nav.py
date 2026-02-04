@@ -102,6 +102,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             ref_code = await referral_service.ensure_ref_code(session, cb.from_user.id)
             active_refs = await referral_service.count_active_referrals(session, cb.from_user.id)
             bal_av, bal_pend, bal_paid = await referral_service.get_balances(session, tg_id=cb.from_user.id)
+            inviter_id = await referral_service.get_inviter_tg_id(session, tg_id=cb.from_user.id)
 
             q = (
                 select(Payment)
@@ -114,6 +115,10 @@ async def on_nav(cb: CallbackQuery) -> None:
 
         pay_lines = [f"• {p.amount} {p.currency} / {p.provider} / {p.status}" for p in payments]
         pay_text = "\n".join(pay_lines) if pay_lines else "• оплат пока нет"
+
+        inviter_line = (
+            f"— Вас пригласил: <code>{inviter_id}</code>\n" if inviter_id else "— Вы пришли: <b>самостоятельно</b>\n"
+        )
 
         # Новый статус Yandex: без логинов, показываем семью/слот/наличие ссылки.
         if ym and ym.invite_link:
@@ -136,6 +141,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             "🧾 <b>Последние оплаты</b>\n"
             f"{pay_text}"
             "\n\n👥 <b>Рефералы</b>\n"
+            f"{inviter_line}"
             f"— Активных: <b>{active_refs}</b>\n"
             f"— Баланс: <b>{bal_av} ₽</b> (ожидание {bal_pend} ₽)\n"
             "— Реферал засчитывается после первой оплаты другом.\n"
@@ -162,6 +168,8 @@ async def on_nav(cb: CallbackQuery) -> None:
             active_cnt = await referral_service.count_active_referrals(session, cb.from_user.id)
             pending_sum, avail_sum = await referral_service.get_balance(session, cb.from_user.id)
             pct = await referral_service.current_percent(session, cb.from_user.id)
+            inviter_id = await referral_service.get_inviter_tg_id(session, tg_id=cb.from_user.id)
+            refs = await referral_service.list_referrals_summary(session, tg_id=cb.from_user.id, limit=15)
 
             # bot username (optional)
             bot_username = getattr(settings, "bot_username", None)
@@ -171,15 +179,33 @@ async def on_nav(cb: CallbackQuery) -> None:
                 else f"/start ref_{code}"
             )
 
+            inviter_line = (
+                f"— Вас пригласил: <code>{inviter_id}</code>\n\n" if inviter_id else "— Вы пришли: <b>самостоятельно</b>\n\n"
+            )
+
+            refs_lines = []
+            for r in refs:
+                dt = r.get("activated_at")
+                dt_s = fmt_dt(dt) if dt else "—"
+                refs_lines.append(
+                    f"• <code>{r['referred_tg_id']}</code> — всего <b>{r['total']} ₽</b> "
+                    f"(доступно {r['available']} / ожид. {r['pending']} / выплач. {r['paid']}) — активирован {dt_s}"
+                )
+
+            refs_block = "\n".join(refs_lines) if refs_lines else "— Пока нет активных рефералов (засчитаются после первой оплаты)"
+
             text = (
                 "👥 <b>Реферальная программа</b>\n\n"
-                "Реферал засчитывается <b>после первой оплаты</b> вашим другом.\n\n"
-                f"Ваша ссылка:\n<code>{deep_link}</code>\n\n"
-                f"Активных рефералов: <b>{active_cnt}</b>\n"
-                f"Ваш текущий уровень: <b>{pct}%</b>\n\n"
-                f"Баланс (ожидает): <b>{pending_sum} ₽</b>\n"
-                f"Баланс (доступно): <b>{avail_sum} ₽</b>\n\n"
-                f"Минимум на вывод: <b>{int(getattr(settings, 'referral_min_payout_rub', 50) or 50)} ₽</b>"
+                "Реферал засчитывается <b>после первой оплаты</b> вашим другом.\n"
+                + inviter_line
+                + f"Ваша ссылка:\n<code>{deep_link}</code>\n\n"
+                + f"Активных рефералов: <b>{active_cnt}</b>\n"
+                + f"Ваш текущий уровень: <b>{pct}%</b>\n\n"
+                + f"Баланс (ожидает): <b>{pending_sum} ₽</b>\n"
+                + f"Баланс (доступно): <b>{avail_sum} ₽</b>\n"
+                + f"Минимум на вывод: <b>{int(getattr(settings, 'referral_min_payout_rub', 50) or 50)} ₽</b>\n\n"
+                + "<b>Ваши активные рефералы</b>\n"
+                + refs_block
             )
 
         buttons = []
