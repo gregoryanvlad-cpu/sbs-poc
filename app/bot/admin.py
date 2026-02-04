@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from aiogram import Router
@@ -18,6 +18,9 @@ from app.db.models.vpn_peer import VpnPeer
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.payout_request import PayoutRequest
+from app.db.models.payment import Payment
+from app.db.models.referral_earning import ReferralEarning
+from app.db.models.referral import Referral
 from app.services.referrals.service import referral_service
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
@@ -115,8 +118,15 @@ class AdminYandexFSM(StatesGroup):
     edit_waiting_plus_end = State()  # edit: new date or skip
     edit_waiting_links = State()   # edit: new links (optional)
 
-    kick_waiting_tg_id = State()   # mark removal: tg_id input
-    reset_waiting_tg_id = State()  # reset user: tg_id input
+    # misc admin ops (used elsewhere in this file)
+    kick_waiting_tg_id = State()
+    reset_waiting_tg_id = State()
+
+
+class AdminReferralMintFSM(StatesGroup):
+    waiting_target_tg_id = State()
+    waiting_amount = State()
+    waiting_status = State()  # available / pending / paid
 
 
 # ==========================
@@ -140,6 +150,152 @@ async def admin_menu(cb: CallbackQuery) -> None:
         parse_mode="HTML",
     )
     await cb.answer()
+
+
+# ==========================
+# TEST: MINT REFERRAL BALANCE
+# ==========================
+
+
+@router.callback_query(lambda c: c.data == "admin:ref:mint")
+async def admin_ref_mint(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.clear()
+    await state.set_state(AdminReferralMintFSM.waiting_target_tg_id)
+    await cb.message.edit_text(
+        "💰 <b>Накрутка реф-баланса (TEST)</b>\n\n"
+        "Отправь TG ID получателя.\n"
+        "Или отправь <code>-</code>, чтобы накрутить себе.",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+    await cb.answer()
+
+
+@router.message(AdminReferralMintFSM.waiting_target_tg_id)
+async def admin_ref_mint_target(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    txt = (message.text or "").strip()
+    if txt == "-":
+        target = int(message.from_user.id)
+    else:
+        try:
+            target = int(txt)
+        except Exception:
+            await message.answer("❌ Нужно число (TG ID) или <code>-</code>.", parse_mode="HTML", reply_markup=kb_admin_menu())
+            return
+
+    await state.update_data(target_tg_id=target)
+    await state.set_state(AdminReferralMintFSM.waiting_amount)
+    await message.answer(
+        "💸 Введи сумму в рублях (целое число).\n"
+        "Пример: <code>150</code>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+@router.message(AdminReferralMintFSM.waiting_amount)
+async def admin_ref_mint_amount(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    try:
+        amount = int((message.text or "").strip())
+    except Exception:
+        amount = 0
+
+    if amount <= 0 or amount > 1_000_000:
+        await message.answer("❌ Сумма должна быть > 0 и адекватной.", reply_markup=kb_admin_menu())
+        return
+
+    await state.update_data(amount_rub=amount)
+    await state.set_state(AdminReferralMintFSM.waiting_status)
+    await message.answer(
+        "🧾 Выбери статус начисления (введи текстом):\n\n"
+        "• <code>available</code> — сразу доступно к выводу\n"
+        "• <code>pending</code> — на холде (как после реальной оплаты)\n"
+        "• <code>paid</code> — сразу отмечено как выплаченное\n",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+@router.message(AdminReferralMintFSM.waiting_status)
+async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    status = (message.text or "").strip().lower()
+    if status not in {"available", "pending", "paid"}:
+        await message.answer("❌ Статус должен быть: available / pending / paid", reply_markup=kb_admin_menu())
+        return
+
+    data = await state.get_data()
+    target = int(data.get("target_tg_id") or message.from_user.id)
+    amount = int(data.get("amount_rub") or 0)
+
+    now = utcnow()
+    dummy_referred = int(f"9{target}") if len(str(target)) < 9 else target + 9_000_000_000
+
+    async with session_scope() as session:
+        # Create a dummy successful payment (no gateway), used as a stable anchor for earnings.
+        pay = Payment(
+            tg_id=dummy_referred,
+            amount=amount,
+            currency="RUB",
+            provider="admin_mint",
+            status="success",
+            created_at=now,
+            paid_at=now,
+        )
+        session.add(pay)
+        await session.flush()
+
+        # Ensure a Referral row exists so cabinet shows a referral entry too.
+        ref = await session.scalar(select(Referral).where(Referral.referred_tg_id == dummy_referred).limit(1))
+        if not ref:
+            ref = Referral(
+                referrer_tg_id=target,
+                referred_tg_id=dummy_referred,
+                status="active",
+                first_payment_id=pay.id,
+                activated_at=now,
+            )
+            session.add(ref)
+            await session.flush()
+
+        hold_days = int(getattr(settings, "referral_hold_days", 7) or 7)
+        available_at = (now + timedelta(days=hold_days)) if status == "pending" else None
+
+        e = ReferralEarning(
+            referrer_tg_id=target,
+            referred_tg_id=dummy_referred,
+            payment_id=pay.id,
+            payment_amount_rub=amount,
+            percent=100,
+            earned_rub=amount,
+            status=status,
+            available_at=available_at,
+            paid_at=now if status == "paid" else None,
+        )
+        session.add(e)
+        await session.commit()
+
+    await state.clear()
+    await message.answer(
+        "✅ Накрутил начисление.\n\n"
+        f"Получатель: <code>{target}</code>\n"
+        f"Сумма: <b>{amount}</b> RUB\n"
+        f"Статус: <code>{status}</code>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
 
 
 # ==========================
