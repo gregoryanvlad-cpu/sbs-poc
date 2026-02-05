@@ -26,6 +26,8 @@ async def run_bot() -> None:
     dp.include_router(yandex_router)
     dp.include_router(referrals_router)
     dp.include_router(admin_router)
+    # Admin kick / mark removed flows
+    dp.include_router(admin_kick_router)
 
     log.info("bot_start")
     await dp.start_polling(bot)
