@@ -18,11 +18,9 @@ def run_bot():
 
     dp = Dispatcher()
 
-    # middlewares
     dp.message.middleware(CorrelationIdMiddleware())
     dp.callback_query.middleware(CorrelationIdMiddleware())
 
-    # routers
     dp.include_router(start.router)
     dp.include_router(nav.router)
     dp.include_router(referrals.router)
