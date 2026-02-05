@@ -88,10 +88,17 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+def kb_back_faq() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="nav:faq")
+    b.adjust(1)
+    return b.as_markup()
 
-def faq_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ℹ️ О сервисе", callback_data="faq_about")],
-        [InlineKeyboardButton(text="📄 Публичная оферта", callback_data="faq_offer")],
-    ])
+
+def kb_faq() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="ℹ️ О сервисе", callback_data="faq:about")
+    b.button(text="📄 Публичная оферта", callback_data="faq:offer")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
