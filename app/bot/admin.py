@@ -7,7 +7,7 @@ from typing import Optional
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
@@ -19,7 +19,7 @@ from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.services.referrals.service import referral_service
+from app.services.referral.service import referral_service
 
 router = Router()
 
@@ -997,3 +997,131 @@ async def admin_payout_actions(cb: CallbackQuery) -> None:
             await cb.answer("✅ rejected")
         else:
             await cb.answer()
+
+# ==========================
+# REFERRAL HOLDS (manual approve)
+# ==========================
+
+@router.callback_query(lambda c: c.data == "admin:ref:holds")
+async def admin_ref_holds(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        # total pending across all users
+        total_pending = await session.scalar(
+            select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(
+                ReferralEarning.status == "pending"
+            )
+        )
+
+        rows = (
+            await session.execute(
+                select(
+                    ReferralEarning.referrer_tg_id.label("tg_id"),
+                    func.count(ReferralEarning.id).label("cnt"),
+                    func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("sum_rub"),
+                )
+                .where(ReferralEarning.status == "pending")
+                .group_by(ReferralEarning.referrer_tg_id)
+                .order_by(func.coalesce(func.sum(ReferralEarning.earned_rub), 0).desc())
+                .limit(20)
+            )
+        ).all()
+
+    lines = [
+        "⏳ <b>Холдовые начисления (рефералка)</b>\n",
+        f"Всего в холде: <b>{int(total_pending or 0)} ₽</b>\n",
+    ]
+
+    if not rows:
+        lines.append("Сейчас холдов нет ✅")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")]]
+        )
+        await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        await cb.answer()
+        return
+
+    lines.append("<b>Топ по сумме (до 20 строк):</b>")
+    buttons = []
+    for r in rows:
+        tg_id = int(r.tg_id)
+        sum_rub = int(r.sum_rub or 0)
+        cnt = int(r.cnt or 0)
+        lines.append(f"• <code>{tg_id}</code> — <b>{sum_rub} ₽</b> (строк: {cnt})")
+        buttons.append([InlineKeyboardButton(text=f"✅ Одобрить {tg_id} ({sum_rub}₽)", callback_data=f"admin:ref:holds:approve:{tg_id}")])
+
+    # approve all
+    buttons.insert(0, [InlineKeyboardButton(text="✅ Одобрить ВСЕ холды", callback_data="admin:ref:holds:approve_all")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:ref:holds:approve_all")
+async def admin_ref_holds_approve_all(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    now = datetime.now(timezone.utc)
+
+    async with session_scope() as session:
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(ReferralEarning.status == "pending")
+            )
+        ).all()
+
+        for e in items:
+            e.status = "available"
+            # ensure it won't be stuck if scheduler expects available_at
+            e.available_at = now
+        await session.commit()
+
+    await cb.answer(f"✅ Одобрено: {len(items)}", show_alert=True)
+    # refresh screen
+    try:
+        cb.data = "admin:ref:holds"
+        await admin_ref_holds(cb)  # type: ignore
+    except Exception:
+        pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin:ref:holds:approve:"))
+async def admin_ref_holds_approve_one(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    tg_id = int(cb.data.split(":")[-1])
+    now = datetime.now(timezone.utc)
+
+    async with session_scope() as session:
+        items = (
+            await session.scalars(
+                select(ReferralEarning).where(
+                    ReferralEarning.status == "pending",
+                    ReferralEarning.referrer_tg_id == tg_id,
+                )
+            )
+        ).all()
+
+        for e in items:
+            e.status = "available"
+            e.available_at = now
+
+        await session.commit()
+
+    await cb.answer(f"✅ Одобрено для {tg_id}: {len(items)}", show_alert=True)
+    # refresh
+    try:
+        cb.data = "admin:ref:holds"
+        await admin_ref_holds(cb)  # type: ignore
+    except Exception:
+        pass
