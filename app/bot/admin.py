@@ -19,7 +19,7 @@ from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.services.referrals.service import referral_service
+from app.services.referral.service import referral_service
 
 router = Router()
 
@@ -140,130 +140,6 @@ async def admin_menu(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-# ==========================
-# PAYOUT REQUESTS (admin)
-# ==========================
-
-
-def _payout_kb(items: list[PayoutRequest]) -> "InlineKeyboardMarkup":
-    """Inline buttons for the last payout requests.
-
-    We keep it simple: for every request in status `created` we show two buttons:
-    - mark paid
-    - reject
-    """
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-    rows: list[list[InlineKeyboardButton]] = []
-    for req in items:
-        if (req.status or "created") == "created":
-            rows.append(
-                [
-                    InlineKeyboardButton(text=f"✅ Paid #{req.id}", callback_data=f"admin:payouts:paid:{req.id}"),
-                    InlineKeyboardButton(text=f"❌ Reject #{req.id}", callback_data=f"admin:payouts:reject:{req.id}"),
-                ]
-            )
-
-    # navigation
-    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:payouts:list")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.callback_query(lambda c: c.data == "admin:payouts:list")
-async def admin_payouts_list(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    async with session_scope() as session:
-        items = (
-            await session.scalars(
-                select(PayoutRequest).order_by(PayoutRequest.id.desc()).limit(20)
-            )
-        ).all()
-
-    if not items:
-        await cb.message.edit_text(
-            "💸 <b>Заявки на вывод</b>\n\nПока заявок нет.",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
-        )
-        await cb.answer()
-        return
-
-    lines = ["💸 <b>Заявки на вывод (последние 20)</b>\n"]
-    for req in items:
-        created = req.created_at.isoformat() if getattr(req, "created_at", None) else "—"
-        processed = req.processed_at.isoformat() if getattr(req, "processed_at", None) else "—"
-        note = (req.note or "").strip()
-        note_str = f" | note: {note}" if note else ""
-        lines.append(
-            f"• <b>#{req.id}</b> | user: <code>{req.tg_id}</code> | {req.amount_rub} RUB | "
-            f"status: <b>{req.status}</b> | created: {created} | processed: {processed}{note_str}\n"
-            f"  реквизиты: <code>{(req.requisites or '')[:120]}</code>"
-        )
-
-    from aiogram.types import InlineKeyboardMarkup
-
-    await cb.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=_payout_kb(items),
-    )
-    await cb.answer()
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("admin:payouts:paid:"))
-async def admin_payouts_paid(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    try:
-        req_id = int(cb.data.rsplit(":", 1)[1])
-    except Exception:
-        await cb.answer("bad request", show_alert=True)
-        return
-
-    async with session_scope() as session:
-        try:
-            await referral_service.mark_payout_paid(session, request_id=req_id)
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            await cb.answer("Не удалось отметить как paid", show_alert=True)
-            return
-
-    await cb.answer("✅ Отмечено как paid")
-    await admin_payouts_list(cb)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("admin:payouts:reject:"))
-async def admin_payouts_reject(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    try:
-        req_id = int(cb.data.rsplit(":", 1)[1])
-    except Exception:
-        await cb.answer("bad request", show_alert=True)
-        return
-
-    async with session_scope() as session:
-        try:
-            await referral_service.reject_payout(session, request_id=req_id, note="rejected by admin")
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            await cb.answer("Не удалось отклонить", show_alert=True)
-            return
-
-    await cb.answer("❌ Отклонено")
-    await admin_payouts_list(cb)
-
-
 # =========================================================
 # REFERRAL MINT (admin testing)
 # =========================================================
@@ -357,15 +233,17 @@ async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
 
         await session.flush()
 
-        # IMPORTANT: Payment model doesn't have `created_at`.
+        # Payment model does not have created_at/payload in this repo.
         pay = Payment(
             tg_id=dummy_referred_id,
             amount=amount,
             currency="RUB",
             provider="mint",
+            provider_payment_id=f"mint_{dummy_referred_id}_{int(now.timestamp())}",
             status="success",
             paid_at=now,
-            payload=None,
+            period_days=int(getattr(settings, "period_days", 0) or 0),
+            period_months=int(getattr(settings, "period_months", 1) or 1),
         )
         session.add(pay)
         await session.flush()  # get pay.id
@@ -820,6 +698,64 @@ async def admin_reset_user(cb: CallbackQuery, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=kb_admin_menu(),
     )
+    await cb.answer()
+
+
+# ==========================
+# PAYOUT REQUESTS (ADMIN)
+# ==========================
+
+
+@router.callback_query(lambda c: c.data in ("admin:payout:list", "admin:payouts:list"))
+async def admin_payout_list(cb: CallbackQuery) -> None:
+    """Show last payout requests and quick actions."""
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        reqs = (
+            await session.scalars(
+                select(PayoutRequest).order_by(PayoutRequest.id.desc()).limit(20)
+            )
+        ).all()
+
+    if not reqs:
+        await cb.message.edit_text(
+            "💸 <b>Заявки на вывод</b>\n\nПока заявок нет.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        await cb.answer()
+        return
+
+    # Build message + buttons
+    lines = ["💸 <b>Заявки на вывод</b>\n"]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for r in reqs:
+        lines.append(
+            f"• <b>#{r.id}</b> | TG: <code>{r.tg_id}</code> | {int(r.amount_rub or 0)} ₽ | <b>{r.status}</b>"
+        )
+
+        # Quick actions only for created requests
+        if (r.status or "").lower() == "created":
+            kb.inline_keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"✅ Paid #{r.id}",
+                        callback_data=f"admin:payout:paid:{r.id}",
+                    ),
+                    InlineKeyboardButton(
+                        text=f"❌ Reject #{r.id}",
+                        callback_data=f"admin:payout:reject:{r.id}",
+                    ),
+                ]
+            )
+
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🏠 Назад", callback_data="admin:menu")])
+
+    await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
     await cb.answer()
 
 
