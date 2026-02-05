@@ -17,7 +17,10 @@ class ReferralEarning(Base):
 
     referrer_tg_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
     referred_tg_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    payment_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    # For automated earnings this points to the related `payments.id`.
+    # For manual/admin mint operations there may be no underlying payment,
+    # so the column must allow NULL.
+    payment_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
 
     # payment data snapshot
     payment_amount_rub: Mapped[int] = mapped_column(Integer, nullable=False)
