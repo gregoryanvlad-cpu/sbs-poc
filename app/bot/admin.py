@@ -737,12 +737,49 @@ async def admin_ref_holds(cb: CallbackQuery, state: FSMContext) -> None:
             select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(ReferralEarning.status == "pending")
         )
 
+        # Список тех, у кого есть pending (чтобы админ видел "кто именно ждёт")
+        # Показываем агрегировано по referrer_tg_id: сумма, количество и ближайшая дата available_at.
+        q = (
+            select(
+                ReferralEarning.referrer_tg_id.label("tg_id"),
+                func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("sum_rub"),
+                func.count(ReferralEarning.id).label("cnt"),
+                func.min(ReferralEarning.available_at).label("min_available_at"),
+            )
+            .where(ReferralEarning.status == "pending")
+            .group_by(ReferralEarning.referrer_tg_id)
+            .order_by(func.coalesce(func.sum(ReferralEarning.earned_rub), 0).desc())
+            .limit(30)
+        )
+        pending_rows = (await session.execute(q)).all()
+
+    def _fmt_dt(dt):
+        if not dt:
+            return "—"
+        # dt может быть tz-aware; отображаем компактно
+        try:
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            return str(dt)[:10]
+
+    pending_list_text = ""
+    if pending_rows:
+        lines = []
+        for tg_id, sum_rub, cnt, min_available_at in pending_rows:
+            lines.append(
+                f"• <code>{tg_id}</code> — <b>{int(sum_rub or 0)} ₽</b> ({int(cnt)} шт.), ближайшая дата: <code>{_fmt_dt(min_available_at)}</code>"
+            )
+        pending_list_text = (
+            "\n<b>Кто сейчас в pending (топ-30):</b>\n" + "\n".join(lines) + "\n"
+        )
+
     await state.clear()
     await state.set_state(AdminYandexFSM.hold_wait_user_id)
 
     await cb.message.edit_text(
         "⏳ <b>Холды рефералки</b>\n\n"
         f"Всего pending (холд): <b>{int(total_pending or 0)} ₽</b>\n\n"
+        f"{pending_list_text}\n"
         "Введи TG ID пользователя чтобы посмотреть его pending и (опционально) одобрить.\n"
         "Или отправь <code>all</code> чтобы одобрить ВСЁ pending, где уже прошла дата available_at.",
         parse_mode="HTML",
