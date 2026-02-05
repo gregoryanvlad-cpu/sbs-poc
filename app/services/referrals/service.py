@@ -238,10 +238,24 @@ class ReferralService:
 
         payer_id = int(payment.tg_id)
         user = await session.get(User, payer_id)
-        if not user or not user.referred_by_tg_id:
+        if not user:
             return
 
-        referrer_id = int(user.referred_by_tg_id)
+        # Determine referrer:
+        # 1) Prefer stored click info on User (set via /start ref_...)
+        # 2) Fallback to existing active Referral row (robust for legacy/admin flows)
+        referrer_id = int(user.referred_by_tg_id) if user.referred_by_tg_id else None
+        if not referrer_id:
+            referrer_id = await session.scalar(
+                select(Referral.referrer_tg_id).where(
+                    Referral.referred_tg_id == payer_id,
+                    Referral.status == "active",
+                ).limit(1)
+            )
+            referrer_id = int(referrer_id) if referrer_id is not None else None
+
+        if not referrer_id:
+            return
 
         # Create referral if first payment
         referral = await session.scalar(select(Referral).where(Referral.referred_tg_id == payer_id).limit(1))
