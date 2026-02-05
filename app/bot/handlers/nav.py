@@ -288,8 +288,8 @@ async def on_nav(cb: CallbackQuery) -> None:
 
     if where == "faq":
         text = (
-            "❓ FAQ\\n\\n"
-            "Выберите раздел ниже.\\n"
+            "❓ FAQ\n\n"
+            "Выберите раздел ниже.\n"
         )
         try:
             await cb.message.edit_text(text, reply_markup=kb_faq())
