@@ -195,6 +195,21 @@ def ensure_referrals_schema() -> None:
                 )
             )
 
+            # Some older deployments had a NOT NULL constraint on the legacy column `amount_rub`.
+            # New code writes only `payment_amount_rub`, so keep `amount_rub` for compatibility
+            # but make it nullable to avoid INSERT failures.
+            try:
+                conn.execute(
+                    text(
+                        """
+                        ALTER TABLE referral_earnings
+                        ALTER COLUMN amount_rub DROP NOT NULL
+                        """
+                    )
+                )
+            except Exception:
+                pass
+
         # ensure NOT NULL for payment_amount_rub when possible (best-effort)
         # If there are NULLs still, leave as-is to avoid crash.
         try:
