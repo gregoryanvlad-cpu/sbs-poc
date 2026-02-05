@@ -232,32 +232,47 @@ class ReferralService:
     # =====================================================
 
     async def on_payment_success(self, session, *, payment: Payment) -> None:
-        """Process referral activation + commission for this successful payment."""
+        """Process referral activation + commission for this successful payment.
+
+        Commission should be начислена на КАЖДЫЙ успешный платеж реферала (включая продления),
+        но строго исключая самореферал (payer == referrer).
+        """
         if not payment or payment.status != "success":
             return
 
         payer_id = int(payment.tg_id)
-        user = await session.get(User, payer_id)
-        if not user:
-            return
 
         # Determine referrer:
-        # 1) Prefer stored click info on User (set via /start ref_...)
-        # 2) Fallback to existing active Referral row (robust for legacy/admin flows)
-        referrer_id = int(user.referred_by_tg_id) if user.referred_by_tg_id else None
+        # 1) Prefer explicit link on User (fast path)
+        # 2) Fallback to existing active Referral row (resilient for older data)
+        referrer_id: int | None = None
+
+        user = await session.get(User, payer_id)
+        if user and user.referred_by_tg_id:
+            referrer_id = int(user.referred_by_tg_id)
+
         if not referrer_id:
-            referrer_id = await session.scalar(
-                select(Referral.referrer_tg_id).where(
+            referral = await session.scalar(
+                select(Referral)
+                .where(
                     Referral.referred_tg_id == payer_id,
                     Referral.status == "active",
-                ).limit(1)
+                )
+                .order_by(Referral.id.desc())
+                .limit(1)
             )
-            referrer_id = int(referrer_id) if referrer_id is not None else None
+            if referral:
+                referrer_id = int(referral.referrer_tg_id)
 
+        # No referrer -> nothing to начислять
         if not referrer_id:
             return
 
-        # Create referral if first payment
+        # Block self-referral (even if someone manually set it in DB for tests)
+        if int(referrer_id) == int(payer_id):
+            return
+
+        # Create referral if first payment (activation)
         referral = await session.scalar(select(Referral).where(Referral.referred_tg_id == payer_id).limit(1))
         if not referral:
             referral = Referral(
@@ -269,6 +284,37 @@ class ReferralService:
             )
             session.add(referral)
             await session.flush()
+
+        percent = _level_percent(await self.count_active_referrals(session, referrer_id))
+        pay_amount = int(payment.amount or 0)
+        earned = int(round(pay_amount * percent / 100.0))
+
+        # Idempotency: one earning per (payment_id, referrer)
+        exists = await session.scalar(
+            select(ReferralEarning.id).where(
+                ReferralEarning.payment_id == payment.id,
+                ReferralEarning.referrer_tg_id == referrer_id,
+            ).limit(1)
+        )
+        if exists:
+            return
+
+        hold_days = int(getattr(settings, "referral_hold_days", 7) or 7)
+        available_at = (payment.paid_at or _utcnow()) + timedelta(days=hold_days)
+
+        session.add(
+            ReferralEarning(
+                referrer_tg_id=referrer_id,
+                referred_tg_id=payer_id,
+                payment_id=payment.id,
+                payment_amount_rub=pay_amount,
+                percent=percent,
+                earned_rub=earned,
+                status="pending" if hold_days else "available",
+                available_at=available_at if hold_days else None,
+            )
+        )
+        await session.flush()
 
         percent = _level_percent(await self.count_active_referrals(session, referrer_id))
         pay_amount = int(payment.amount or 0)
