@@ -19,7 +19,7 @@ from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.services.referral.service import referral_service
+from app.services.referrals.service import referral_service
 
 router = Router()
 
