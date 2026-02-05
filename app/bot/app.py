@@ -8,6 +8,7 @@ from app.bot.handlers.nav import router as nav_router
 from app.bot.handlers.yandex import router as yandex_router
 from app.bot.handlers.referrals import router as referrals_router
 from app.bot.admin import router as admin_router
+from app.bot.admin_kick import router as admin_kick_router
 from app.bot.middlewares import CorrelationIdMiddleware, RateLimitMiddleware
 
 log = logging.getLogger(__name__)
