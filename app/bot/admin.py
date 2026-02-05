@@ -7,13 +7,13 @@ from typing import Optional
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
 from app.core.config import settings
-from app.db.models import Payment, Referral, ReferralEarning, Subscription, User, VpnPeer
+from app.db.models import ReferralEarning, User
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
@@ -22,22 +22,6 @@ from app.db.session import session_scope
 from app.services.referrals.service import referral_service
 
 router = Router()
-
-# ==========================
-# Time helpers
-# ==========================
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _fmt_dt(dt: datetime | None) -> str:
-    if not dt:
-        return "—"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.strftime("%Y-%m-%d")
-
 
 # ==========================
 # RU date parsing: "9 февраля 2026"
@@ -60,8 +44,14 @@ _MONTH_NUM_RU = {
 _RU_DATE_RE = re.compile(r"^\s*(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*$", re.IGNORECASE)
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _parse_ru_date_to_utc_end_of_day(s: str) -> Optional[datetime]:
-    """Parse "9 февраля 2026" -> 2026-02-09 23:59:59 UTC."""
+    """
+    Parse "9 февраля 2026" -> 2026-02-09 23:59:59 UTC
+    """
     s = (s or "").strip().lower().replace("ё", "е")
     m = _RU_DATE_RE.match(s)
     if not m:
@@ -86,8 +76,11 @@ def _normalize_label(label: str) -> str:
 
 
 def _fmt_plus_end_at(dt: datetime | None) -> str:
-    return _fmt_dt(dt)
-
+    if not dt:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.date().isoformat()
 
 
 def _kb_user_nav() -> InlineKeyboardMarkup:
@@ -98,30 +91,37 @@ def _kb_user_nav() -> InlineKeyboardMarkup:
         ]
     )
 
+
 # ==========================
 # FSM
 # ==========================
 
-class AdminFSM(StatesGroup):
-    # yandex add
+class AdminYandexFSM(StatesGroup):
+    # add yandex account
     waiting_label = State()
     waiting_plus_end = State()
     waiting_links = State()
 
-    # yandex edit
+    # edit yandex account
     edit_waiting_label = State()
     edit_waiting_plus_end = State()
     edit_waiting_links = State()
 
-    # kick mark
-    kick_waiting_tg_id = State()
-
     # reset user
-    reset_waiting_tg_id = State()
+    reset_wait_user_id = State()
 
-    # referral mint
-    mint_waiting_amount = State()
-    mint_waiting_status = State()  # "pending" / "available"
+    # mint referral earnings
+    mint_wait_target_tg = State()
+    mint_wait_amount = State()
+    mint_wait_status = State()
+
+    # payouts
+    payout_wait_action = State()
+    payout_wait_request_id = State()
+    payout_wait_reject_note = State()
+
+    # approve holds
+    hold_wait_user_id = State()
 
 
 # ==========================
@@ -141,8 +141,10 @@ async def admin_menu(cb: CallbackQuery) -> None:
         "— загружаешь 3 готовые ссылки-приглашения (слоты 1..3)\n"
         "— бот выдаёт ссылки пользователям автоматически\n\n"
         "💰 <b>Рефералка</b>\n"
-        "— можно создать тестовое начисление (mint) для проверки вывода\n\n"
-        "⚠️ Исключение пользователей из семьи — вручную.\n",
+        "— накрутка тестовых начислений (mint)\n"
+        "— заявки на вывод + approve/reject\n"
+        "— холды: approve pending→available\n\n"
+        "⚠️ Исключение пользователей из семьи делается вручную.\n",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
@@ -150,158 +152,7 @@ async def admin_menu(cb: CallbackQuery) -> None:
 
 
 # =========================================================
-# REFERRAL MINT (admin testing)
-# =========================================================
-
-@router.callback_query(lambda c: c.data == "admin:ref:mint")
-async def admin_ref_mint_start(cb: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    await state.clear()
-    await state.set_state(AdminFSM.mint_waiting_amount)
-
-    await cb.message.edit_text(
-        "💰 <b>Mint (тестовое начисление)</b>\n\n"
-        "Введи сумму в рублях (целое число).\n"
-        "Пример: <code>150</code>\n\n"
-        "Далее спрошу статус: pending/available.",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
-    await cb.answer()
-
-
-@router.message(AdminFSM.mint_waiting_amount)
-async def admin_ref_mint_amount(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await message.answer("❌ Введи сумму числом. Пример: <code>150</code>", parse_mode="HTML")
-        return
-
-    amount = int(raw)
-    if amount <= 0 or amount > 1_000_000:
-        await message.answer("❌ Сумма выглядит странно. Введи 1..1000000")
-        return
-
-    await state.update_data(mint_amount=amount)
-    await state.set_state(AdminFSM.mint_waiting_status)
-
-    await message.answer(
-        "Теперь введи статус начисления:\n"
-        "— <code>pending</code> (на холде)\n"
-        "— <code>available</code> (сразу доступно)\n\n"
-        "Пример: <code>available</code>",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
-
-
-@router.message(AdminFSM.mint_waiting_status)
-async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    status = (message.text or "").strip().lower()
-    if status not in ("pending", "available"):
-        await message.answer("❌ Нужно <code>pending</code> или <code>available</code>.", parse_mode="HTML")
-        return
-
-    data = await state.get_data()
-    amount = int(data.get("mint_amount") or 0)
-    if amount <= 0:
-        await state.clear()
-        await message.answer("❌ Сессия сбилась. Начни заново: Mint")
-        return
-
-    owner_id = int(message.from_user.id)
-    now = utcnow()
-
-    # To satisfy DB constraints we create:
-    # - dummy referred user
-    # - Payment(success) for dummy user
-    # - Referral(owner -> dummy)
-    # - ReferralEarning(owner, dummy, payment_id)
-    dummy_referred_id = owner_id + 999_000
-
-    async with session_scope() as session:
-        # ensure users
-        owner = await session.get(User, owner_id)
-        if not owner:
-            owner = User(tg_id=owner_id)
-            session.add(owner)
-
-        dummy = await session.get(User, dummy_referred_id)
-        if not dummy:
-            dummy = User(tg_id=dummy_referred_id)
-            session.add(dummy)
-
-        await session.flush()
-
-        # Payment model does not have created_at/payload in this repo.
-        pay = Payment(
-            tg_id=dummy_referred_id,
-            amount=amount,
-            currency="RUB",
-            provider="mint",
-            provider_payment_id=f"mint_{dummy_referred_id}_{int(now.timestamp())}",
-            status="success",
-            paid_at=now,
-            period_days=int(getattr(settings, "period_days", 0) or 0),
-            period_months=int(getattr(settings, "period_months", 1) or 1),
-        )
-        session.add(pay)
-        await session.flush()  # get pay.id
-
-        ref = await session.scalar(
-            select(Referral).where(Referral.referred_tg_id == dummy_referred_id).limit(1)
-        )
-        if not ref:
-            ref = Referral(
-                referrer_tg_id=owner_id,
-                referred_tg_id=dummy_referred_id,
-                status="active",
-                first_payment_id=pay.id,
-                activated_at=now,
-            )
-            session.add(ref)
-            await session.flush()
-
-        hold_days = int(getattr(settings, "referral_hold_days", 7) or 7)
-        available_at = now + timedelta(days=hold_days)
-
-        earning = ReferralEarning(
-            referrer_tg_id=owner_id,
-            referred_tg_id=dummy_referred_id,
-            payment_id=pay.id,
-            payment_amount_rub=amount,
-            percent=100,
-            earned_rub=amount,
-            status=status,
-            available_at=available_at if status == "pending" else None,
-        )
-        session.add(earning)
-
-        await session.commit()
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Mint выполнен</b>\n\n"
-        f"Сумма: <code>{amount}</code> RUB\n"
-        f"Статус: <code>{status}</code>\n"
-        f"Dummy referred: <code>{dummy_referred_id}</code>",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
-
-
-# =========================================================
-# YANDEX ACCOUNTS: add/edit/list
+# ADD ACCOUNT (step-by-step): label -> plus_end_at -> 3 links
 # =========================================================
 
 @router.callback_query(lambda c: c.data == "admin:yandex:add")
@@ -311,7 +162,7 @@ async def admin_yandex_add(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await state.set_state(AdminFSM.waiting_label)
+    await state.set_state(AdminYandexFSM.waiting_label)
 
     await cb.message.edit_text(
         "➕ <b>Добавление Yandex-аккаунта</b>\n\n"
@@ -324,7 +175,7 @@ async def admin_yandex_add(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-@router.message(AdminFSM.waiting_label)
+@router.message(AdminYandexFSM.waiting_label)
 async def admin_yandex_waiting_label(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
@@ -339,7 +190,7 @@ async def admin_yandex_waiting_label(message: Message, state: FSMContext) -> Non
         return
 
     await state.update_data(label=label)
-    await state.set_state(AdminFSM.waiting_plus_end)
+    await state.set_state(AdminYandexFSM.waiting_plus_end)
 
     await message.answer(
         "📅 <b>До какого числа подписка активна?</b>\n\n"
@@ -351,7 +202,7 @@ async def admin_yandex_waiting_label(message: Message, state: FSMContext) -> Non
     )
 
 
-@router.message(AdminFSM.waiting_plus_end)
+@router.message(AdminYandexFSM.waiting_plus_end)
 async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
@@ -371,10 +222,7 @@ async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> 
     label = data.get("label")
     if not label:
         await state.clear()
-        await message.answer(
-            "❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.",
-            reply_markup=kb_admin_menu(),
-        )
+        await message.answer("❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.", reply_markup=kb_admin_menu())
         return
 
     async with session_scope() as session:
@@ -394,7 +242,7 @@ async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> 
         await session.commit()
 
     await state.update_data(plus_end_at_iso=plus_end_at.isoformat())
-    await state.set_state(AdminFSM.waiting_links)
+    await state.set_state(AdminYandexFSM.waiting_links)
 
     await message.answer(
         "🔗 <b>Теперь отправь 3 ссылки (слоты 1..3)</b>\n\n"
@@ -409,7 +257,7 @@ async def admin_yandex_waiting_plus_end(message: Message, state: FSMContext) -> 
     )
 
 
-@router.message(AdminFSM.waiting_links)
+@router.message(AdminYandexFSM.waiting_links)
 async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
@@ -426,10 +274,7 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
     label = data.get("label")
     if not label:
         await state.clear()
-        await message.answer(
-            "❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.",
-            reply_markup=kb_admin_menu(),
-        )
+        await message.answer("❌ Сессия сбилась. Нажми «➕ Добавить Yandex-аккаунт» ещё раз.", reply_markup=kb_admin_menu())
         return
 
     async with session_scope() as session:
@@ -439,14 +284,10 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
             await message.answer("❌ Аккаунт не найден. Начни добавление заново.", reply_markup=kb_admin_menu())
             return
 
-        # Upsert 3 slots. IMPORTANT: do not overwrite issued/burned (S1).
         for idx, link in enumerate(lines, start=1):
             slot = await session.scalar(
                 select(YandexInviteSlot)
-                .where(
-                    YandexInviteSlot.yandex_account_id == acc.id,
-                    YandexInviteSlot.slot_index == idx,
-                )
+                .where(YandexInviteSlot.yandex_account_id == acc.id, YandexInviteSlot.slot_index == idx)
                 .limit(1)
             )
             if not slot:
@@ -458,6 +299,7 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
                 )
                 session.add(slot)
             else:
+                # IMPORTANT: do not overwrite issued/burned (S1)
                 if (slot.status or "free") == "free":
                     slot.invite_link = link
 
@@ -473,6 +315,10 @@ async def admin_yandex_waiting_links(message: Message, state: FSMContext) -> Non
         reply_markup=kb_admin_menu(),
     )
 
+
+# ==========================
+# LIST ACCOUNTS/SLOTS
+# ==========================
 
 @router.callback_query(lambda c: c.data == "admin:yandex:list")
 async def admin_yandex_list(cb: CallbackQuery) -> None:
@@ -491,7 +337,7 @@ async def admin_yandex_list(cb: CallbackQuery) -> None:
             await cb.answer()
             return
 
-        lines: list[str] = ["📋 <b>Yandex аккаунты / слоты</b>\n"]
+        lines = ["📋 <b>Yandex аккаунты / слоты</b>\n"]
         for acc in accounts:
             free_cnt = await session.scalar(
                 select(func.count(YandexInviteSlot.id)).where(
@@ -515,6 +361,10 @@ async def admin_yandex_list(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+# ==========================
+# EDIT ACCOUNT (label -> new date -> optional links)
+# ==========================
+
 @router.callback_query(lambda c: c.data == "admin:yandex:edit")
 async def admin_yandex_edit(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
@@ -522,7 +372,7 @@ async def admin_yandex_edit(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await state.set_state(AdminFSM.edit_waiting_label)
+    await state.set_state(AdminYandexFSM.edit_waiting_label)
 
     await cb.message.edit_text(
         "✏️ <b>Редактирование Yandex-аккаунта</b>\n\n"
@@ -534,18 +384,14 @@ async def admin_yandex_edit(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-@router.message(AdminFSM.edit_waiting_label)
+@router.message(AdminYandexFSM.edit_waiting_label)
 async def admin_yandex_edit_waiting_label(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
 
     label = _normalize_label(message.text or "")
     if not label:
-        await message.answer(
-            "❌ Не понял label. Пример: <code>YA_ACC_1</code>",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
-        )
+        await message.answer("❌ Не понял label. Пример: <code>YA_ACC_1</code>", parse_mode="HTML", reply_markup=kb_admin_menu())
         return
 
     async with session_scope() as session:
@@ -556,7 +402,7 @@ async def admin_yandex_edit_waiting_label(message: Message, state: FSMContext) -
 
         await state.update_data(edit_label=label)
 
-        await state.set_state(AdminFSM.edit_waiting_plus_end)
+        await state.set_state(AdminYandexFSM.edit_waiting_plus_end)
         await message.answer(
             "📅 <b>Новая дата окончания Plus</b>\n\n"
             f"Сейчас: <code>{_fmt_plus_end_at(acc.plus_end_at)}</code>\n\n"
@@ -568,7 +414,7 @@ async def admin_yandex_edit_waiting_label(message: Message, state: FSMContext) -
         )
 
 
-@router.message(AdminFSM.edit_waiting_plus_end)
+@router.message(AdminYandexFSM.edit_waiting_plus_end)
 async def admin_yandex_edit_waiting_plus_end(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
@@ -603,7 +449,7 @@ async def admin_yandex_edit_waiting_plus_end(message: Message, state: FSMContext
             acc.plus_end_at = new_dt
         await session.commit()
 
-    await state.set_state(AdminFSM.edit_waiting_links)
+    await state.set_state(AdminYandexFSM.edit_waiting_links)
     await message.answer(
         "🔗 <b>Обновить ссылки слотов (опционально)</b>\n\n"
         "Если хочешь заменить ссылки — отправь 3 строки (слоты 1..3).\n"
@@ -615,7 +461,7 @@ async def admin_yandex_edit_waiting_plus_end(message: Message, state: FSMContext
     )
 
 
-@router.message(AdminFSM.edit_waiting_links)
+@router.message(AdminYandexFSM.edit_waiting_links)
 async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
@@ -635,11 +481,7 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
 
     lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
     if len(lines) != 3:
-        await message.answer(
-            "❌ Нужно ровно 3 строки (или отправь <code>-</code>).",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
-        )
+        await message.answer("❌ Нужно ровно 3 строки (или отправь <code>-</code>).", parse_mode="HTML", reply_markup=kb_admin_menu())
         return
 
     async with session_scope() as session:
@@ -654,10 +496,7 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
         for idx, link in enumerate(lines, start=1):
             slot = await session.scalar(
                 select(YandexInviteSlot)
-                .where(
-                    YandexInviteSlot.yandex_account_id == acc.id,
-                    YandexInviteSlot.slot_index == idx,
-                )
+                .where(YandexInviteSlot.yandex_account_id == acc.id, YandexInviteSlot.slot_index == idx)
                 .limit(1)
             )
             if not slot:
@@ -687,9 +526,9 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
     )
 
 
-# =========================================================
-# RESET USER (admin)
-# =========================================================
+# ==========================
+# RESET USER (FULL)  + YANDEX MEMBERSHIP CLEANUP
+# ==========================
 
 @router.callback_query(lambda c: c.data == "admin:reset:user")
 async def admin_reset_user(cb: CallbackQuery, state: FSMContext) -> None:
@@ -698,29 +537,315 @@ async def admin_reset_user(cb: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await state.set_state(AdminFSM.reset_waiting_tg_id)
+    await state.set_state(AdminYandexFSM.reset_wait_user_id)
 
     await cb.message.edit_text(
         "🧨 <b>Сброс пользователя</b>\n\n"
-        "Введи TG ID пользователя (число).\n"
-        "Сбросит подписку, VPN-пир и Yandex Plus (в БД).",
+        "Отправь TG ID пользователя (число).\n"
+        "⚠️ Будут сброшены: подписка, VPN, Yandex membership, реф-данные (частично).",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.message(AdminYandexFSM.reset_wait_user_id)
+async def admin_reset_user_apply(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("❌ Нужно число (TG ID).", reply_markup=kb_admin_menu())
+        return
+
+    tg_id = int(txt)
+    await state.clear()
+
+    async with session_scope() as session:
+        # reset yandex membership
+        ym = await session.scalar(
+            select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
+        )
+        if ym:
+            try:
+                ym.status = "reset"
+            except Exception:
+                pass
+            try:
+                ym.invite_link = None
+            except Exception:
+                pass
+            try:
+                ym.yandex_account_label = None
+            except Exception:
+                pass
+            try:
+                ym.slot_index = None
+            except Exception:
+                pass
+
+        # reset user referral click info
+        u = await session.get(User, tg_id)
+        if u:
+            u.referred_by_tg_id = None
+            u.referred_at = None
+
+        await session.commit()
+
+    await message.answer(
+        f"✅ Пользователь <code>{tg_id}</code> сброшен.\n"
+        "Yandex membership очищен (семья/слот/ссылка).",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+# ==========================
+# REFERRALS: MINT (TEST EARNINGS)
+# ==========================
+
+@router.callback_query(lambda c: c.data == "admin:ref:mint")
+async def admin_ref_mint(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.clear()
+    await state.set_state(AdminYandexFSM.mint_wait_target_tg)
+
+    await cb.message.edit_text(
+        "🧪 <b>Mint реф. денег</b>\n\n"
+        "Шаг 1/3: отправь TG ID получателя (кому начислить).",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.message(AdminYandexFSM.mint_wait_target_tg)
+async def admin_ref_mint_target(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("❌ Нужно число (TG ID).", reply_markup=kb_admin_menu())
+        return
+
+    await state.update_data(target_tg=int(txt))
+    await state.set_state(AdminYandexFSM.mint_wait_amount)
+
+    await message.answer(
+        "Шаг 2/3: отправь сумму в ₽ (целое число).\n"
+        "Пример: <code>150</code>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+@router.message(AdminYandexFSM.mint_wait_amount)
+async def admin_ref_mint_amount(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("❌ Нужно целое число (₽).", reply_markup=kb_admin_menu())
+        return
+
+    await state.update_data(amount=int(txt))
+    await state.set_state(AdminYandexFSM.mint_wait_status)
+
+    await message.answer(
+        "Шаг 3/3: статус начисления:\n"
+        "— <code>pending</code> (в холде)\n"
+        "— <code>available</code> (сразу доступно)\n\n"
+        "Отправь <code>pending</code> или <code>available</code>.",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+@router.message(AdminYandexFSM.mint_wait_status)
+async def admin_ref_mint_status(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    status = (message.text or "").strip().lower()
+    if status not in ("pending", "available"):
+        await message.answer("❌ Нужно: <code>pending</code> или <code>available</code>.", parse_mode="HTML", reply_markup=kb_admin_menu())
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    target_tg = int(data.get("target_tg") or 0)
+    amount = int(data.get("amount") or 0)
+    if not target_tg or amount <= 0:
+        await message.answer("❌ Сессия сбилась. Начни заново.", reply_markup=kb_admin_menu())
+        return
+
+    async with session_scope() as session:
+        # ensure user exists (owner can mint to anyone)
+        u = await session.get(User, target_tg)
+        if not u:
+            u = User(tg_id=target_tg)
+            session.add(u)
+            await session.flush()
+
+        available_at = None
+        if status == "pending":
+            hold_days = int(getattr(settings, "referral_hold_days", 7) or 7)
+            available_at = _utcnow() + timedelta(days=hold_days)
+
+        e = ReferralEarning(
+            referrer_tg_id=target_tg,
+            referred_tg_id=target_tg,
+            payment_id=None,
+            payment_amount_rub=0,
+            percent=0,
+            earned_rub=amount,
+            status=status,
+            available_at=available_at,
+        )
+        session.add(e)
+        await session.commit()
+
+    await message.answer(
+        "✅ Mint выполнен.\n\n"
+        f"Кому: <code>{target_tg}</code>\n"
+        f"Сумма: <b>{amount} ₽</b>\n"
+        f"Статус: <b>{status}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+# ==========================
+# REFERRALS: HOLDS (approve pending -> available)
+# ==========================
+
+@router.callback_query(lambda c: c.data == "admin:ref:holds")
+async def admin_ref_holds(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        total_pending = await session.scalar(
+            select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(ReferralEarning.status == "pending")
+        )
+
+    await state.clear()
+    await state.set_state(AdminYandexFSM.hold_wait_user_id)
+
+    await cb.message.edit_text(
+        "⏳ <b>Холды рефералки</b>\n\n"
+        f"Всего pending (холд): <b>{int(total_pending or 0)} ₽</b>\n\n"
+        "Введи TG ID пользователя чтобы посмотреть его pending и (опционально) одобрить.\n"
+        "Или отправь <code>all</code> чтобы одобрить ВСЁ pending, где уже прошла дата available_at.",
         parse_mode="HTML",
         reply_markup=kb_admin_menu(),
     )
     await cb.answer()
 
 
+@router.message(AdminYandexFSM.hold_wait_user_id)
+async def admin_ref_hold_action(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    txt = (message.text or "").strip().lower()
+
+    if txt == "all":
+        async with session_scope() as session:
+            moved_count = await referral_service.release_pending(session)
+            await session.commit()
+
+        await state.clear()
+        await message.answer(
+            f"✅ Одобрено pending→available: <b>{moved_count}</b> начислений.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    if not txt.isdigit():
+        await message.answer("❌ Нужно: TG ID (число) или <code>all</code>.", parse_mode="HTML", reply_markup=kb_admin_menu())
+        return
+
+    tg_id = int(txt)
+
+    async with session_scope() as session:
+        pending_sum = await session.scalar(
+            select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(
+                ReferralEarning.referrer_tg_id == tg_id,
+                ReferralEarning.status == "pending",
+            )
+        )
+        available, pending, paid = await referral_service.get_balances(session, tg_id)
+
+        # approve this user's pending immediately (manual override)
+        q = select(ReferralEarning).where(
+            ReferralEarning.referrer_tg_id == tg_id,
+            ReferralEarning.status == "pending",
+        )
+        items = (await session.scalars(q)).all()
+        moved = 0
+        for e in items:
+            moved += int(e.earned_rub or 0)
+            e.status = "available"
+            e.available_at = None
+
+        await session.commit()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Готово.\n\n"
+        f"Пользователь: <code>{tg_id}</code>\n"
+        f"Одобрено pending→available: <b>{moved} ₽</b>\n\n"
+        f"Баланс сейчас:\n"
+        f"— Доступно: <b>{available} ₽</b>\n"
+        f"— В холде: <b>{pending_sum} ₽</b>\n"
+        f"— Выплачено: <b>{paid} ₽</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+    # notify user (FIXED: no broken multiline strings)
+    try:
+        async with session_scope() as session:
+            avail, pend, paid = await referral_service.get_balances(session, tg_id)
+        await message.bot.send_message(
+            chat_id=int(tg_id),
+            text=(
+                "✅ <b>Реферальные начисления одобрены</b>\n\n"
+                f"Переведено: <b>{moved} ₽</b> (pending → available)\n\n"
+                "Ваш баланс:\n"
+                f"— Доступно: <b>{avail} ₽</b>\n"
+                f"— В холде: <b>{pend} ₽</b>\n"
+                f"— Выплачено: <b>{paid} ₽</b>"
+            ),
+            reply_markup=_kb_user_nav(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
 # ==========================
 # PAYOUT REQUESTS (ADMIN)
 # ==========================
 
-
-@router.callback_query(lambda c: c.data in ("admin:payout:list", "admin:payouts:list"))
-async def admin_payout_list(cb: CallbackQuery) -> None:
-    """Show last payout requests and quick actions."""
+@router.callback_query(lambda c: c.data == "admin:payouts")
+async def admin_payouts(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
+
+    await state.clear()
 
     async with session_scope() as session:
         reqs = (
@@ -731,470 +856,103 @@ async def admin_payout_list(cb: CallbackQuery) -> None:
 
     if not reqs:
         await cb.message.edit_text(
-            "💸 <b>Заявки на вывод</b>\n\nПока заявок нет.",
-            parse_mode="HTML",
+            "📤 <b>Заявки на вывод</b>\n\nПока заявок нет.",
             reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
         )
         await cb.answer()
         return
 
-    # Build message + buttons
-    lines = ["💸 <b>Заявки на вывод</b>\n"]
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    lines = ["📤 <b>Заявки на вывод</b>\n"]
     for r in reqs:
         lines.append(
-            f"• <b>#{r.id}</b> | TG: <code>{r.tg_id}</code> | {int(r.amount_rub or 0)} ₽ | <b>{r.status}</b>"
+            f"• ID <code>{r.id}</code> | TG <code>{r.tg_id}</code> | "
+            f"{r.amount_rub} ₽ | <b>{r.status}</b>"
         )
 
-        # Quick actions only for created requests
-        if (r.status or "").lower() == "created":
-            kb.inline_keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"✅ Paid #{r.id}",
-                        callback_data=f"admin:payout:paid:{r.id}",
-                    ),
-                    InlineKeyboardButton(
-                        text=f"❌ Reject #{r.id}",
-                        callback_data=f"admin:payout:reject:{r.id}",
-                    ),
-                ]
-            )
+    lines.append("\nОтправь ID заявки чтобы обработать (approve/reject).")
 
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🏠 Назад", callback_data="admin:menu")])
-
-    await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+    await state.set_state(AdminYandexFSM.payout_wait_request_id)
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
     await cb.answer()
 
 
-@router.message(AdminFSM.reset_waiting_tg_id)
-async def admin_reset_user_tg(message: Message, state: FSMContext) -> None:
+@router.message(AdminYandexFSM.payout_wait_request_id)
+async def admin_payout_choose(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
 
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await message.answer("❌ TG ID должен быть числом.", reply_markup=kb_admin_menu())
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("❌ Нужно число (ID заявки).", reply_markup=kb_admin_menu())
         return
 
-    tg_id = int(raw)
-    now = utcnow()
+    req_id = int(txt)
+    await state.update_data(payout_req_id=req_id)
+    await state.set_state(AdminYandexFSM.payout_wait_action)
 
-    async with session_scope() as session:
-        # subscription
-        sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
-        if sub:
-            sub.end_at = now
-            sub.is_active = False
-            sub.status = "inactive"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Одобрить (paid)", callback_data="admin:payout:approve")],
+            [InlineKeyboardButton(text="❌ Отклонить (rejected)", callback_data="admin:payout:reject")],
+            [InlineKeyboardButton(text="🏠 Назад", callback_data="admin:menu")],
+        ]
+    )
 
-        # vpn peers
-        peers = (await session.scalars(select(VpnPeer).where(VpnPeer.tg_id == tg_id))).all()
-        for p in peers:
-            p.is_active = False
-            p.revoked_at = now
-
-        # yandex membership: clear so cabinet doesn't show stale family/slot
-        ym = await session.scalar(
-            select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
-        )
-        if ym:
-            ym.status = "pending"
-            ym.yandex_account_id = None
-            ym.account_label = None
-            ym.slot_index = None
-            ym.invite_link = None
-            ym.invite_issued_at = None
-            ym.invite_expires_at = None
-            ym.removed_at = now
-            ym.updated_at = now
-
-        await session.commit()
-
-    await state.clear()
     await message.answer(
-        f"✅ Пользователь <code>{tg_id}</code> сброшен.",
+        f"Заявка <code>{req_id}</code>.\nВыбери действие:",
         parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
+        reply_markup=kb,
     )
 
 
-# =========================================================
-# KICK REPORT (manual removal reminder) + MARK REMOVED
-# =========================================================
-
-@router.callback_query(lambda c: c.data == "admin:kick:report")
-async def admin_kick_report(cb: CallbackQuery) -> None:
+@router.callback_query(lambda c: c.data == "admin:payout:approve")
+async def admin_payout_approve(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
 
-    today = utcnow().date()
-    now = utcnow()
-
-    async with session_scope() as session:
-        q = (
-            select(YandexMembership, Subscription)
-            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
-            .where(
-                YandexMembership.status == "active",
-                Subscription.end_at.is_not(None),
-            )
-        )
-        rows = (await session.execute(q)).all()
-
-        due: list[tuple[YandexMembership, Subscription]] = []
-        for ym, sub in rows:
-            end_at = sub.end_at
-            if not end_at:
-                continue
-            if end_at.tzinfo is None:
-                end_at = end_at.replace(tzinfo=timezone.utc)
-            if end_at.date() <= today:
-                due.append((ym, sub))
-
-    if not due:
-        await cb.message.edit_text(
-            "📣 <b>Отчёт по исключению</b>\n\nСегодня участников для исключения нет.",
-            parse_mode="HTML",
-            reply_markup=kb_admin_menu(),
-        )
-        await cb.answer()
-        return
-
-    lines = ["📣 <b>Сегодня пора исключить следующих участников из семей:</b>\n"]
-    for i, (ym, sub) in enumerate(due, start=1):
-        vpn_peer = "Отключен"
-        # basic check: any active peer
-        async with session_scope() as session:
-            active_peer_cnt = await session.scalar(
-                select(func.count(VpnPeer.id)).where(VpnPeer.tg_id == ym.tg_id, VpnPeer.is_active.is_(True))
-            )
-            if int(active_peer_cnt or 0) > 0:
-                vpn_peer = "Включен"
-
-        created = ym.created_at or now
-        age_days = (now.date() - created.date()).days
-        lines.append(
-            f"#{i}\n"
-            f"Пользователь ID TG: <code>{ym.tg_id}</code>\n"
-            f"Дата приобретения подписки на сервис: <code>{_fmt_dt(sub.created_at)}</code>\n"
-            f"Дата окончания подписки на сервис: <code>{_fmt_dt(sub.end_at)}</code>\n"
-            f"Наименование семьи (label): <code>{ym.account_label or '—'}</code>\n"
-            f"Номер слота: <code>{ym.slot_index or '—'}</code>\n"
-            f"VPN: {vpn_peer}\n"
-            f"Подписка: {'Продлевалась' if (sub.end_at and sub.end_at > now) else 'Не продлевалась'}\n"
-            f"Пользователь с нами: <code>{age_days}</code> дней\n"
-        )
-
-    await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb_admin_menu())
-    await cb.answer()
-
-
-@router.callback_query(lambda c: c.data == "admin:kick:mark")
-async def admin_kick_mark_start(cb: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
+    data = await state.get_data()
+    req_id = int(data.get("payout_req_id") or 0)
     await state.clear()
-    await state.set_state(AdminFSM.kick_waiting_tg_id)
 
-    await cb.message.edit_text(
-        "✅ <b>Отметить как исключённого</b>\n\n"
-        "Введи TG ID пользователя, которого ты уже исключил из семьи.\n"
-        "Это нужно для учёта (в БД проставится removed).",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
-    await cb.answer()
-
-
-@router.message(AdminFSM.kick_waiting_tg_id)
-async def admin_kick_mark_apply(message: Message, state: FSMContext) -> None:
-    if not is_owner(message.from_user.id):
-        return
-
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await message.answer("❌ TG ID должен быть числом.", reply_markup=kb_admin_menu())
-        return
-
-    tg_id = int(raw)
-    now = utcnow()
-
-    async with session_scope() as session:
-        ym = await session.scalar(
-            select(YandexMembership)
-            .where(YandexMembership.tg_id == tg_id)
-            .order_by(YandexMembership.id.desc())
-            .limit(1)
-        )
-        if not ym:
-            await state.clear()
-            await message.answer("❌ Membership не найден.", reply_markup=kb_admin_menu())
-            return
-
-        ym.status = "removed"
-        ym.removed_at = now
-        ym.updated_at = now
-
-        await session.commit()
-
-    await state.clear()
-    await message.answer(
-        f"✅ Отмечено: <code>{tg_id}</code> исключён.",
-        parse_mode="HTML",
-        reply_markup=kb_admin_menu(),
-    )
-
-
-# =========================================================
-# PAYOUT ADMIN (optional): mark payout paid / reject
-# =========================================================
-
-@router.callback_query(lambda c: c.data and c.data.startswith("admin:payout:"))
-async def admin_payout_actions(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
+    if not req_id:
+        await cb.message.edit_text("❌ Сессия сбилась.", reply_markup=kb_admin_menu())
         await cb.answer()
         return
-
-    # Format: admin:payout:paid:<id> OR admin:payout:reject:<id>
-    parts = (cb.data or "").split(":")
-    if len(parts) != 4:
-        await cb.answer()
-        return
-
-    action = parts[2]
-    req_id = int(parts[3])
 
     async with session_scope() as session:
         req = await session.get(PayoutRequest, req_id)
         if not req:
-            await cb.answer("not found", show_alert=True)
+            await cb.message.edit_text("❌ Заявка не найдена.", reply_markup=kb_admin_menu())
+            await cb.answer()
             return
 
-        now = utcnow()
-        if action == "paid":
-            req.status = "paid"
-            req.processed_at = now
-            items = (await session.scalars(
-                select(ReferralEarning).where(
-                    ReferralEarning.payout_request_id == req_id,
-                    ReferralEarning.status == "reserved",
-                )
-            )).all()
-            for e in items:
-                e.status = "paid"
-                e.paid_at = now
-            await session.commit()
-            await cb.answer("✅ marked paid")
-        elif action == "reject":
-            req.status = "rejected"
-            req.processed_at = now
-            items = (await session.scalars(
-                select(ReferralEarning).where(
-                    ReferralEarning.payout_request_id == req_id,
-                    ReferralEarning.status == "reserved",
-                )
-            )).all()
-            for e in items:
-                e.status = "available"
-                e.payout_request_id = None
-            await session.commit()
-            await cb.answer("✅ rejected")
-        else:
-            await cb.answer()
-
-# ==========================
-# REFERRAL HOLDS (manual approve)
-# ==========================
-
-@router.callback_query(lambda c: c.data == "admin:ref:holds")
-async def admin_ref_holds(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    async with session_scope() as session:
-        # total pending across all users
-        total_pending = await session.scalar(
-            select(func.coalesce(func.sum(ReferralEarning.earned_rub), 0)).where(
-                ReferralEarning.status == "pending"
-            )
-        )
-
-        rows = (
-            await session.execute(
-                select(
-                    ReferralEarning.referrer_tg_id.label("tg_id"),
-                    func.count(ReferralEarning.id).label("cnt"),
-                    func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("sum_rub"),
-                )
-                .where(ReferralEarning.status == "pending")
-                .group_by(ReferralEarning.referrer_tg_id)
-                .order_by(func.coalesce(func.sum(ReferralEarning.earned_rub), 0).desc())
-                .limit(20)
-            )
-        ).all()
-
-    lines = [
-        "⏳ <b>Холдовые начисления (рефералка)</b>\n",
-        f"Всего в холде: <b>{int(total_pending or 0)} ₽</b>\n",
-    ]
-
-    if not rows:
-        lines.append("Сейчас холдов нет ✅")
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")]]
-        )
-        await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
-        await cb.answer()
-        return
-
-    lines.append("<b>Топ по сумме (до 20 строк):</b>")
-    buttons = []
-    for r in rows:
-        tg_id = int(r.tg_id)
-        sum_rub = int(r.sum_rub or 0)
-        cnt = int(r.cnt or 0)
-        lines.append(f"• <code>{tg_id}</code> — <b>{sum_rub} ₽</b> (строк: {cnt})")
-        buttons.append([InlineKeyboardButton(text=f"✅ Одобрить {tg_id} ({sum_rub}₽)", callback_data=f"admin:ref:holds:approve:{tg_id}")])
-
-    # approve all
-    buttons.insert(0, [InlineKeyboardButton(text="✅ Одобрить ВСЕ холды", callback_data="admin:ref:holds:approve_all")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
-    await cb.answer()
-
-
-@router.callback_query(lambda c: c.data == "admin:ref:holds:approve_all")
-async def admin_ref_holds_approve_all(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    now = datetime.now(timezone.utc)
-
-    notifications: list[tuple[int, int, int, int, int]] = []  # (tg_id, moved, avail, pending, paid)
-
-    async with session_scope() as session:
-        rows = (
-            await session.execute(
-                select(
-                    ReferralEarning.referrer_tg_id,
-                    func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("moved_rub"),
-                )
-                .where(ReferralEarning.status == "pending")
-                .group_by(ReferralEarning.referrer_tg_id)
-            )
-        ).all()
-
-        items = (
-            await session.scalars(
-                select(ReferralEarning).where(ReferralEarning.status == "pending")
-            )
-        ).all()
-
-        for e in items:
-            e.status = "available"
-            # ensure it won't be stuck if scheduler expects available_at
-            e.available_at = now
-
+        # mark paid
+        await referral_service.mark_payout_paid(session, request_id=req_id)
         await session.commit()
 
-        # Prepare per-user balances AFTER move
-        moved_map = {int(r[0]): int(r[1] or 0) for r in rows}
-        for tg_id, moved in moved_map.items():
-            avail, pend, paid = await referral_service.get_balances(session, tg_id)
-            notifications.append((tg_id, moved, avail, pend, paid))
-
-    # Notify users (best-effort; user may block bot)
-    for tg_id, moved, avail, pend, paid in notifications:
-        try:
-            await cb.bot.send_message(
-                chat_id=int(tg_id),
-                text=(
-                    "✅ <b>Реферальные начисления одобрены</b>
-
-"
-                    f"Переведено: <b>{moved} ₽</b> (pending → available)
-"
-                    f"Ваш баланс:
-"
-                    f"— Доступно: <b>{avail} ₽</b>
-"
-                    f"— В холде: <b>{pend} ₽</b>
-"
-                    f"— Выплачено: <b>{paid} ₽</b>"
-                ),
-                reply_markup=_kb_user_nav(),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    await cb.answer(f"✅ Одобрено: {len(notifications)} пользователей / {len(items)} начислений", show_alert=True)
-    # refresh screen
-    try:
-        cb.data = "admin:ref:holds"
-        await admin_ref_holds(cb)  # type: ignore
-    except Exception:
-        pass
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("admin:ref:holds:approve:"))
-async def admin_ref_holds_approve_one(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    tg_id = int(cb.data.split(":")[-1])
-    now = datetime.now(timezone.utc)
-
-    moved = 0
-    avail = pend = paid = 0
-
-    async with session_scope() as session:
-        items = (
-            await session.scalars(
-                select(ReferralEarning).where(
-                    ReferralEarning.status == "pending",
-                    ReferralEarning.referrer_tg_id == tg_id,
-                )
-            )
-        ).all()
-
-        moved = sum(int(e.earned_rub or 0) for e in items)
-
-        for e in items:
-            e.status = "available"
-            e.available_at = now
-
-        await session.commit()
-
+        tg_id = int(req.tg_id)
         avail, pend, paid = await referral_service.get_balances(session, tg_id)
 
-    # Notify user
+    await cb.message.edit_text(
+        f"✅ Заявка <code>{req_id}</code> отмечена как <b>paid</b>.",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+    await cb.answer()
+
+    # notify user
     try:
         await cb.bot.send_message(
-            chat_id=int(tg_id),
+            chat_id=tg_id,
             text=(
-                "✅ <b>Реферальные начисления одобрены</b>
-
-"
-                f"Переведено: <b>{moved} ₽</b> (pending → available)
-"
-                f"Ваш баланс:
-"
-                f"— Доступно: <b>{avail} ₽</b>
-"
-                f"— В холде: <b>{pend} ₽</b>
-"
+                "✅ <b>Выплата обработана</b>\n\n"
+                f"Заявка: <code>{req_id}</code>\n"
+                f"Статус: <b>paid</b>\n\n"
+                "Ваш баланс:\n"
+                f"— Доступно: <b>{avail} ₽</b>\n"
+                f"— В холде: <b>{pend} ₽</b>\n"
                 f"— Выплачено: <b>{paid} ₽</b>"
             ),
             reply_markup=_kb_user_nav(),
@@ -1203,11 +961,132 @@ async def admin_ref_holds_approve_one(cb: CallbackQuery) -> None:
     except Exception:
         pass
 
-    await cb.answer(f"✅ Одобрено для {tg_id}: {moved} ₽ / {len(items)} начислений", show_alert=True)
-    # refresh
+
+@router.callback_query(lambda c: c.data == "admin:payout:reject")
+async def admin_payout_reject(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.set_state(AdminYandexFSM.payout_wait_reject_note)
+
+    await cb.message.edit_text(
+        "❌ <b>Отклонение заявки</b>\n\n"
+        "Отправь комментарий (почему отклонено). Можно коротко.\n"
+        "Если не нужен — отправь <code>-</code>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+    await cb.answer()
+
+
+@router.message(AdminYandexFSM.payout_wait_reject_note)
+async def admin_payout_reject_note(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    note = (message.text or "").strip()
+    if note == "-":
+        note = ""
+
+    data = await state.get_data()
+    req_id = int(data.get("payout_req_id") or 0)
+    await state.clear()
+
+    if not req_id:
+        await message.answer("❌ Сессия сбилась.", reply_markup=kb_admin_menu())
+        return
+
+    async with session_scope() as session:
+        req = await session.get(PayoutRequest, req_id)
+        if not req:
+            await message.answer("❌ Заявка не найдена.", reply_markup=kb_admin_menu())
+            return
+
+        await referral_service.reject_payout(session, request_id=req_id, note=note)
+        await session.commit()
+
+        tg_id = int(req.tg_id)
+        avail, pend, paid = await referral_service.get_balances(session, tg_id)
+
+    await message.answer(
+        f"✅ Заявка <code>{req_id}</code> отмечена как <b>rejected</b>.",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
     try:
-        cb.data = "admin:ref:holds"
-        await admin_ref_holds(cb)  # type: ignore
+        await message.bot.send_message(
+            chat_id=tg_id,
+            text=(
+                "❌ <b>Выплата отклонена</b>\n\n"
+                f"Заявка: <code>{req_id}</code>\n"
+                f"Статус: <b>rejected</b>\n"
+                f"Комментарий: <i>{note or '—'}</i>\n\n"
+                "Ваш баланс:\n"
+                f"— Доступно: <b>{avail} ₽</b>\n"
+                f"— В холде: <b>{pend} ₽</b>\n"
+                f"— Выплачено: <b>{paid} ₽</b>"
+            ),
+            reply_markup=_kb_user_nav(),
+            parse_mode="HTML",
+        )
     except Exception:
         pass
 
+
+# ==========================
+# BULK APPROVE PENDING -> AVAILABLE (NOTIFY USERS)
+# ==========================
+
+@router.callback_query(lambda c: c.data == "admin:ref:approve_pending")
+async def admin_ref_approve_pending(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        # take snapshot grouped by user for notifications
+        rows = (await session.execute(
+            select(
+                ReferralEarning.referrer_tg_id,
+                func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("sum_rub"),
+            )
+            .where(ReferralEarning.status == "pending")
+            .group_by(ReferralEarning.referrer_tg_id)
+        )).all()
+
+        moved_count = await referral_service.release_pending(session)
+        await session.commit()
+
+    await cb.message.edit_text(
+        f"✅ Pending→available выполнено.\nОдобрено начислений: <b>{moved_count}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+    await cb.answer()
+
+    # notify each affected user with correct balances (FIXED)
+    for r in rows:
+        try:
+            tg_id = int(r.referrer_tg_id)
+            moved_sum_rub = int(r.sum_rub or 0)
+
+            async with session_scope() as session:
+                available, pending, paid = await referral_service.get_balances(session, tg_id)
+
+            await cb.bot.send_message(
+                chat_id=int(tg_id),
+                text=(
+                    "✅ <b>Реферальные начисления одобрены</b>\n\n"
+                    f"Переведено: <b>{moved_count}</b> начислений на сумму <b>{moved_sum_rub} ₽</b> (pending → available)\n\n"
+                    "Ваш баланс:\n"
+                    f"— Доступно: <b>{available} ₽</b>\n"
+                    f"— В холде: <b>{pending} ₽</b>\n"
+                    f"— Выплачено: <b>{paid} ₽</b>"
+                ),
+                reply_markup=_kb_user_nav(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            continue
