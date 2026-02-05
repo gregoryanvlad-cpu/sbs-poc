@@ -72,7 +72,8 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="📋 Кого исключить сегодня", callback_data="admin:kick:report")
     b.button(text="🧾 Отметить пользователя исключённым", callback_data="admin:kick:mark")
 
-    b.button(text="💸 Заявки на вывод", callback_data="admin:payouts:list")
+    # Payout requests list (admin)
+    b.button(text="💸 Заявки на вывод", callback_data="admin:payout:list")
 
     # TEST: накрутить реферальные начисления, чтобы проверить выводы
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
