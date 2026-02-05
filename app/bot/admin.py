@@ -89,6 +89,15 @@ def _fmt_plus_end_at(dt: datetime | None) -> str:
     return _fmt_dt(dt)
 
 
+
+def _kb_user_nav() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Личный кабинет", callback_data="nav:cabinet")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
 # ==========================
 # FSM
 # ==========================
@@ -1071,7 +1080,20 @@ async def admin_ref_holds_approve_all(cb: CallbackQuery) -> None:
 
     now = datetime.now(timezone.utc)
 
+    notifications: list[tuple[int, int, int, int, int]] = []  # (tg_id, moved, avail, pending, paid)
+
     async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(
+                    ReferralEarning.referrer_tg_id,
+                    func.coalesce(func.sum(ReferralEarning.earned_rub), 0).label("moved_rub"),
+                )
+                .where(ReferralEarning.status == "pending")
+                .group_by(ReferralEarning.referrer_tg_id)
+            )
+        ).all()
+
         items = (
             await session.scalars(
                 select(ReferralEarning).where(ReferralEarning.status == "pending")
@@ -1082,9 +1104,41 @@ async def admin_ref_holds_approve_all(cb: CallbackQuery) -> None:
             e.status = "available"
             # ensure it won't be stuck if scheduler expects available_at
             e.available_at = now
+
         await session.commit()
 
-    await cb.answer(f"✅ Одобрено: {len(items)}", show_alert=True)
+        # Prepare per-user balances AFTER move
+        moved_map = {int(r[0]): int(r[1] or 0) for r in rows}
+        for tg_id, moved in moved_map.items():
+            avail, pend, paid = await referral_service.get_balances(session, tg_id)
+            notifications.append((tg_id, moved, avail, pend, paid))
+
+    # Notify users (best-effort; user may block bot)
+    for tg_id, moved, avail, pend, paid in notifications:
+        try:
+            await cb.bot.send_message(
+                chat_id=int(tg_id),
+                text=(
+                    "✅ <b>Реферальные начисления одобрены</b>
+
+"
+                    f"Переведено: <b>{moved} ₽</b> (pending → available)
+"
+                    f"Ваш баланс:
+"
+                    f"— Доступно: <b>{avail} ₽</b>
+"
+                    f"— В холде: <b>{pend} ₽</b>
+"
+                    f"— Выплачено: <b>{paid} ₽</b>"
+                ),
+                reply_markup=_kb_user_nav(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await cb.answer(f"✅ Одобрено: {len(notifications)} пользователей / {len(items)} начислений", show_alert=True)
     # refresh screen
     try:
         cb.data = "admin:ref:holds"
@@ -1102,6 +1156,9 @@ async def admin_ref_holds_approve_one(cb: CallbackQuery) -> None:
     tg_id = int(cb.data.split(":")[-1])
     now = datetime.now(timezone.utc)
 
+    moved = 0
+    avail = pend = paid = 0
+
     async with session_scope() as session:
         items = (
             await session.scalars(
@@ -1112,16 +1169,45 @@ async def admin_ref_holds_approve_one(cb: CallbackQuery) -> None:
             )
         ).all()
 
+        moved = sum(int(e.earned_rub or 0) for e in items)
+
         for e in items:
             e.status = "available"
             e.available_at = now
 
         await session.commit()
 
-    await cb.answer(f"✅ Одобрено для {tg_id}: {len(items)}", show_alert=True)
+        avail, pend, paid = await referral_service.get_balances(session, tg_id)
+
+    # Notify user
+    try:
+        await cb.bot.send_message(
+            chat_id=int(tg_id),
+            text=(
+                "✅ <b>Реферальные начисления одобрены</b>
+
+"
+                f"Переведено: <b>{moved} ₽</b> (pending → available)
+"
+                f"Ваш баланс:
+"
+                f"— Доступно: <b>{avail} ₽</b>
+"
+                f"— В холде: <b>{pend} ₽</b>
+"
+                f"— Выплачено: <b>{paid} ₽</b>"
+            ),
+            reply_markup=_kb_user_nav(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await cb.answer(f"✅ Одобрено для {tg_id}: {moved} ₽ / {len(items)} начислений", show_alert=True)
     # refresh
     try:
         cb.data = "admin:ref:holds"
         await admin_ref_holds(cb)  # type: ignore
     except Exception:
         pass
+
