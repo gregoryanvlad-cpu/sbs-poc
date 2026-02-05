@@ -936,4 +936,3 @@ async def admin_payout_actions(cb: CallbackQuery) -> None:
             await cb.answer("✅ rejected")
         else:
             await cb.answer()
-
