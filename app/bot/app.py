@@ -1,33 +1,32 @@
-import logging
-
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
 
-from app.core.config import settings
-from app.bot.handlers.start import router as start_router
-from app.bot.handlers.nav import router as nav_router
-from app.bot.handlers.yandex import router as yandex_router
-from app.bot.handlers.referrals import router as referrals_router
+from app.config import settings
+from app.bot.middlewares import CorrelationIdMiddleware
+
+from app.bot.handlers import start, nav, referrals, yandex
 from app.bot.admin import router as admin_router
 from app.bot.admin_kick import router as admin_kick_router
-from app.bot.middlewares import CorrelationIdMiddleware, RateLimitMiddleware
-
-log = logging.getLogger(__name__)
 
 
-async def run_bot() -> None:
-    bot = Bot(token=settings.bot_token)
+def run_bot():
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        parse_mode=ParseMode.HTML,
+    )
+
     dp = Dispatcher()
-        dp.message.middleware(CorrelationIdMiddleware())
-    dp.callback_query.middleware(CorrelationIdMiddleware())
-    dp.callback_query.middleware(RateLimitMiddleware(min_interval_sec=0.4))
 
-    dp.include_router(start_router)
-    dp.include_router(nav_router)
-    dp.include_router(yandex_router)
-    dp.include_router(referrals_router)
+    # middlewares
+    dp.message.middleware(CorrelationIdMiddleware())
+    dp.callback_query.middleware(CorrelationIdMiddleware())
+
+    # routers
+    dp.include_router(start.router)
+    dp.include_router(nav.router)
+    dp.include_router(referrals.router)
+    dp.include_router(yandex.router)
     dp.include_router(admin_router)
-    # Admin kick / mark removed flows
     dp.include_router(admin_kick_router)
 
-    log.info("bot_start")
-    await dp.start_polling(bot)
+    return bot, dp
