@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 async def run_bot() -> None:
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
-    dp.message.middleware(CorrelationIdMiddleware())
+        dp.message.middleware(CorrelationIdMiddleware())
     dp.callback_query.middleware(CorrelationIdMiddleware())
     dp.callback_query.middleware(RateLimitMiddleware(min_interval_sec=0.4))
 
