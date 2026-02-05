@@ -74,6 +74,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
 
     # Payout requests list (admin)
     b.button(text="💸 Заявки на вывод", callback_data="admin:payout:list")
+    b.button(text="⏳ Холды (рефералка)", callback_data="admin:ref:holds")
 
     # TEST: накрутить реферальные начисления, чтобы проверить выводы
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
@@ -85,4 +86,3 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
-
