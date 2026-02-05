@@ -57,9 +57,9 @@ async def main() -> None:
     scheduler_task = None
     if settings.scheduler_enabled:
         scheduler_task = asyncio.create_task(run_scheduler(), name="scheduler")
-
     try:
-        await run_bot()
+        bot, dp = run_bot()
+        await dp.start_polling(bot)
     finally:
         if scheduler_task:
             scheduler_task.cancel()
