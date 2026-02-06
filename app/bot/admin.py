@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -20,6 +21,7 @@ from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.services.referrals.service import referral_service
+from app.services.vpn.service import vpn_service
 
 router = Router()
 
@@ -134,8 +136,22 @@ async def admin_menu(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
+    # Best-effort VPN status block (never fail admin menu)
+    vpn_line = "🌍 VPN: статус недоступен"
+    try:
+        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
+        if st.get("ok"):
+            cpu = st.get("cpu_load_percent")
+            act = st.get("active_peers")
+            tot = st.get("total_peers")
+            if cpu is not None and act is not None and tot is not None:
+                vpn_line = f"🌍 VPN: загрузка CPU ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
+    except Exception:
+        pass
+
     await cb.message.edit_text(
-        "🛠 <b>Админка</b>\n\n"
+        "🛠 <b>Админка</b>\n"
+        f"{vpn_line}\n\n"
         "🟡 <b>Yandex Plus (ручной режим)</b>\n"
         "— добавляешь аккаунт и дату окончания Plus\n"
         "— загружаешь 3 готовые ссылки-приглашения (слоты 1..3)\n"
@@ -148,6 +164,41 @@ async def admin_menu(cb: CallbackQuery) -> None:
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:status")
+async def admin_vpn_status(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=6)
+    except Exception:
+        st = {"ok": False}
+
+    if not st.get("ok"):
+        text = (
+            "📊 <b>Статус VPN</b>\n\n"
+            "❌ Не удалось получить статус сервера.\n"
+            "Проверь SSH (WG_SSH_*) и доступность сервера."
+        )
+    else:
+        cpu = st.get("cpu_load_percent")
+        act = st.get("active_peers")
+        tot = st.get("total_peers")
+        text = (
+            "📊 <b>Статус VPN</b>\n\n"
+            f"— Загрузка CPU: <b>{cpu:.1f}%</b>\n"
+            f"— Активных пиров (handshake &lt; 3 мин): <b>{act}</b>\n"
+            f"— Всего пиров на интерфейсе: <b>{tot}</b>\n"
+        )
+
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+    except Exception:
+        pass
     await cb.answer()
 
 
