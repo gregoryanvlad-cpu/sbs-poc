@@ -191,5 +191,35 @@ class VPNService:
             "PersistentKeepalive = 25\n"
         )
 
+    async def get_server_status(self) -> Dict[str, Any]:
+        """Best-effort server status for UI (no hard dependency).
+
+        Returns:
+          {
+            ok: bool,
+            cpu_load_percent: float|None,
+            active_peers: int|None,
+            total_peers: int|None,
+          }
+        """
+        try:
+            cpu = await self.provider.get_cpu_load_percent(sample_seconds=1)
+            active = await self.provider.get_active_peers(window_seconds=180)
+            total = await self.provider.get_total_peers()
+            return {
+                "ok": True,
+                "cpu_load_percent": cpu,
+                "active_peers": active,
+                "total_peers": total,
+            }
+        except Exception as e:
+            log.warning("vpn_status_unavailable: %s", e)
+            return {
+                "ok": False,
+                "cpu_load_percent": None,
+                "active_peers": None,
+                "total_peers": None,
+            }
+
 
 vpn_service = VPNService()
