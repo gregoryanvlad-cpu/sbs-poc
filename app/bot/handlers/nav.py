@@ -143,7 +143,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         if ym and ym.invite_link:
             y_text = (
                 f"— Семья: <code>{getattr(ym, 'account_label', '—') or '—'}</code>\n"
-                f"— Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n"
+                f"— № Места: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n"
                 "— Приглашение: ✅ есть"
             )
         else:
@@ -153,7 +153,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             "👤 <b>Личный кабинет</b>\n\n"
             f"🆔 ID: <code>{cb.from_user.id}</code>\n\n"
             f"💳 Подписка: {'активна ✅' if _is_sub_active(sub.end_at) else 'не активна ❌'}\n"
-            f"📅 До: {fmt_dt(sub.end_at)}\n"
+            f"📅 Активна до: {fmt_dt(sub.end_at)}\n"
             f"⏳ Осталось: {days_left(sub.end_at)} дн.\n\n"
             "🟡 <b>Yandex Plus</b>\n"
             f"{y_text}\n\n"
@@ -162,7 +162,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             "\n\n👥 <b>Рефералы</b>\n"
             f"{inviter_line}"
             f"— Активных: <b>{active_refs}</b>\n"
-            f"— Баланс: <b>{bal_av} ₽</b> (ожидание {bal_pend} ₽)\n"
+            f"— Баланс: <b>{bal_av} ₽</b> (HOLD (7 дней) {bal_pend} ₽)\n"
             "— Реферал засчитывается после первой оплаты другом.\n"
         )
         try:
@@ -287,7 +287,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             buttons.append([InlineKeyboardButton(text="Получить приглашение", callback_data="yandex:issue")])
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
-                "Нажми кнопку ниже — я выдам тебе приглашение в семейную подписку.\n"
+                "Нажмите кнопку ниже — вам будет выслано приглашение в семейную подписку.\n"
                 "После выдачи ссылка останется в этом разделе."
             )
 
@@ -372,7 +372,7 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 
     await cb.message.edit_text(
         "✅ <b>Оплата прошла успешно!</b>\n\n"
-        "Для подключения перейдите в разделы:\n"
+        "Теперь вам доступны следующие разделы:\n"
         "— 🟡 <b>Yandex Plus</b>\n"
         "— 🌍 <b>VPN</b>\n\n"
         "Спасибо, что выбрали наш сервис 💛",
@@ -386,9 +386,9 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 async def on_vpn_guide(cb: CallbackQuery) -> None:
     text = (
         "📖 Инструкция\n\n"
-        "1) Нажми «Отправить конфиг + QR»\n"
-        "2) Импортируй в WireGuard\n"
-        f"3) Конфиг удалится через {settings.auto_delete_seconds} сек."
+        "1) Нажмите «Отправить конфиг + QR»\n"
+        "2) Импортируйте конфигурацию (.conf) в WireGuard\n"
+        f"3) Конфигурация будет удалено автоматиечски через {settings.auto_delete_seconds} сек."
     )
     await cb.message.edit_text(text, reply_markup=kb_vpn())
     await cb.answer()
@@ -400,11 +400,11 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, cb.from_user.id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна", show_alert=True)
+            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
             return
 
     await cb.message.edit_text(
-        "♻️ Сбросить VPN?\nСтарый конфиг перестанет работать.",
+        "♻️ Сбросить VPN?\n ВНИМАНИЕ: Старый конфиг перестанет работать.",
         reply_markup=kb_confirm_reset(),
     )
     await cb.answer()
@@ -419,7 +419,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна", show_alert=True)
+            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
             return
 
     await cb.answer("Сбрасываю…")
@@ -489,7 +489,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна", show_alert=True)
+            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
             return
 
         try:
