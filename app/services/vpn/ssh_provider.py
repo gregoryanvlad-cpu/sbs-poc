@@ -58,16 +58,28 @@ class WireGuardSSHProvider:
                 await asyncio.sleep(0.5)
         raise last
 
-    async def _run_output(self, cmd: str) -> str:
-        """Run a command over SSH and return stdout (best-effort)."""
+    async def _run_output(self, cmd: str, *, check: bool = True) -> str:
+        """Run a command over SSH and return stdout.
+
+        If check=False, a non-zero exit code won't raise; stderr will be logged.
+        """
         last = None
         for _ in range(self.retries):
             try:
                 async with await self._connect() as conn:
                     full_cmd = f"{ENV_PATH} {cmd}"
-                    result = await conn.run(full_cmd, timeout=self.cmd_timeout, check=True)
+                    try:
+                        result = await conn.run(full_cmd, timeout=self.cmd_timeout, check=check)
+                    except asyncssh.ProcessError as e:
+                        # Surface stderr to logs (helps debug remote env differences).
+                        if getattr(e, "stderr", None):
+                            log.warning("SSH stderr: %s", str(e.stderr).strip())
+                        raise
+
                     if result.stderr:
                         log.warning("SSH stderr: %s", result.stderr.strip())
+                    if not check and getattr(result, "exit_status", 0) != 0:
+                        log.warning("SSH non-zero exit status %s for cmd: %s", result.exit_status, cmd)
                     return (result.stdout or "").strip()
             except Exception as e:
                 last = e
@@ -109,17 +121,20 @@ class WireGuardSSHProvider:
         # Compute CPU usage percent using /proc/stat delta over sample_seconds.
         # Returns a float in range [0,100].
         s = int(sample_seconds)
+        # NOTE: use POSIX sh (bash may be absent on some minimal images).
         cmd = (
-            "bash -lc '"
-            "read cpu u n s i w irq sirq st < /proc/stat; "
-            "t1=$((u+n+s+i+w+irq+sirq+st)); i1=$((i+w)); "
-            f"sleep {s}; "
-            "read cpu u n s i w irq sirq st < /proc/stat; "
-            "t2=$((u+n+s+i+w+irq+sirq+st)); i2=$((i+w)); "
-            "dt=$((t2-t1)); di=$((i2-i1)); "
-            "if [ $dt -le 0 ]; then echo 0; else echo $(( (1000*(dt-di))/dt )); fi'"
+            'sh -lc "'
+            'read cpu u n s i w irq sirq st _ < /proc/stat; '
+            't1=$((u+n+s+i+w+irq+sirq+st)); i1=$((i+w)); '
+            f'sleep {s}; '
+            'read cpu u n s i w irq sirq st _ < /proc/stat; '
+            't2=$((u+n+s+i+w+irq+sirq+st)); i2=$((i+w)); '
+            'dt=$((t2-t1)); di=$((i2-i1)); '
+            'if [ "$dt" -le 0 ]; then echo 0; else echo $(( (1000*(dt-di))/dt )); fi'
+            '"'
         )
-        out = await self._run_output(cmd)
+        # Best-effort: don't crash status if command fails.
+        out = await self._run_output(cmd, check=False)
         try:
             per_mille = int(out.strip()) if out else 0
             if per_mille < 0:
