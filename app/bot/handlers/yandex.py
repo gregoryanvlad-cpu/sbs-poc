@@ -7,6 +7,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 from sqlalchemy import select
 
 from app.bot.keyboards import kb_main
+from app.services.vpn.service import vpn_service
 from app.db.session import session_scope
 from app.db.models.yandex_membership import YandexMembership
 from app.repo import get_subscription
@@ -14,6 +15,22 @@ from app.bot.ui import utcnow
 from app.services.yandex.service import yandex_service
 
 router = Router()
+
+
+async def _home_text_with_vpn() -> str:
+    """Local helper to keep main menu consistent."""
+    line = "🌍 VPN: статус недоступен"
+    try:
+        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
+        if st.get("ok"):
+            cpu = st.get("cpu_load_percent")
+            act = st.get("active_peers")
+            tot = st.get("total_peers")
+            if cpu is not None and act is not None and tot is not None:
+                line = f"🌍 VPN: загрузка ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
+    except Exception:
+        pass
+    return "🏠 <b>Главное меню</b>\n" + line
 
 
 def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
@@ -117,10 +134,26 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
             await cb.bot.edit_message_text(
                 chat_id=sent.chat.id,
                 message_id=sent.message_id,
-                text="Главное меню:",
+                text=await _home_text_with_vpn(),
                 reply_markup=kb_main(),
+                parse_mode="HTML",
             )
         except Exception:
             pass
 
     asyncio.create_task(_auto_back())
+
+
+async def _home_text_with_vpn() -> str:
+    line = "🌍 VPN: статус недоступен"
+    try:
+        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
+        if st.get("ok"):
+            cpu = st.get("cpu_load_percent")
+            act = st.get("active_peers")
+            tot = st.get("total_peers")
+            if cpu is not None and act is not None and tot is not None:
+                line = f"🌍 VPN: загрузка ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
+    except Exception:
+        pass
+    return "🏠 <b>Главное меню</b>\n" + line
