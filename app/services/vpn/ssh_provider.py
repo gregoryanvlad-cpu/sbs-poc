@@ -118,29 +118,54 @@ class WireGuardSSHProvider:
             return 0
 
     async def get_cpu_load_percent(self, sample_seconds: int = 1) -> float:
-        # Compute CPU usage percent using /proc/stat delta over sample_seconds.
-        # Returns a float in range [0,100].
-        s = int(sample_seconds)
-        # NOTE: use POSIX sh (bash may be absent on some minimal images).
-        cmd = (
-            'sh -lc "'
-            'read cpu u n s i w irq sirq st _ < /proc/stat; '
-            't1=$((u+n+s+i+w+irq+sirq+st)); i1=$((i+w)); '
-            f'sleep {s}; '
-            'read cpu u n s i w irq sirq st _ < /proc/stat; '
-            't2=$((u+n+s+i+w+irq+sirq+st)); i2=$((i+w)); '
-            'dt=$((t2-t1)); di=$((i2-i1)); '
-            'if [ "$dt" -le 0 ]; then echo 0; else echo $(( (1000*(dt-di))/dt )); fi'
-            '"'
-        )
-        # Best-effort: don't crash status if command fails.
-        out = await self._run_output(cmd, check=False)
-        try:
-            per_mille = int(out.strip()) if out else 0
-            if per_mille < 0:
-                per_mille = 0
-            if per_mille > 1000:
-                per_mille = 1000
-            return per_mille / 10.0
-        except Exception:
+        """Compute CPU usage percent using /proc/stat deltas.
+
+        We intentionally do the math on *our* side instead of a remote shell
+        expression: on some minimal images, shell arithmetic/awk variants can
+        behave differently and produce "0" even when there is load.
+        """
+
+        def _parse_cpu_line(line: str) -> Optional[list[int]]:
+            # Example: cpu  4705 0 4310 136239 52 0 103 0 0 0
+            parts = line.strip().split()
+            if len(parts) < 5 or parts[0] != "cpu":
+                return None
+            try:
+                return [int(x) for x in parts[1:]]
+            except Exception:
+                return None
+
+        s = max(1, int(sample_seconds))
+
+        # Snapshot #1
+        out1 = await self._run_output("head -n1 /proc/stat", check=False)
+        v1 = _parse_cpu_line(out1)
+        if not v1:
             return 0.0
+
+        await asyncio.sleep(s)
+
+        # Snapshot #2
+        out2 = await self._run_output("head -n1 /proc/stat", check=False)
+        v2 = _parse_cpu_line(out2)
+        if not v2:
+            return 0.0
+
+        # Fields order (Linux): user nice system idle iowait irq softirq steal guest guest_nice
+        # We treat idle = idle + iowait (if present).
+        idle1 = v1[3] + (v1[4] if len(v1) > 4 else 0)
+        idle2 = v2[3] + (v2[4] if len(v2) > 4 else 0)
+        total1 = sum(v1)
+        total2 = sum(v2)
+
+        dt = total2 - total1
+        didle = idle2 - idle1
+        if dt <= 0:
+            return 0.0
+
+        usage = (dt - didle) / dt * 100.0
+        if usage < 0:
+            usage = 0.0
+        if usage > 100:
+            usage = 100.0
+        return round(usage, 1)
