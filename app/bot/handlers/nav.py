@@ -50,7 +50,8 @@ async def _build_home_text() -> str:
             act = st.get("active_peers")
             tot = st.get("total_peers")
             if cpu is not None and act is not None and tot is not None:
-                line = f"🌍 Нагрузка на VPN сейчас составляет:~<b>{cpu:.0f}%</b>"
+                cpu_str = f"{cpu:.1f}%" if cpu >= 0.1 else ("&lt;0.1%" if cpu > 0 else "0.0%")
+                line = f"🌍 Нагрузка на VPN сейчас составляет: <b>{cpu_str}</b>"
     except Exception:
         pass
 
