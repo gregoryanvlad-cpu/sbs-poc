@@ -40,6 +40,23 @@ from app.services.referrals.service import referral_service
 router = Router()
 
 
+async def _build_home_text() -> str:
+    """Main menu text with best-effort VPN status."""
+    line = "🌍 VPN: статус недоступен"
+    try:
+        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
+        if st.get("ok"):
+            cpu = st.get("cpu_load_percent")
+            act = st.get("active_peers")
+            tot = st.get("total_peers")
+            if cpu is not None and act is not None and tot is not None:
+                line = f"🌍 VPN: загрузка ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
+    except Exception:
+        pass
+
+    return "🏠 <b>Главное меню</b>\n" + line
+
+
 def _is_sub_active(sub_end_at: datetime | None) -> bool:
     if not sub_end_at:
         return False
@@ -91,7 +108,7 @@ async def on_nav(cb: CallbackQuery) -> None:
     if where == "home":
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         try:
-            await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(), parse_mode="HTML")
         except Exception:
             pass
         await cb.answer()
@@ -518,7 +535,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
             except Exception:
                 pass
         try:
-            await cb.message.edit_text("Главное меню:", reply_markup=kb_main())
+            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(), parse_mode="HTML")
         except Exception:
             pass
 
