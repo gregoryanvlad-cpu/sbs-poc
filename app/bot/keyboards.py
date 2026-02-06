@@ -63,6 +63,9 @@ def kb_confirm_reset() -> InlineKeyboardMarkup:
 def kb_admin_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
 
+    # VPN status
+    b.button(text="📊 Статус VPN", callback_data="admin:vpn:status")
+
     # Yandex manual
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
     b.button(text="📋 Список аккаунтов/слотов", callback_data="admin:yandex:list")
