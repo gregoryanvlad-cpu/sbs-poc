@@ -221,5 +221,36 @@ class VPNService:
                 "total_peers": None,
             }
 
+    async def get_recent_peer_handshakes(self, window_seconds: int = 180) -> list[dict[str, Any]]:
+        """List recent peers by latest handshake.
+
+        Returns a list of dicts:
+          {public_key, handshake_ts, age_seconds}
+        for peers with handshake within window_seconds.
+
+        This is used by admin UI to map active peers to user profiles.
+        """
+        try:
+            hs = await self.provider.get_latest_handshakes()
+        except Exception as e:
+            log.warning("vpn_recent_handshakes_unavailable: %s", e)
+            return []
+
+        now_ts = int(utcnow().timestamp())
+        items: list[dict[str, Any]] = []
+        w = max(1, int(window_seconds))
+        for k, ts in hs.items():
+            if not ts or ts <= 0:
+                continue
+            age = now_ts - int(ts)
+            if age < 0:
+                age = 0
+            if age <= w:
+                items.append({"public_key": k, "handshake_ts": int(ts), "age_seconds": int(age)})
+
+        # Sort most recent first
+        items.sort(key=lambda x: x.get("handshake_ts", 0), reverse=True)
+        return items
+
 
 vpn_service = VPNService()
