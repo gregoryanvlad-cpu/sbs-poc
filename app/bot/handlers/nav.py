@@ -42,6 +42,14 @@ from app.services.referrals.service import referral_service
 router = Router()
 
 
+async def _safe_cb_answer(cb: CallbackQuery) -> None:
+    """Best-effort callback answer (avoid 'query is too old' noise)."""
+    try:
+        await _safe_cb_answer(cb)
+    except Exception:
+        pass
+
+
 def _load_wg_instructions() -> dict:
     """Load device-specific WireGuard instructions from instructions.json.
 
@@ -130,14 +138,14 @@ async def _cleanup_flow_messages_for_user(bot, chat_id: int, tg_id: int) -> None
 
 @router.callback_query(lambda c: c.data and c.data.startswith("nav:"))
 async def on_nav(cb: CallbackQuery) -> None:
+    # Answer ASAP for *all* nav callbacks to avoid Telegram callback timeouts.
+    # Some branches do DB/SSH/network work and can take a few seconds.
+    await _safe_cb_answer(cb)
+
     where = cb.data.split(":", 1)[1]
 
     if where == "home":
-        # Answer ASAP to avoid "query is too old" (home text may wait on VPN status).
-        try:
-            await cb.answer()
-        except Exception:
-            pass
+        # Home text may wait on VPN status; callback already answered above.
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         try:
             await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(), parse_mode="HTML")
@@ -204,7 +212,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             )
         except Exception:
             pass
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     if where == "referrals":
@@ -269,7 +277,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception:
             pass
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     if where == "pay":
@@ -280,7 +288,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             )
         except Exception:
             pass
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     if where == "vpn":
@@ -288,7 +296,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
         except Exception:
             pass
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     if where == "yandex":
@@ -331,7 +339,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         except Exception:
             pass
 
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     if where == "faq":
@@ -346,7 +354,7 @@ async def on_nav(cb: CallbackQuery) -> None:
                 await cb.message.answer(text, reply_markup=kb_faq())
             except Exception:
                 pass
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     if where == "support":
@@ -357,7 +365,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             )
         except Exception:
             pass
-        await cb.answer()
+        await _safe_cb_answer(cb)
         return
 
     await cb.answer("Неизвестный раздел")
@@ -423,7 +431,7 @@ async def on_vpn_guide(cb: CallbackQuery) -> None:
         "Выберите устройство, чтобы открыть инструкцию:"
     )
     await cb.message.edit_text(text, reply_markup=kb_vpn_guide_platforms(), parse_mode="HTML")
-    await cb.answer()
+    await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("vpn:howto:"))
@@ -458,7 +466,7 @@ async def on_vpn_howto(cb: CallbackQuery) -> None:
     )
 
     await cb.message.edit_text(text, reply_markup=kb_vpn_guide_back(), parse_mode="HTML")
-    await cb.answer()
+    await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data == "vpn:reset:confirm")
@@ -474,7 +482,7 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
         "♻️ Сбросить VPN?\n ВНИМАНИЕ: Старый конфиг перестанет работать.",
         reply_markup=kb_confirm_reset(),
     )
-    await cb.answer()
+    await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data == "vpn:reset")
@@ -592,7 +600,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
         caption="QR для WireGuard",
     )
 
-    await cb.answer()
+    await _safe_cb_answer(cb)
 
     async def _cleanup():
         await asyncio.sleep(settings.auto_delete_seconds)
@@ -622,7 +630,7 @@ async def faq_about(cb: CallbackQuery) -> None:
         await cb.message.edit_text(FAQ_ABOUT_TEXT, reply_markup=kb_back_faq())
     except Exception:
         await cb.message.answer(FAQ_ABOUT_TEXT, reply_markup=kb_back_faq())
-    await cb.answer()
+    await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data == "faq:offer")
@@ -631,4 +639,4 @@ async def faq_offer(cb: CallbackQuery) -> None:
     file = BufferedInputFile(data, filename="public_offer.txt")
     await cb.message.answer_document(file, caption="📄 Публичная оферта (текстовым файлом)")
     await cb.message.answer("⬅️ Назад в FAQ", reply_markup=kb_back_faq())
-    await cb.answer()
+    await _safe_cb_answer(cb)
