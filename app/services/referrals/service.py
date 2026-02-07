@@ -228,6 +228,73 @@ class ReferralService:
         await session.flush()
 
     # =====================================================
+    # ADMIN-ONLY: FORCE REASSIGN REFERRAL OWNER
+    # =====================================================
+
+    async def admin_reassign_referral(
+        self,
+        session,
+        *,
+        referred_tg_id: int,
+        new_referrer_tg_id: int,
+    ) -> tuple[bool, int | None]:
+        """Force reassign referral owner.
+
+        This method is intended for admin tools only.
+
+        What it does:
+        - Ensure referred user exists.
+        - Update users.referred_by_tg_id to new owner (so next activation/prolongations work).
+        - If there are already Referral/ReferralEarning rows for this referred user,
+          reassign them to the new referrer as well (so future accounting is consistent).
+
+        Returns (ok, previous_referrer_tg_id).
+        """
+        referred_tg_id = int(referred_tg_id)
+        new_referrer_tg_id = int(new_referrer_tg_id)
+        if referred_tg_id <= 0 or new_referrer_tg_id <= 0:
+            return False, None
+        if referred_tg_id == new_referrer_tg_id:
+            return False, None
+
+        # Ensure both users exist.
+        referred = await session.get(User, referred_tg_id)
+        if not referred:
+            referred = User(tg_id=referred_tg_id)
+            session.add(referred)
+            await session.flush()
+
+        owner = await session.get(User, new_referrer_tg_id)
+        if not owner:
+            owner = User(tg_id=new_referrer_tg_id)
+            session.add(owner)
+            await session.flush()
+
+        prev = referred.referred_by_tg_id
+
+        # Update pending owner.
+        referred.referred_by_tg_id = new_referrer_tg_id
+        referred.referred_at = _utcnow()
+        await session.flush()
+
+        # Reassign active referral relationship (if any).
+        # Note: there may be multiple Referral rows (e.g. historical). We update all.
+        await session.execute(
+            Referral.__table__.update()
+            .where(Referral.referred_tg_id == referred_tg_id)
+            .values(referrer_tg_id=new_referrer_tg_id)
+        )
+
+        # Reassign earnings so balances follow the new owner.
+        await session.execute(
+            ReferralEarning.__table__.update()
+            .where(ReferralEarning.referred_tg_id == referred_tg_id)
+            .values(referrer_tg_id=new_referrer_tg_id)
+        )
+
+        return True, int(prev) if prev is not None else None
+
+    # =====================================================
     # PAYMENT HOOK
     # =====================================================
 
