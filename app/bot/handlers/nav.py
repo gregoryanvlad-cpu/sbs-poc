@@ -133,12 +133,16 @@ async def on_nav(cb: CallbackQuery) -> None:
     where = cb.data.split(":", 1)[1]
 
     if where == "home":
+        # Answer ASAP to avoid "query is too old" (home text may wait on VPN status).
+        try:
+            await cb.answer()
+        except Exception:
+            pass
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         try:
             await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(), parse_mode="HTML")
         except Exception:
             pass
-        await cb.answer()
         return
 
     if where == "cabinet":
