@@ -278,7 +278,89 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
     except Exception:
         pass
-    await cb.answer()
+    return
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
+async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
+    """Show which user profiles have an active WireGuard peer (recent handshake)."""
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    # Answer ASAP to avoid callback timeout (we do SSH + DB work below).
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    # 1) recent handshakes from the server
+    recent = await vpn_service.get_recent_peer_handshakes(window_seconds=180)
+    if not recent:
+        text = (
+            "👥 <b>Активные VPN-профили</b>\n\n"
+            "Сейчас нет пиров с handshake за последние 3 минуты."
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    keys = [x["public_key"] for x in recent if x.get("public_key")]
+
+    # 2) map public_key -> VpnPeer row (active peers only)
+    from sqlalchemy import select
+    from app.db.models.vpn_peer import VpnPeer
+    from app.db.session import session_scope
+
+    async with session_scope() as session:
+        q = select(VpnPeer).where(VpnPeer.is_active == True, VpnPeer.client_public_key.in_(keys))  # noqa: E712
+        res = await session.execute(q)
+        rows = list(res.scalars().all())
+
+    by_key = {r.client_public_key: r for r in rows}
+
+    # 3) render
+    lines: list[str] = ["👥 <b>Активные VPN-профили</b>", ""]
+    for item in recent[:25]:
+        k = item.get("public_key")
+        row = by_key.get(k)
+        if not row:
+            # Peer exists on server but not in DB (or not active in DB)
+            continue
+
+        label = await _format_user_label(cb.bot, int(row.tg_id))
+        hs_ts = int(item.get("handshake_ts") or 0)
+        age = int(item.get("age_seconds") or 0)
+
+        # Human readable timestamp (UTC) + age.
+        try:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromtimestamp(hs_ts, tz=timezone.utc)
+            hs_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            hs_str = "—"
+
+        lines.append(f"{label}")
+        lines.append(f"   └ Устройство: —")
+        lines.append(f"   └ Последний handshake: <code>{hs_str}</code> (~{age}с назад)")
+        lines.append("")
+
+    if len(lines) <= 2:
+        lines = [
+            "👥 <b>Активные VPN-профили</b>",
+            "",
+            "Не удалось сопоставить активные peer'ы с профилями в базе (vpn_peers).",
+        ]
+
+    try:
+        await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
+    except Exception:
+        pass
+
+    return
 
 
 # ==========================
