@@ -110,9 +110,11 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
 
 def kb_admin_referrals_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="👑 Забрать реферала себе", callback_data="admin:referrals:take")
-    b.button(text="🔁 Назначить реферала", callback_data="admin:referrals:assign")
-    b.button(text="🔍 Узнать владельца", callback_data="admin:referrals:owner")
+    # Важно: эти callback_data должны совпадать с хендлерами в admin.py
+    # (иначе будет "Update ... is not handled").
+    b.button(text="👑 Забрать реферала себе", callback_data="admin:ref:take:self")
+    b.button(text="🔁 Назначить реферала", callback_data="admin:ref:assign")
+    b.button(text="🔍 Узнать владельца", callback_data="admin:ref:owner")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
     b.adjust(1)
     return b.as_markup()
