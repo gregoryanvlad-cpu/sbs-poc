@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
-from app.bot.keyboards import kb_admin_menu
+from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, User
 from app.db.models.payout_request import PayoutRequest
@@ -177,6 +177,12 @@ async def admin_menu(cb: CallbackQuery) -> None:
         await cb.answer()
         return
 
+    # Answer ASAP to avoid "query is too old" when we do network calls below.
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
     # Best-effort VPN status block (never fail admin menu)
     vpn_line = "🌍 VPN: статус недоступен"
     try:
@@ -205,7 +211,19 @@ async def admin_menu(cb: CallbackQuery) -> None:
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(lambda c: c.data == "admin:referrals:menu")
+async def admin_referrals_menu(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
     await cb.answer()
+    await cb.message.edit_text(
+        "🔁 <b>Управление рефералами</b>\n\nВыбери действие:",
+        reply_markup=kb_admin_referrals_menu(),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(lambda c: c.data == "admin:vpn:status")
@@ -213,6 +231,9 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
+
+    # Answer ASAP to avoid callback timeout (we do SSH / network calls below).
+    await cb.answer()
 
     try:
         st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=6)
