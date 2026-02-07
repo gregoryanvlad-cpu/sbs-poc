@@ -51,6 +51,26 @@ def kb_vpn() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def kb_vpn_guide_platforms() -> InlineKeyboardMarkup:
+    """Device selector for WireGuard setup instructions."""
+    b = InlineKeyboardBuilder()
+    b.button(text="📱 Android", callback_data="vpn:howto:android")
+    b.button(text="🍎 iPhone / iPad", callback_data="vpn:howto:ios")
+    b.button(text="💻 Windows", callback_data="vpn:howto:windows")
+    b.button(text="🍏 macOS", callback_data="vpn:howto:macos")
+    b.button(text="🐧 Linux", callback_data="vpn:howto:linux")
+    b.button(text="⬅️ Назад", callback_data="nav:vpn")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_vpn_guide_back() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="vpn:guide")
+    b.adjust(1)
+    return b.as_markup()
+
+
 def kb_confirm_reset() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, сбросить", callback_data="vpn:reset")
@@ -65,6 +85,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
 
     # VPN status
     b.button(text="📊 Статус VPN", callback_data="admin:vpn:status")
+    b.button(text="👥 Активные VPN-профили", callback_data="admin:vpn:active_profiles")
 
     # Yandex manual
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
