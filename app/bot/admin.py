@@ -226,6 +226,23 @@ async def admin_referrals_menu(cb: CallbackQuery) -> None:
     )
 
 
+# Backward compatibility (older keyboards used these callback_data values).
+# Keeping them prevents "Update ... is not handled" if some old messages are still in chats.
+@router.callback_query(lambda c: c.data == "admin:referrals:take")
+async def _admin_referrals_take_legacy(cb: CallbackQuery, state: FSMContext) -> None:
+    await admin_ref_take_self(cb, state)
+
+
+@router.callback_query(lambda c: c.data == "admin:referrals:assign")
+async def _admin_referrals_assign_legacy(cb: CallbackQuery, state: FSMContext) -> None:
+    await admin_ref_assign(cb, state)
+
+
+@router.callback_query(lambda c: c.data == "admin:referrals:owner")
+async def _admin_referrals_owner_legacy(cb: CallbackQuery, state: FSMContext) -> None:
+    await admin_ref_owner(cb, state)
+
+
 @router.callback_query(lambda c: c.data == "admin:vpn:status")
 async def admin_vpn_status(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
