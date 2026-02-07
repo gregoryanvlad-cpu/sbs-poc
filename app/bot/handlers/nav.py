@@ -27,6 +27,8 @@ from app.bot.keyboards import (
     kb_main,
     kb_pay,
     kb_vpn,
+    kb_vpn_guide_platforms,
+    kb_vpn_guide_back,
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
@@ -38,6 +40,30 @@ from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 
 router = Router()
+
+
+def _load_wg_instructions() -> dict:
+    """Load device-specific WireGuard instructions from instructions.json.
+
+    Best-effort: if file missing or invalid, return an empty dict.
+    """
+    try:
+        # instructions.json is stored at project root
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[3]
+        p = root / "instructions.json"
+        if not p.exists():
+            return {}
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _fmt_instruction_block(lines: list[str]) -> str:
+    if not lines:
+        return "—"
+    return "\n".join(lines)
 
 
 async def _build_home_text() -> str:
@@ -386,12 +412,48 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "vpn:guide")
 async def on_vpn_guide(cb: CallbackQuery) -> None:
     text = (
-        "📖 Инструкция\n\n"
-        "1) Нажмите «Отправить конфиг + QR»\n"
-        "2) Импортируйте конфигурацию (.conf) в WireGuard\n"
-        f"3) Конфигурация будет удалено автоматиечски через {settings.auto_delete_seconds} сек."
+        "📖 <b>Инструкция по подключению WireGuard</b>\n\n"
+        "1) Нажмите «📦 Отправить конфиг + QR»\n"
+        "2) Импортируйте конфигурацию (.conf) в приложение WireGuard\n"
+        f"3) Конфиг будет удалён автоматически через <b>{settings.auto_delete_seconds} сек.</b>\n\n"
+        "Выберите устройство, чтобы открыть инструкцию:"
     )
-    await cb.message.edit_text(text, reply_markup=kb_vpn())
+    await cb.message.edit_text(text, reply_markup=kb_vpn_guide_platforms(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("vpn:howto:"))
+async def on_vpn_howto(cb: CallbackQuery) -> None:
+    platform = cb.data.split(":", 2)[2]
+
+    instructions = _load_wg_instructions()
+    lines = instructions.get(platform, [])
+
+    # Fallback for linux (often missing in json)
+    if platform == "linux" and not lines:
+        lines = [
+            "1) Установите WireGuard (Ubuntu/Debian): <code>sudo apt update && sudo apt install wireguard</code>",
+            "2) Скопируйте конфиг в <code>/etc/wireguard/wg0.conf</code>",
+            "3) Запустите: <code>sudo wg-quick up wg0</code>",
+            "4) Остановить: <code>sudo wg-quick down wg0</code>",
+        ]
+
+    title_map = {
+        "android": "📱 Android",
+        "ios": "🍎 iPhone / iPad",
+        "windows": "💻 Windows",
+        "macos": "🍏 macOS",
+        "linux": "🐧 Linux",
+    }
+    title = title_map.get(platform, platform)
+
+    text = (
+        f"{title} — <b>подключение WireGuard</b>\n\n"
+        f"{_fmt_instruction_block(lines)}\n\n"
+        "Если что-то не подключается — попробуйте «♻️ Сбросить VPN» в меню VPN."
+    )
+
+    await cb.message.edit_text(text, reply_markup=kb_vpn_guide_back(), parse_mode="HTML")
     await cb.answer()
 
 
