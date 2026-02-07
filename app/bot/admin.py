@@ -15,7 +15,6 @@ from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, User
-from app.db.models.vpn_peer import VpnPeer
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
@@ -86,6 +85,38 @@ def _fmt_plus_end_at(dt: datetime | None) -> str:
     return dt.date().isoformat()
 
 
+async def _resolve_tg_id(bot, raw: str) -> int | None:
+    """Resolve input like '123', '@username' to tg_id.
+
+    Best-effort: if username can't be resolved (e.g., user didn't start bot), returns None.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if s.startswith("@"):  # try resolve via get_chat
+        try:
+            chat = await bot.get_chat(s)
+            return int(chat.id)
+        except Exception:
+            return None
+    return None
+
+
+async def _tg_label(bot, tg_id: int) -> str:
+    """Human-readable label: First Last (@username)."""
+    try:
+        chat = await bot.get_chat(int(tg_id))
+        name = " ".join([p for p in [getattr(chat, "first_name", ""), getattr(chat, "last_name", "")] if p]).strip()
+        username = getattr(chat, "username", None)
+        if username:
+            return f"{name or 'Пользователь'} (@{username})"
+        return name or f"ID {tg_id}"
+    except Exception:
+        return f"ID {tg_id}"
+
+
 def _kb_user_nav() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -125,6 +156,15 @@ class AdminYandexFSM(StatesGroup):
 
     # approve holds
     hold_wait_user_id = State()
+
+
+class AdminReferralAssignFSM(StatesGroup):
+    waiting_referred = State()
+    waiting_new_owner = State()
+
+
+class AdminReferralOwnerFSM(StatesGroup):
+    waiting_referred = State()
 
 
 # ==========================
@@ -203,91 +243,220 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-def _fmt_age_seconds(age: int) -> str:
+# ==========================
+# REFERRALS MANAGEMENT (ADMIN-ONLY)
+# ==========================
+
+
+def _kb_ref_manage() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Забрать реферала себе", callback_data="admin:ref:take:self")],
+            [InlineKeyboardButton(text="🔁 Назначить реферала", callback_data="admin:ref:assign")],
+            [InlineKeyboardButton(text="🔍 Узнать владельца", callback_data="admin:ref:owner")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+        ]
+    )
+
+
+async def _resolve_tg_id_from_text(bot, text: str) -> int | None:
+    """Accepts tg id or @username. Returns tg_id or None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        return int(t)
+    if t.startswith("@"):  # username
+        try:
+            chat = await bot.get_chat(t)
+            return int(chat.id)
+        except Exception:
+            return None
+    return None
+
+
+async def _format_user_label(bot, tg_id: int) -> str:
+    """Best-effort: Иван (@ivan) / Иван / ID 123"""
     try:
-        age = int(age)
+        chat = await bot.get_chat(tg_id)
+        name = (chat.full_name or "").strip() or (chat.first_name or "").strip() or f"ID {tg_id}"
+        uname = getattr(chat, "username", None)
+        if uname:
+            return f"{name} (@{uname})"
+        return name
     except Exception:
-        age = 0
-    if age < 60:
-        return f"{age} сек"
-    if age < 3600:
-        m = age // 60
-        s = age % 60
-        return f"{m} мин {s} сек"
-    h = age // 3600
-    m = (age % 3600) // 60
-    return f"{h} ч {m} мин"
+        return f"ID {tg_id}"
 
 
-@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
-async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
+@router.callback_query(lambda c: c.data == "admin:ref:manage")
+async def admin_ref_manage(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
+    await state.clear()
+    await cb.message.edit_text(
+        "🔁 <b>Управление рефералами</b>\n\n"
+        "Здесь можно принудительно переназначать рефералов.\n"
+        "Пользователи сами никого присваивать не могут.",
+        reply_markup=_kb_ref_manage(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
 
-    # Get recent peers from wg and map to DB profiles.
-    peers = await vpn_service.get_recent_peer_handshakes(window_seconds=180)
-    if not peers:
-        text = (
-            "👥 <b>Активные VPN-профили</b>\n\n"
-            "❌ Активных VPN-подключений сейчас нет (handshake &lt; 3 мин)."
-        )
-        await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+
+@router.callback_query(lambda c: c.data == "admin:ref:take:self")
+async def admin_ref_take_self(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
         await cb.answer()
         return
-
-    keys = [p["public_key"] for p in peers if p.get("public_key")]
-    key_to_peer: dict[str, VpnPeer] = {}
-    async with session_scope() as session:
-        if keys:
-            q = select(VpnPeer).where(VpnPeer.client_public_key.in_(keys))
-            res = await session.execute(q)
-            rows = list(res.scalars().all())
-            # Prefer active row if duplicates exist
-            for r in rows:
-                if r.client_public_key not in key_to_peer or (r.is_active and not key_to_peer[r.client_public_key].is_active):
-                    key_to_peer[r.client_public_key] = r
-
-    lines = ["👥 <b>Активные VPN-профили</b>", ""]
-
-    idx = 0
-    for p in peers:
-        pub = p.get("public_key")
-        age = p.get("age_seconds", 0)
-        row = key_to_peer.get(pub)
-        if not row:
-            # Peer exists on server but not in DB (or rotated out)
-            idx += 1
-            short = (pub[:6] + "…" + pub[-6:]) if pub and len(pub) > 16 else (pub or "—")
-            lines.append(f"{idx}️⃣ Unknown profile")
-            lines.append(f"└ Паблик ключ: <code>{short}</code>")
-            lines.append(f"└ Устройство: —")
-            lines.append(f"└ Последний handshake: {_fmt_age_seconds(age)} назад")
-            lines.append("")
-            continue
-
-        tg_id = int(row.tg_id)
-
-        # Best-effort get name/username via Telegram
-        display = str(tg_id)
-        try:
-            chat = await cb.bot.get_chat(tg_id)
-            name = (getattr(chat, "first_name", None) or getattr(chat, "title", None) or str(tg_id)).strip()
-            username = getattr(chat, "username", None)
-            display = f"{name} (@{username})" if username else f"{name}"
-        except Exception:
-            display = str(tg_id)
-
-        idx += 1
-        lines.append(f"{idx}️⃣ {display}")
-        lines.append("└ Устройство: —")
-        lines.append(f"└ Последний handshake: {_fmt_age_seconds(age)} назад")
-        lines.append("")
-
-    lines.append(f"Всего активных: <b>{idx}</b>")
-
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
+    await state.clear()
+    await state.set_state(AdminReferralAssignFSM.waiting_referred)
+    await state.update_data(mode="take_self")
+    await cb.message.edit_text(
+        "👑 <b>Забрать реферала себе</b>\n\n"
+        "Отправь TG ID реферала или @username:",
+        reply_markup=_kb_ref_manage(),
+        parse_mode="HTML",
+    )
     await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:ref:assign")
+async def admin_ref_assign(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.set_state(AdminReferralAssignFSM.waiting_referred)
+    await state.update_data(mode="assign")
+    await cb.message.edit_text(
+        "🔁 <b>Назначить реферала</b>\n\n"
+        "Отправь TG ID реферала или @username:",
+        reply_markup=_kb_ref_manage(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.message(AdminReferralAssignFSM.waiting_referred)
+async def admin_ref_wait_referred(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    referred_id = await _resolve_tg_id_from_text(message.bot, message.text or "")
+    if not referred_id:
+        await message.answer("❌ Не получилось распознать пользователя. Пришли TG ID (цифры) или @username")
+        return
+
+    data = await state.get_data()
+    mode = data.get("mode")
+
+    if mode == "take_self":
+        new_owner_id = int(getattr(settings, "owner_tg_id", 0) or 0) or int(message.from_user.id)
+        async with session_scope() as session:
+            ok, prev = await referral_service.admin_reassign_referral(
+                session, referred_tg_id=referred_id, new_referrer_tg_id=new_owner_id
+            )
+            await session.commit()
+
+        ref_lbl = await _format_user_label(message.bot, referred_id)
+        prev_lbl = await _format_user_label(message.bot, prev) if prev else "—"
+        await state.clear()
+        await message.answer(
+            "✅ <b>Готово</b>\n\n"
+            f"Реферал: <b>{ref_lbl}</b>\n"
+            f"Был у: <b>{prev_lbl}</b>\n"
+            f"Теперь у: <b>{await _format_user_label(message.bot, new_owner_id)}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    # assign to a specific owner
+    await state.update_data(referred_id=referred_id)
+    await state.set_state(AdminReferralAssignFSM.waiting_new_owner)
+    await message.answer(
+        "👤 Отправь TG ID нового владельца или @username (кому назначить реферала):",
+        reply_markup=_kb_ref_manage(),
+    )
+
+
+@router.message(AdminReferralAssignFSM.waiting_new_owner)
+async def admin_ref_wait_new_owner(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    new_owner_id = await _resolve_tg_id_from_text(message.bot, message.text or "")
+    if not new_owner_id:
+        await message.answer("❌ Не получилось распознать пользователя. Пришли TG ID (цифры) или @username")
+        return
+
+    data = await state.get_data()
+    referred_id = int(data.get("referred_id") or 0)
+    if not referred_id:
+        await state.clear()
+        await message.answer("❌ Сессия сбилась. Открой управление рефералами заново.", reply_markup=kb_admin_menu())
+        return
+
+    async with session_scope() as session:
+        ok, prev = await referral_service.admin_reassign_referral(
+            session, referred_tg_id=referred_id, new_referrer_tg_id=int(new_owner_id)
+        )
+        await session.commit()
+
+    ref_lbl = await _format_user_label(message.bot, referred_id)
+    prev_lbl = await _format_user_label(message.bot, prev) if prev else "—"
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Готово</b>\n\n"
+        f"Реферал: <b>{ref_lbl}</b>\n"
+        f"Был у: <b>{prev_lbl}</b>\n"
+        f"Теперь у: <b>{await _format_user_label(message.bot, int(new_owner_id))}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:ref:owner")
+async def admin_ref_owner(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.set_state(AdminReferralOwnerFSM.waiting_referred)
+    await cb.message.edit_text(
+        "🔍 <b>Узнать владельца реферала</b>\n\n"
+        "Отправь TG ID реферала или @username:",
+        reply_markup=_kb_ref_manage(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.message(AdminReferralOwnerFSM.waiting_referred)
+async def admin_ref_owner_wait(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    referred_id = await _resolve_tg_id_from_text(message.bot, message.text or "")
+    if not referred_id:
+        await message.answer("❌ Не получилось распознать пользователя. Пришли TG ID (цифры) или @username")
+        return
+
+    async with session_scope() as session:
+        owner = await referral_service.get_current_referrer_tg_id(session, referred_tg_id=referred_id)
+
+    ref_lbl = await _format_user_label(message.bot, referred_id)
+    owner_lbl = await _format_user_label(message.bot, owner) if owner else "—"
+    await state.clear()
+    await message.answer(
+        "🔍 <b>Владелец реферала</b>\n\n"
+        f"Реферал: <b>{ref_lbl}</b>\n"
+        f"Владелец: <b>{owner_lbl}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
 
 
 # =========================================================
