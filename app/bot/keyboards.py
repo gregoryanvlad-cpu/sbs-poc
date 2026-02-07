@@ -45,14 +45,12 @@ def kb_vpn() -> InlineKeyboardMarkup:
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
-    # ✅ FIX: "Назад" должен вести в Главное меню
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
 
 
 def kb_vpn_guide_platforms() -> InlineKeyboardMarkup:
-    """Device selector for WireGuard setup instructions."""
     b = InlineKeyboardBuilder()
     b.button(text="📱 Android", callback_data="vpn:howto:android")
     b.button(text="🍎 iPhone / iPad", callback_data="vpn:howto:ios")
@@ -74,7 +72,6 @@ def kb_vpn_guide_back() -> InlineKeyboardMarkup:
 def kb_confirm_reset() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, сбросить", callback_data="vpn:reset")
-    # тут оставляем возврат в VPN-меню
     b.button(text="⬅️ Назад", callback_data="nav:vpn")
     b.adjust(1)
     return b.as_markup()
@@ -83,31 +80,40 @@ def kb_confirm_reset() -> InlineKeyboardMarkup:
 def kb_admin_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
 
-    # VPN status
+    # VPN
     b.button(text="📊 Статус VPN", callback_data="admin:vpn:status")
     b.button(text="👥 Активные VPN-профили", callback_data="admin:vpn:active_profiles")
 
-    # Yandex manual
+    # Yandex
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
     b.button(text="📋 Список аккаунтов/слотов", callback_data="admin:yandex:list")
     b.button(text="✏️ Редактировать аккаунт", callback_data="admin:yandex:edit")
 
-    # ✅ NEW: отчёт на сегодня + отметка исключения
+    # Kick reports
     b.button(text="📋 Кого исключить сегодня", callback_data="admin:kick:report")
     b.button(text="🧾 Отметить пользователя исключённым", callback_data="admin:kick:mark")
 
-    # Payout requests list (admin)
+    # Finance / referrals
     b.button(text="💸 Заявки на вывод", callback_data="admin:payouts")
     b.button(text="⏳ Холды (рефералка)", callback_data="admin:ref:holds")
-
-    # TEST: накрутить реферальные начисления, чтобы проверить выводы
+    b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
 
-    # legacy/test (оставляем как просил)
+    # Legacy / test
     b.button(text="🧽 Снять страйки Yandex", callback_data="admin:forgive:user")
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
 
     b.button(text="🏠 Главное меню", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_admin_referrals_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="👑 Забрать реферала себе", callback_data="admin:referrals:take")
+    b.button(text="🔁 Назначить реферала", callback_data="admin:referrals:assign")
+    b.button(text="🔍 Узнать владельца", callback_data="admin:referrals:owner")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
     b.adjust(1)
     return b.as_markup()
 
