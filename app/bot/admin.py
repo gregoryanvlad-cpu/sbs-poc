@@ -15,6 +15,7 @@ from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, User
+from app.db.models.vpn_peer import VpnPeer
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
@@ -199,6 +200,93 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
     except Exception:
         pass
+    await cb.answer()
+
+
+def _fmt_age_seconds(age: int) -> str:
+    try:
+        age = int(age)
+    except Exception:
+        age = 0
+    if age < 60:
+        return f"{age} сек"
+    if age < 3600:
+        m = age // 60
+        s = age % 60
+        return f"{m} мин {s} сек"
+    h = age // 3600
+    m = (age % 3600) // 60
+    return f"{h} ч {m} мин"
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
+async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    # Get recent peers from wg and map to DB profiles.
+    peers = await vpn_service.get_recent_peer_handshakes(window_seconds=180)
+    if not peers:
+        text = (
+            "👥 <b>Активные VPN-профили</b>\n\n"
+            "❌ Активных VPN-подключений сейчас нет (handshake &lt; 3 мин)."
+        )
+        await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+        await cb.answer()
+        return
+
+    keys = [p["public_key"] for p in peers if p.get("public_key")]
+    key_to_peer: dict[str, VpnPeer] = {}
+    async with session_scope() as session:
+        if keys:
+            q = select(VpnPeer).where(VpnPeer.client_public_key.in_(keys))
+            res = await session.execute(q)
+            rows = list(res.scalars().all())
+            # Prefer active row if duplicates exist
+            for r in rows:
+                if r.client_public_key not in key_to_peer or (r.is_active and not key_to_peer[r.client_public_key].is_active):
+                    key_to_peer[r.client_public_key] = r
+
+    lines = ["👥 <b>Активные VPN-профили</b>", ""]
+
+    idx = 0
+    for p in peers:
+        pub = p.get("public_key")
+        age = p.get("age_seconds", 0)
+        row = key_to_peer.get(pub)
+        if not row:
+            # Peer exists on server but not in DB (or rotated out)
+            idx += 1
+            short = (pub[:6] + "…" + pub[-6:]) if pub and len(pub) > 16 else (pub or "—")
+            lines.append(f"{idx}️⃣ Unknown profile")
+            lines.append(f"└ Паблик ключ: <code>{short}</code>")
+            lines.append(f"└ Устройство: —")
+            lines.append(f"└ Последний handshake: {_fmt_age_seconds(age)} назад")
+            lines.append("")
+            continue
+
+        tg_id = int(row.tg_id)
+
+        # Best-effort get name/username via Telegram
+        display = str(tg_id)
+        try:
+            chat = await cb.bot.get_chat(tg_id)
+            name = (getattr(chat, "first_name", None) or getattr(chat, "title", None) or str(tg_id)).strip()
+            username = getattr(chat, "username", None)
+            display = f"{name} (@{username})" if username else f"{name}"
+        except Exception:
+            display = str(tg_id)
+
+        idx += 1
+        lines.append(f"{idx}️⃣ {display}")
+        lines.append("└ Устройство: —")
+        lines.append(f"└ Последний handshake: {_fmt_age_seconds(age)} назад")
+        lines.append("")
+
+    lines.append(f"Всего активных: <b>{idx}</b>")
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
     await cb.answer()
 
 
