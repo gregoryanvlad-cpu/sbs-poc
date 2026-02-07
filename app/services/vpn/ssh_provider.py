@@ -117,6 +117,30 @@ class WireGuardSSHProvider:
         except Exception:
             return 0
 
+    async def get_latest_handshakes(self) -> dict[str, int]:
+        """Return latest handshake timestamps for peers.
+
+        Output of `wg show <iface> latest-handshakes`:
+          <pubkey>\t<unix_ts>
+        where unix_ts can be 0 if never.
+        """
+        out = await self._run_output(f"{WG_BIN} show {self.interface} latest-handshakes", check=False)
+        res: dict[str, int] = {}
+        if not out:
+            return res
+        for ln in out.splitlines():
+            parts = ln.strip().split()
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip()
+            try:
+                ts = int(parts[1])
+            except Exception:
+                ts = 0
+            if key:
+                res[key] = ts
+        return res
+
     async def get_cpu_load_percent(self, sample_seconds: int = 1) -> float:
         """Compute CPU usage percent using /proc/stat deltas.
 
