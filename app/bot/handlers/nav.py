@@ -45,7 +45,7 @@ router = Router()
 async def _safe_cb_answer(cb: CallbackQuery) -> None:
     """Best-effort callback answer (avoid 'query is too old' noise)."""
     try:
-        await _safe_cb_answer(cb)
+        await cb.answer()
     except Exception:
         pass
 
