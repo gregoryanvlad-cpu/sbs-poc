@@ -53,25 +53,20 @@ class AdminResetUserService:
                 delete(Payment).where(Payment.tg_id == tg_id)
             )
 
-            # 4) сбрасываем подписку (не удаляем строку, чтобы ensure_user не пересоздавал её)
-            #    и чтобы гарантированно очистить end_at/start_at/is_active.
-            sub = await session.get(Subscription, tg_id)
-            if sub:
-                sub.start_at = None
-                sub.end_at = None
-                sub.is_active = False
-                sub.status = "inactive"
-            else:
-                sub = Subscription(tg_id=tg_id)
-                sub.start_at = None
-                sub.end_at = None
-                sub.is_active = False
-                sub.status = "inactive"
+            # 4) сбрасываем подписку ЖЁСТКО:
+            #    - удаляем все записи subscriptions по tg_id (на случай дублей из старых миграций/ручных вставок)
+            #    - создаём "чистую" неактивную подписку
+            await session.execute(delete(Subscription).where(Subscription.tg_id == tg_id))
 
-                session.add(sub)
-                await session.flush()
-                session.add(sub)
-                await session.flush()
+            sub = Subscription(
+                tg_id=tg_id,
+                start_at=None,
+                end_at=None,
+                is_active=False,
+                status="inactive",
+            )
+            session.add(sub)
+            await session.flush()
 
             # 5) сбрасываем пользователя (не удаляем строку, чтобы не ломать связи/логику)
             user = await session.get(User, tg_id)
