@@ -131,6 +131,8 @@ def kb_faq() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="ℹ️ О сервисе", callback_data="faq:about")
     b.button(text="📄 Публичная оферта", callback_data="faq:offer")
+    b.button(text="🔐 Политика конфиденциальности", callback_data="faq:privacy")
+    b.button(text="📝 Пользовательское соглашение", callback_data="faq:terms")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
