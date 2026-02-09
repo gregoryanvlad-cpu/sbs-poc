@@ -999,10 +999,26 @@ async def admin_reset_user_apply(message: Message, state: FSMContext) -> None:
 
     from app.services.admin.reset_user import AdminResetUserService
 
-    await message.answer("⏳ Сбрасываю пользователя...", reply_markup=kb_admin_menu())
-    await AdminResetUserService().reset_user(tg_id=tg_id)
+        await message.answer("⏳ Сбрасываю пользователя...", reply_markup=kb_admin_menu())
 
-    await message.answer(
+    try:
+        # Safety: avoid infinite waiting if DB/infra is stuck
+        await asyncio.wait_for(AdminResetUserService().reset_user(tg_id=tg_id), timeout=30)
+    except asyncio.TimeoutError:
+        await message.answer(
+            "⚠️ Сброс занял слишком много времени и был остановлен.\n"
+            "Попробуй ещё раз через минуту.",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+    except Exception as e:
+        await message.answer(
+            f"❌ Ошибка при сбросе пользователя: {e}",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+await message.answer(
         f"✅ Пользователь <code>{tg_id}</code> полностью сброшен.\n"
         "Теперь он как новый.",
         parse_mode="HTML",
