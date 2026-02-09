@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from sqlalchemy import delete, select, update
 
@@ -15,24 +16,30 @@ from app.db.models.yandex_membership import YandexMembership
 log = logging.getLogger(__name__)
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class AdminResetUserService:
     """
     Полный сброс пользователя для тестов:
-    - удаляем Subscription
-    - удаляем Payment
-    - удаляем VpnPeer
     - удаляем YandexMembership
-    - сбрасываем flow_state/flow_data у User (или удаляем User, если хочешь — но безопаснее сброс)
+    - отвязываем YandexInviteSlot от пользователя (не возвращаем в free)
+    - удаляем VpnPeer
+    - удаляем Payment
+    - жёстко сбрасываем Subscription (end_at=None + inactive)
+    - сбрасываем flow_state/flow_data у User
     """
 
     async def reset_user(self, *, tg_id: int) -> None:
         async with session_scope() as session:
-            # 1) удаляем yandex_membership по tg_id (ВАЖНО: НЕ user_id)
+            # --- USER (may be missing) ---
+            user = await session.get(User, tg_id)
+
+            # 1) Yandex membership by tg_id
             await session.execute(delete(YandexMembership).where(YandexMembership.tg_id == tg_id))
 
-            # 1.1) В ручном режиме слоты не переиспользуются (S1), но после "reset" мы должны
-            # убрать привязку слота к пользователю, чтобы в ЛК больше не отображались "семья/слот".
-            # Сам слот остаётся issued/burned (мы его не возвращаем в free).
+            # 1.1) Detach slot (keep status issued/burned as-is)
             await session.execute(
                 update(YandexInviteSlot)
                 .where(YandexInviteSlot.issued_to_tg_id == tg_id)
@@ -43,34 +50,33 @@ class AdminResetUserService:
                 )
             )
 
-            # 2) удаляем vpn peers
-            await session.execute(
-                delete(VpnPeer).where(VpnPeer.tg_id == tg_id)
-            )
+            # 2) VPN peers
+            await session.execute(delete(VpnPeer).where(VpnPeer.tg_id == tg_id))
 
-            # 3) удаляем платежи
-            await session.execute(
-                delete(Payment).where(Payment.tg_id == tg_id)
-            )
+            # 3) Payments
+            await session.execute(delete(Payment).where(Payment.tg_id == tg_id))
 
-            # 4) сбрасываем подписку ЖЁСТКО:
-            #    - удаляем все записи subscriptions по tg_id (на случай дублей из старых миграций/ручных вставок)
-            #    - создаём "чистую" неактивную подписку
-            await session.execute(delete(Subscription).where(Subscription.tg_id == tg_id))
+            # 4) Subscription: do NOT rely on delete+insert (can be fragile with FKs/constraints in old DBs).
+            #    We either update existing row, or create a new inactive one.
+            sub = await session.get(Subscription, tg_id)
+            if sub is None:
+                # If there is no user row, create it to satisfy FK, then create subscription.
+                if user is None:
+                    user = User(tg_id=tg_id)
+                    session.add(user)
+                    await session.flush()
 
-            sub = Subscription(
-                tg_id=tg_id,
-                start_at=None,
-                end_at=None,
-                is_active=False,
-                status="inactive",
-            )
-            session.add(sub)
-            await session.flush()
+                sub = Subscription(tg_id=tg_id)
+                session.add(sub)
+                await session.flush()
 
-            # 5) сбрасываем пользователя (не удаляем строку, чтобы не ломать связи/логику)
-            user = await session.get(User, tg_id)
-            if user:
+            sub.start_at = None
+            sub.end_at = None
+            sub.is_active = False
+            sub.status = "inactive"
+
+            # 5) Reset user flow + any cached yandex fields
+            if user is not None:
                 # reset referral click info (if present)
                 if hasattr(user, "referred_by_tg_id"):
                     setattr(user, "referred_by_tg_id", None)
@@ -80,7 +86,6 @@ class AdminResetUserService:
                 user.flow_state = None
                 user.flow_data = None
 
-                # если у тебя есть поля, которые фиксируют яндекс-логин/статус в User — тоже сбрось:
                 if hasattr(user, "yandex_login"):
                     setattr(user, "yandex_login", None)
                 if hasattr(user, "yandex_status"):
