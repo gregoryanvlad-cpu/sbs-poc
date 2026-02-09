@@ -356,17 +356,13 @@ async def on_nav(cb: CallbackQuery) -> None:
                 pass
         await _safe_cb_answer(cb)
         return
+
     if where == "support":
         try:
             await cb.message.edit_text(
-                "🛠 Поддержка
-
-"
-                "По всем вопросам пиши сюда: @sbsmanager_bot
-
-"
-                "Контакты для связи:
-"
+                "🛠 Поддержка\n\n"
+                "По всем вопросам пиши сюда: @sbsmanager_bot\n\n"
+                "Контакты для связи:\n"
                 "sbs@sertera.group",
                 reply_markup=kb_back_home(),
             )
@@ -374,6 +370,8 @@ async def on_nav(cb: CallbackQuery) -> None:
             pass
         await _safe_cb_answer(cb)
         return
+
+
     await cb.answer("Неизвестный раздел")
 
 
