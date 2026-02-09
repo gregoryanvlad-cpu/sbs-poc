@@ -71,6 +71,12 @@ class AdminResetUserService:
             # 5) сбрасываем пользователя (не удаляем строку, чтобы не ломать связи/логику)
             user = await session.get(User, tg_id)
             if user:
+                # reset referral click info (if present)
+                if hasattr(user, "referred_by_tg_id"):
+                    setattr(user, "referred_by_tg_id", None)
+                if hasattr(user, "referred_at"):
+                    setattr(user, "referred_at", None)
+
                 user.flow_state = None
                 user.flow_data = None
 
