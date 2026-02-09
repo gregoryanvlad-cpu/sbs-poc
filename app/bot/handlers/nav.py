@@ -785,7 +785,7 @@ async def faq_about(cb: CallbackQuery) -> None:
 async def faq_offer(cb: CallbackQuery) -> None:
     data = FAQ_OFFER_TEXT.encode("utf-8")
     file = BufferedInputFile(data, filename="public_offer.txt")
-    await cb.message.answer_document(file, caption="📄 Публичная оферта (текстовым файлом)")
+    await cb.message.answer_document(file, caption="📄 Публичная оферта")
     await cb.message.answer("⬅️ Назад в FAQ", reply_markup=kb_back_faq())
     await _safe_cb_answer(cb)
 
@@ -793,7 +793,7 @@ async def faq_offer(cb: CallbackQuery) -> None:
 async def faq_privacy(cb: CallbackQuery) -> None:
     data = FAQ_PRIVACY_TEXT.encode("utf-8")
     file = BufferedInputFile(data, filename="privacy_policy.txt")
-    await cb.message.answer_document(file, caption="🔐 Политика конфиденциальности (текстовым файлом)")
+    await cb.message.answer_document(file, caption="🔐 Политика конфиденциальности")
     await cb.message.answer("⬅️ Назад в FAQ", reply_markup=kb_back_faq())
     await _safe_cb_answer(cb)
 
@@ -802,7 +802,7 @@ async def faq_privacy(cb: CallbackQuery) -> None:
 async def faq_terms(cb: CallbackQuery) -> None:
     data = FAQ_TERMS_TEXT.encode("utf-8")
     file = BufferedInputFile(data, filename="user_agreement.txt")
-    await cb.message.answer_document(file, caption="📝 Пользовательское соглашение (текстовым файлом)")
+    await cb.message.answer_document(file, caption="📝 Пользовательское соглашение")
     await cb.message.answer("⬅️ Назад в FAQ", reply_markup=kb_back_faq())
     await _safe_cb_answer(cb)
 
