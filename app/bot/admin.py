@@ -960,6 +960,13 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
 
 @router.callback_query(lambda c: c.data == "admin:reset:user")
 async def admin_reset_user(cb: CallbackQuery, state: FSMContext) -> None:
+    """
+    Полный сброс пользователя (TEST):
+    - подписка
+    - VPN
+    - Yandex membership/слот
+    - сброс flow_state/flow_data
+    """
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
@@ -968,9 +975,9 @@ async def admin_reset_user(cb: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminYandexFSM.reset_wait_user_id)
 
     await cb.message.edit_text(
-        "🧨 <b>Сброс пользователя</b>\n\n"
+        "🧨 <b>Полный сброс пользователя</b>\n\n"
         "Отправь TG ID пользователя (число).\n"
-        "⚠️ Будут сброшены: подписка, VPN, Yandex membership, реф-данные (частично).",
+        "⚠️ Будут удалены: подписка, VPN, Yandex membership/слот.",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
@@ -990,40 +997,14 @@ async def admin_reset_user_apply(message: Message, state: FSMContext) -> None:
     tg_id = int(txt)
     await state.clear()
 
-    async with session_scope() as session:
-        # reset yandex membership
-        ym = await session.scalar(
-            select(YandexMembership).where(YandexMembership.tg_id == tg_id).order_by(YandexMembership.id.desc()).limit(1)
-        )
-        if ym:
-            try:
-                ym.status = "reset"
-            except Exception:
-                pass
-            try:
-                ym.invite_link = None
-            except Exception:
-                pass
-            try:
-                ym.yandex_account_label = None
-            except Exception:
-                pass
-            try:
-                ym.slot_index = None
-            except Exception:
-                pass
+    from app.services.admin.reset_user import AdminResetUserService
 
-        # reset user referral click info
-        u = await session.get(User, tg_id)
-        if u:
-            u.referred_by_tg_id = None
-            u.referred_at = None
-
-        await session.commit()
+    await message.answer("⏳ Сбрасываю пользователя...", reply_markup=kb_admin_menu())
+    await AdminResetUserService().reset_user(tg_id=tg_id)
 
     await message.answer(
-        f"✅ Пользователь <code>{tg_id}</code> сброшен.\n"
-        "Yandex membership очищен (семья/слот/ссылка).",
+        f"✅ Пользователь <code>{tg_id}</code> полностью сброшен.\n"
+        "Теперь он как новый.",
         parse_mode="HTML",
         reply_markup=kb_admin_menu(),
     )
