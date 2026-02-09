@@ -360,7 +360,12 @@ async def on_nav(cb: CallbackQuery) -> None:
     if where == "support":
         try:
             await cb.message.edit_text(
-                "🛠 Поддержка\n\nПо всем вопросам пиши сюда: @sbsmanager_bot",
+                "🛠 Поддержка
+
+По всем вопросам пиши сюда: @sbsmanager_bot
+
+Контакты для связи:
+sbs@sertera.group",
                 reply_markup=kb_back_home(),
             )
         except Exception:
