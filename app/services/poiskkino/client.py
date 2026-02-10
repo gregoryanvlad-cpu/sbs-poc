@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -23,22 +24,32 @@ class PoiskKinoClient:
     def _headers(self) -> dict[str, str]:
         if not self.api_key:
             return {}
-        return {"X-API-KEY": self.api_key}
+        # Header name is case-insensitive, but we keep the documented casing.
+        return {
+            "X-API-KEY": self.api_key,
+            # Some gateways block requests without UA; keep it explicit.
+            "User-Agent": "sbsconnect-bot/kinoteka",
+            "Accept": "application/json",
+        }
 
     async def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = self.base_url.rstrip("/") + path
         timeout = aiohttp.ClientTimeout(total=12)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=self._headers(), params=params) as resp:
-                # Try to decode JSON even for errors (API often returns details).
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    data = await resp.text()
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=self._headers(), params=params) as resp:
+                    # Try to decode JSON even for errors (API often returns details).
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = await resp.text()
 
-                if resp.status >= 400:
-                    raise PoiskKinoError(f"PoiskKino {resp.status}: {data}")
-                return data
+                    if resp.status >= 400:
+                        raise PoiskKinoError(f"PoiskKino {resp.status}: {data}")
+                    return data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # Normalize all transport errors to PoiskKinoError so handlers can show a stable message.
+            raise PoiskKinoError(f"PoiskKino network error: {type(e).__name__}: {e}") from e
 
     async def search(self, query: str, *, limit: int = 6, page: int = 1) -> dict[str, Any]:
         # Поиск фильмов/сериалов по названию
