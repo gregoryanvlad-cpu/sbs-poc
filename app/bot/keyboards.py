@@ -7,13 +7,12 @@ def kb_main() -> InlineKeyboardMarkup:
     b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
     b.button(text="🟡 Yandex Plus", callback_data="nav:yandex")
     b.button(text="🌍 VPN", callback_data="nav:vpn")
+    b.button(text="🎬 Кинотека", callback_data="nav:kinoteka")
     b.button(text="💳 Оплата", callback_data="nav:pay")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
     b.adjust(1)
     return b.as_markup()
-
-
 def kb_back_home() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="⬅️ Назад", callback_data="nav:home")
@@ -46,6 +45,21 @@ def kb_vpn() -> InlineKeyboardMarkup:
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
     b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_kinoteka() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔍 Поиск", callback_data="kino:search")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_kinoteka_back() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="nav:kinoteka")
     b.adjust(1)
     return b.as_markup()
 
