@@ -106,23 +106,20 @@ async def on_kino_query_input(msg: Message) -> None:
             await session.commit()
 
     # Render compact list with buttons (up to 6)
-    kb = []
+    kb: list[list[InlineKeyboardButton]] = []
     lines = ["🎬 <b>Результаты</b>:"]
-    for i, m in enumerate(results[:6], start=1):
+    # IMPORTANT: callback_data is limited, so we store full results in DB and pass only index (0-based)
+    for idx, m in enumerate(results[:6]):
+        n = idx + 1
         name = m.get("title") or "Без названия"
         url = m.get("url")
         rating = m.get("rating")
         rating_str = f"{rating}" if rating else "—"
-        # Year is often inside title for rezka; keep as-is
-        year = None
 
-        title_line = f"{i}) {name}"
-        if year:
-            title_line += f" ({year})"
-        lines.append(f"{title_line} — {rating_str}")
+        lines.append(f"{n}) {name} — {rating_str}")
 
-        if isinstance(mid, int):
-            kb.append([InlineKeyboardButton(text=f"{i}️⃣ Открыть", callback_data=f"kino:item:{mid}")])
+        if url:
+            kb.append([InlineKeyboardButton(text=f"{n}️⃣ Открыть", callback_data=f"kino:item:{idx}")])
 
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:kinoteka")])
 
