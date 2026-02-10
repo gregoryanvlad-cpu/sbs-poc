@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.vpn_peer import VpnPeer
@@ -93,6 +93,16 @@ class VPNService:
 
     async def ensure_peer(self, session: AsyncSession, tg_id: int) -> Dict[str, Any]:
         """Return existing active peer or create/apply a new one."""
+
+        # Prevent duplicate peer creation on rapid double-clicks / concurrent requests
+        # (including across multiple app replicas). PostgreSQL advisory lock is scoped
+        # to the current transaction.
+        try:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
+        except Exception:
+            # Non-Postgres / no permissions — best effort.
+            pass
+
         active = await self._get_active_peer(session, tg_id)
         if active:
             return self._row_to_peer_dict(active)
@@ -135,6 +145,13 @@ class VPNService:
 
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
         """Manual reset: best-effort remove old peer then create/apply new peer."""
+
+        # Serialize resets per user (see ensure_peer).
+        try:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
+        except Exception:
+            pass
+
         active = await self._get_active_peer(session, tg_id)
 
         if active:
