@@ -31,6 +31,7 @@ from app.bot.keyboards import (
     kb_vpn,
     kb_vpn_guide_platforms,
     kb_vpn_guide_back,
+    kb_kinoteka,
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
@@ -251,6 +252,29 @@ async def on_nav(cb: CallbackQuery) -> None:
         except Exception:
             pass
         await _safe_cb_answer(cb)
+        return
+
+    if where == "kinoteka":
+        async with session_scope() as session:
+            sub = await get_subscription(session, cb.from_user.id)
+
+        if not _is_sub_active(sub.end_at):
+            await cb.message.answer(
+                "⛔️ Подписка не активна.\n\n"
+                "Раздел <b>Кинотека</b> доступен только при активной подписке.",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            await cb.message.edit_text(
+                "🎬 <b>Кинотека</b>\n\n"
+                "Найду фильм/сериал по названию и покажу карточку с рейтингами.",
+                reply_markup=kb_kinoteka(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return
 
     if where == "referrals":
