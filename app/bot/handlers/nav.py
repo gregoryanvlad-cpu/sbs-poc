@@ -655,7 +655,9 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
 
     conf_file = BufferedInputFile(
         conf_text.encode(),
-        filename=f"SBS_{tg_id}.conf",
+        # Keep the same active config content, but use a unique filename on each выдача
+        # (helps iOS/Android caches and matches expected behaviour).
+        filename=f"SBS_{tg_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.conf",
     )
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
