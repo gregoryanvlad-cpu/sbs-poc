@@ -49,6 +49,39 @@ VPN_BUNDLE_COUNTER: dict[int, tuple[str, int]] = {}
 IOS_GUIDE_MEDIA: dict[int, list[int]] = {}
 
 
+def _today_key() -> str:
+    """Return current date key used for per-day counters (UTC)."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _next_vpn_bundle_filename(tg_id: int) -> str:
+    """Generate a unique filename for today's *downloads*.
+
+    NOTE: The peer/config itself must stay the same until user presses
+    "Сбросить VPN". We only change the filename so clients that cache by name
+    (esp. iOS) can re-import.
+
+    Format: SBS_<tg_id>_<N>.conf where N starts from 1 each day.
+    """
+    today = _today_key()
+    prev = VPN_BUNDLE_COUNTER.get(tg_id)
+    if not prev or prev[0] != today:
+        n = 1
+    else:
+        n = prev[1] + 1
+    VPN_BUNDLE_COUNTER[tg_id] = (today, n)
+    return f"SBS_{tg_id}_{n}.conf"
+
+
+def _reset_vpn_bundle_counter(tg_id: int) -> None:
+    """Reset per-day bundle filename counter for the user.
+
+    Called on VPN reset and on full user reset.
+    """
+    # Start numbering from 1 after reset (on next выдача).
+    VPN_BUNDLE_COUNTER.pop(tg_id, None)
+
+
 
 async def _safe_cb_answer(cb: CallbackQuery) -> None:
     """Best-effort callback answer (avoid 'query is too old' noise)."""
