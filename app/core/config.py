@@ -60,6 +60,11 @@ class Settings:
     referral_hold_days: int = 7
     referral_min_payout_rub: int = 50
 
+    # PoiskKino (ex-openmoviedb)
+    poiskkino_base_url: str = "https://api.poiskkino.dev"
+    # IMPORTANT: keep secret out of repo; pass via env POISKKINO_API_KEY
+    poiskkino_api_key: str | None = None
+
 
 def _load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
@@ -100,6 +105,10 @@ def _load_settings() -> Settings:
         # Referrals
         referral_hold_days=int(os.getenv("REFERRAL_HOLD_DAYS", "7")),
         referral_min_payout_rub=int(os.getenv("REFERRAL_MIN_PAYOUT_RUB", "50")),
+
+        # PoiskKino
+        poiskkino_base_url=os.getenv("POISKKINO_BASE_URL", "https://api.poiskkino.dev").strip(),
+        poiskkino_api_key=(os.getenv("POISKKINO_API_KEY") or "").strip() or None,
     )
 
 
