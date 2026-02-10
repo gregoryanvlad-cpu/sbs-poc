@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+from pathlib import Path
 from datetime import datetime, timezone
 
 import qrcode
@@ -62,8 +63,6 @@ def _load_wg_instructions() -> dict:
     """
     try:
         # instructions.json is stored at project root
-        from pathlib import Path
-
         root = Path(__file__).resolve().parents[3]
         p = root / "instructions.json"
         if not p.exists():
