@@ -44,6 +44,8 @@ from app.services.referrals.service import referral_service
 router = Router()
 
 # Store message ids of iOS guide screenshots to delete on Back
+VPN_BUNDLE_COUNTER: dict[int, tuple[str, int]] = {}
+
 IOS_GUIDE_MEDIA: dict[int, list[int]] = {}
 
 
@@ -307,8 +309,18 @@ async def on_nav(cb: CallbackQuery) -> None:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
 
+        
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
+            try:
+                await cb.message.edit_text(
+                    "🟡 <b>Yandex Plus</b>\n\n"
+                    "🚫 Подписка не активна. Чтобы открыть доступ — оплати подписку в разделе «Оплата».",
+                    reply_markup=kb_back_home(),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            await _safe_cb_answer(cb)
             return
 
         buttons: list[list[InlineKeyboardButton]] = []
@@ -556,6 +568,7 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "vpn:reset")
 async def on_vpn_reset(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
+    _reset_vpn_bundle_counter(tg_id)
     chat_id = cb.message.chat.id
 
     # ✅ FIX: запрет сброса VPN без активной подписки
@@ -657,7 +670,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
         conf_text.encode(),
         # Keep the same active config content, but use a unique filename on each выдача
         # (helps iOS/Android caches and matches expected behaviour).
-        filename=f"SBS_{tg_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.conf",
+        filename=_next_vpn_bundle_filename(tg_id),
     )
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
