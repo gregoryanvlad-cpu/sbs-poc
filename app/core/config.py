@@ -65,6 +65,9 @@ class Settings:
     # IMPORTANT: keep secret out of repo; pass via env POISKKINO_API_KEY
     poiskkino_api_key: str | None = None
 
+    # HdRezka (search & карточки)
+    rezka_origin: str = "https://hdrezka.ag"
+
 
 def _load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
@@ -109,6 +112,8 @@ def _load_settings() -> Settings:
         # PoiskKino
         poiskkino_base_url=os.getenv("POISKKINO_BASE_URL", "https://api.poiskkino.dev").strip(),
         poiskkino_api_key=(os.getenv("POISKKINO_API_KEY") or "").strip() or None,
+        # Rezka
+        rezka_origin=os.getenv("REZKA_ORIGIN", "https://hdrezka.ag").strip(),
     )
 
 
