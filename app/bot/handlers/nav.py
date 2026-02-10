@@ -11,6 +11,7 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     FSInputFile,
+    InputMediaPhoto,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -40,6 +41,10 @@ from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 
 router = Router()
+
+# Store message ids of iOS guide screenshots to delete on Back
+IOS_GUIDE_MEDIA: dict[int, list[int]] = {}
+
 
 
 async def _safe_cb_answer(cb: CallbackQuery) -> None:
@@ -193,7 +198,6 @@ async def on_nav(cb: CallbackQuery) -> None:
             f"🆔 ID: <code>{cb.from_user.id}</code>\n\n"
             f"💳 Подписка: {'активна ✅' if _is_sub_active(sub.end_at) else 'не активна ❌'}\n"
             f"📅 Активна до: {fmt_dt(sub.end_at)}\n"
-            f"⏳ Осталось: {days_left(sub.end_at)} дн.\n\n"
             "🟡 <b>Yandex Plus</b>\n"
             f"{y_text}\n\n"
             "🧾 <b>Последние оплаты</b>\n"
@@ -427,6 +431,14 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:guide")
 async def on_vpn_guide(cb: CallbackQuery) -> None:
+
+    # cleanup iOS guide screenshots if they were sent previously
+    ids = IOS_GUIDE_MEDIA.pop(cb.from_user.id, [])
+    for mid in ids:
+        try:
+            await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=mid)
+        except Exception:
+            pass
     text = (
         "📖 <b>Инструкция по подключению WireGuard</b>\n\n"
         "1) Нажмите «📦 Отправить конфиг + QR»\n"
@@ -442,8 +454,61 @@ async def on_vpn_guide(cb: CallbackQuery) -> None:
 async def on_vpn_howto(cb: CallbackQuery) -> None:
     platform = cb.data.split(":", 2)[2]
 
+    if platform == "ios":
+        text = (
+            "🍎 <b>iPhone / iPad — подключение WireGuard</b>\n\n"
+            "1) Установите WireGuard из App Store\n"
+            "2) В боте нажмите «📦 Отправить конфиг + QR»\n"
+            "3) Откройте .conf и импортируйте в WireGuard\n\n"
+            "Ниже придёт подробная инструкция со скриншотами."
+        )
+        await cb.message.edit_text(text, reply_markup=kb_vpn_guide_back(), parse_mode="HTML")
+
+        # Send screenshots as album (will be removed on Back)
+        base = Path(__file__).resolve().parents[1] / "assets" / "ios_wg"
+        files = [
+            base / "01_appstore.jpg",
+            base / "02_bot_menu.jpg",
+            base / "03_conf_message.jpg",
+            base / "04_open_share.jpg",
+            base / "05_share_sheet.jpg",
+            base / "06_choose_wg.jpg",
+            base / "07_enable.jpg",
+        ]
+        media = []
+        for fp in files:
+            if fp.exists():
+                media.append(InputMediaPhoto(media=FSInputFile(str(fp))))
+        sent_ids: list[int] = []
+        if media:
+            try:
+                msgs = await cb.bot.send_media_group(chat_id=cb.message.chat.id, media=media)
+                sent_ids = [m.message_id for m in msgs]
+            except Exception:
+                # fallback: send one by one
+                for fp in files:
+                    if not fp.exists():
+                        continue
+                    try:
+                        mmsg = await cb.bot.send_photo(chat_id=cb.message.chat.id, photo=FSInputFile(str(fp)))
+                        sent_ids.append(mmsg.message_id)
+                    except Exception:
+                        pass
+
+        if sent_ids:
+            IOS_GUIDE_MEDIA[cb.from_user.id] = sent_ids
+
+        await _safe_cb_answer(cb)
+        return
+
     instructions = _load_wg_instructions()
     lines = instructions.get(platform, [])
+
+    if platform != "ios" and not lines:
+        lines = [
+            "Инструкция для этого устройства будет добавлена позже.",
+            "Пока используйте импорт .conf в приложении WireGuard.",
+        ]
 
     # Fallback for linux (often missing in json)
     if platform == "linux" and not lines:
@@ -523,7 +588,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
 
             conf_file = BufferedInputFile(
                 conf_text.encode(),
-                filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf",
+                filename=f"SBS_{tg_id}.conf",
             )
             qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
@@ -591,7 +656,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
 
     conf_file = BufferedInputFile(
         conf_text.encode(),
-        filename=f"SBS_{tg_id}_{datetime.now().strftime('%d-%m-%Y')}.conf",
+        filename=f"SBS_{tg_id}.conf",
     )
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
