@@ -11,6 +11,7 @@ from app.db.models.payment import Payment
 from app.db.models.vpn_peer import VpnPeer
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
+from app.services.vpn.service import vpn_service
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,21 @@ class AdminResetUserService:
                     issued_at=None,
                 )
             )
+            # 2) блокируем VPN peers на сервере (best-effort), затем удаляем из БД
+            try:
+                res = await session.execute(select(VpnPeer).where(VpnPeer.tg_id == tg_id))
+                peers = list(res.scalars().all())
+                for p in peers:
+                    try:
+                        await vpn_service.provider.remove_peer(p.client_public_key)
+                    except Exception:
+                        log.exception(
+                            "admin_reset_user_remove_peer_failed tg_id=%s peer_id=%s",
+                            tg_id,
+                            getattr(p, "id", None),
+                        )
+            except Exception:
+                log.exception("admin_reset_user_list_peers_failed tg_id=%s", tg_id)
 
             # 2) удаляем vpn peers
             await session.execute(
