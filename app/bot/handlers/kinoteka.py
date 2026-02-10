@@ -11,7 +11,7 @@ from app.bot.ui import utcnow
 from app.db.models.user import User
 from app.db.session import session_scope
 from app.repo import get_subscription
-from app.services.poiskkino.client import poiskkino_client, PoiskKinoError
+from app.services.rezka.client import rezka_client, RezkaError
 
 router = Router()
 
@@ -69,21 +69,18 @@ async def on_kino_query_input(msg: Message) -> None:
 
         # stop flow no matter what (avoid stuck state)
         user.flow_state = None
-        user.flow_data = None
+        # flow_data will be overwritten with search results below
         await session.commit()
 
     try:
-        data = await poiskkino_client.search(query, limit=6, page=1)
-    except PoiskKinoError:
+        results = await rezka_client.search(query, limit=6)
+    except RezkaError:
         await msg.answer(
-            "⚠️ Не удалось получить данные из Кинотеки.\n"
-            "Проверь API-ключ/лимит и попробуй ещё раз.",
+            "⚠️ Не удалось получить данные из Кинотеки.\nПопробуй ещё раз позже.",
             reply_markup=kb_kinoteka_back(),
         )
         return
     except Exception:
-        # We intentionally keep the user-facing message generic,
-        # but log the root cause for debugging.
         log.exception("Kinoteka search failed", extra={"tg_id": tg_id, "query": query})
         await msg.answer(
             "⚠️ Временная ошибка Кинотеки. Попробуй ещё раз позже.",
@@ -91,30 +88,33 @@ async def on_kino_query_input(msg: Message) -> None:
         )
         return
 
-    docs = data.get("docs") if isinstance(data, dict) else None
-    if not docs:
+    if not results:
         await msg.answer(
             "Ничего не нашёл 😕\n\nПопробуй другое название.",
             reply_markup=kb_kinoteka_back(),
         )
         return
 
+    # Store results in user flow_data so we can open by index (callback_data is limited)
+    async with session_scope() as session:
+        user = await session.get(User, tg_id)
+        if user:
+            user.flow_data = json.dumps(
+                {"rezka_results": results, "query": query, "saved_at": utcnow().isoformat()},
+                ensure_ascii=False,
+            )
+            await session.commit()
+
     # Render compact list with buttons (up to 6)
     kb = []
     lines = ["🎬 <b>Результаты</b>:"]
-    for i, m in enumerate(docs[:6], start=1):
-        mid = m.get("id")
-        name = m.get("name") or m.get("alternativeName") or m.get("enName") or "Без названия"
-        year = m.get("year")
-        rating_kp = ((m.get("rating") or {}).get("kp"))
-        rating_imdb = ((m.get("rating") or {}).get("imdb"))
-
-        rating_bits = []
-        if rating_kp:
-            rating_bits.append(f"КП {rating_kp}")
-        if rating_imdb:
-            rating_bits.append(f"IMDb {rating_imdb}")
-        rating_str = (" / ".join(rating_bits)) if rating_bits else "—"
+    for i, m in enumerate(results[:6], start=1):
+        name = m.get("title") or "Без названия"
+        url = m.get("url")
+        rating = m.get("rating")
+        rating_str = f"{rating}" if rating else "—"
+        # Year is often inside title for rezka; keep as-is
+        year = None
 
         title_line = f"{i}) {name}"
         if year:
@@ -137,66 +137,83 @@ async def on_kino_query_input(msg: Message) -> None:
 async def on_kino_item(cb: CallbackQuery) -> None:
     await cb.answer()
     try:
-        movie_id = int(cb.data.split(":", 2)[2])
+        idx = int(cb.data.split(":", 2)[2])
     except Exception:
         return
 
+    # Load saved results
+    async with session_scope() as session:
+        user = await session.get(User, cb.from_user.id)
+        data = {}
+        if user and user.flow_data:
+            try:
+                data = json.loads(user.flow_data)
+            except Exception:
+                data = {}
+    results = (data or {}).get("rezka_results") or []
+    if not isinstance(results, list) or idx < 0 or idx >= len(results):
+        await cb.message.answer("⚠️ Не удалось открыть карточку. Сделай поиск заново.", reply_markup=kb_kinoteka_back())
+        return
+
+    url = (results[idx] or {}).get("url")
+    if not url:
+        await cb.message.answer("⚠️ Не удалось открыть карточку. Сделай поиск заново.", reply_markup=kb_kinoteka_back())
+        return
+
     try:
-        m = await poiskkino_client.get_movie(movie_id)
-    except PoiskKinoError:
+        info = await rezka_client.get_info(url)
+    except RezkaError:
         await cb.message.answer(
-            "⚠️ Не удалось открыть карточку. Возможно, закончился лимит или неверный API-ключ.",
+            "⚠️ Не удалось открыть карточку. Попробуй ещё раз позже.",
             reply_markup=kb_kinoteka_back(),
         )
         return
     except Exception:
-        log.exception("Kinoteka get_movie failed", extra={"tg_id": cb.from_user.id, "movie_id": movie_id})
+        log.exception("Kinoteka get_info failed", extra={"tg_id": cb.from_user.id, "url": url})
         await cb.message.answer("⚠️ Временная ошибка. Попробуй ещё раз позже.")
         return
 
-    name = m.get("name") or m.get("alternativeName") or m.get("enName") or "Без названия"
-    year = m.get("year")
-    desc = m.get("description") or m.get("shortDescription") or ""
-    if desc:
-        desc = desc.strip()
-        if len(desc) > 800:
-            desc = desc[:800].rsplit(" ", 1)[0] + "…"
+    name = info.get("name") or "Без названия"
+    orig = info.get("orig_name")
+    desc = (info.get("description") or "").strip()
+    if desc and len(desc) > 800:
+        desc = desc[:800].rsplit(" ", 1)[0] + "…"
 
-    rating = m.get("rating") or {}
-    kp = rating.get("kp")
-    imdb = rating.get("imdb")
+    rating = info.get("rating")
+    year = info.get("year")
+    category = info.get("category")
 
-    type_ = m.get("type")  # movie | tv-series etc
     title = f"🎬 <b>{name}</b>"
     meta = []
+    if orig and orig != name:
+        meta.append(str(orig))
     if year:
         meta.append(str(year))
-    if type_:
-        meta.append(str(type_))
+    if category:
+        meta.append(str(category))
     meta_line = " • ".join(meta) if meta else ""
-
-    r_line_bits = []
-    if kp:
-        r_line_bits.append(f"КП: <b>{kp}</b>")
-    if imdb:
-        r_line_bits.append(f"IMDb: <b>{imdb}</b>")
-    r_line = " | ".join(r_line_bits) if r_line_bits else ""
 
     text = title
     if meta_line:
         text += f"\n{meta_line}"
-    if r_line:
-        text += f"\n{r_line}"
+    if rating:
+        text += f"\nРейтинг: <b>{rating}</b>"
     if desc:
         text += f"\n\n{desc}"
 
-    # Poster if available
-    poster_url = ((m.get("poster") or {}).get("url"))
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Открыть на Rezka", url=url)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:kinoteka")],
+        ]
+    )
+
+    poster_url = info.get("thumbnail_hq") or info.get("thumbnail")
     if poster_url:
         try:
-            await cb.message.answer_photo(poster_url, caption=text, parse_mode="HTML", reply_markup=kb_kinoteka_back())
+            await cb.message.answer_photo(poster_url, caption=text, parse_mode="HTML", reply_markup=kb)
             return
         except Exception:
             pass
 
-    await cb.message.answer(text, parse_mode="HTML", reply_markup=kb_kinoteka_back())
+    await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
