@@ -75,7 +75,8 @@ async def yandex_copy_invite(cb: CallbackQuery) -> None:
 @router.callback_query(F.data == "yandex:issue")
 async def on_yandex_issue(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
-    await cb.answer()
+    # Do not answer the callback here: in the "subscription inactive" branch we
+    # need to show an alert, and Telegram allows answering only once.
 
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
@@ -118,6 +119,12 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
             "Напиши в поддержку или попробуй позже."
         )
         return
+
+    # Best-effort stop the spinner for the successful path.
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
     sent = await cb.message.answer(
         "✅ Приглашение готово.\n\n"
