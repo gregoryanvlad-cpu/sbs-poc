@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -13,6 +14,8 @@ from app.repo import get_subscription
 from app.services.poiskkino.client import poiskkino_client, PoiskKinoError
 
 router = Router()
+
+log = logging.getLogger(__name__)
 
 
 def _is_sub_active(end_at) -> bool:
@@ -79,6 +82,9 @@ async def on_kino_query_input(msg: Message) -> None:
         )
         return
     except Exception:
+        # We intentionally keep the user-facing message generic,
+        # but log the root cause for debugging.
+        log.exception("Kinoteka search failed", extra={"tg_id": tg_id, "query": query})
         await msg.answer(
             "⚠️ Временная ошибка Кинотеки. Попробуй ещё раз позже.",
             reply_markup=kb_kinoteka_back(),
@@ -144,6 +150,7 @@ async def on_kino_item(cb: CallbackQuery) -> None:
         )
         return
     except Exception:
+        log.exception("Kinoteka get_movie failed", extra={"tg_id": cb.from_user.id, "movie_id": movie_id})
         await cb.message.answer("⚠️ Временная ошибка. Попробуй ещё раз позже.")
         return
 
