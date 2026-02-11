@@ -1,23 +1,22 @@
 """
-Secondary bot entrypoint (player gateway).
-Run this file in a separate Railway service (kinoteka-player).
-Required env vars in that service:
- - DATABASE_URL (reference to the shared Postgres)
- - PLAYER_BOT_TOKEN (or BOT_TOKEN)
- - OWNER_TG_ID (any digits; used by shared config loader)
- - MAIN_BOT_USERNAME (e.g. sbsconnect_bot)
- - PLAYER_RATE_LIMIT_PER_MINUTE (comma-separated)
- - REZKA_MIRROR (optional, default https://rezka.ag)
+Secondary bot entrypoint — Player Gateway (inoteka Secure Connection | SBS)
+Запускается в Railway-сервисе kinoteka-player с SERVICE_ROLE=player
+
+Обязательные переменные:
+- SERVICE_ROLE=player
+- PLAYER_BOT_TOKEN (или BOT_TOKEN)
+- DATABASE_URL (общая Postgres)
+- MAIN_BOT_USERNAME (для кнопки "Купить подписку")
+- REZKA_MIRROR (опционально, по умолчанию https://rezka.ag)
 """
 
 from __future__ import annotations
 import asyncio
 import logging
-import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -27,17 +26,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from app.core.logging import setup_logging
 from app.core.config import settings
 from app.db.session import init_engine, session_scope
-from app.repo import get_subscription  # твои репо
-from app.bot.ui import utcnow  # твоя утилита
-from app.db.models import ContentRequest  # модель для content_requests (предполагаю в models.py)
-from HdRezkaApi import HdRezkaApi  # парсер Rezka
+from app.repo import get_subscription, get_content_request_by_token
+from app.bot.ui import utcnow
+from HdRezkaApi import HdRezkaApi
 
 log = logging.getLogger(__name__)
 
 # Инициализация парсера Rezka
 rezka = HdRezkaApi(mirror=os.getenv("REZKA_MIRROR", "https://rezka.ag"))
 
-# Rate-limit cache (простой, в памяти)
+# Простой rate-limit в памяти
 rate_cache = {}  # user_id → (count, last_time)
 
 router = Router()
@@ -45,7 +43,7 @@ router = Router()
 
 def rate_limit_exceeded(user_id: int) -> bool:
     limit = int(os.getenv("PLAYER_RATE_LIMIT_PER_MINUTE", "15"))
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     if user_id in rate_cache:
         count, last_time = rate_cache[user_id]
         if now - last_time < 60:
@@ -81,20 +79,16 @@ async def handle_start_with_token(message: Message) -> None:
         await message.answer("Слишком много запросов. Подождите минуту.")
         return
 
-    # Достаем content_url по токену из БД
+    # Достаём url по токену
     async with session_scope() as session:
-        req = await session.query(ContentRequest).filter(
-            ContentRequest.token == token,
-            ContentRequest.expires_at > utcnow()
-        ).first()
-
+        req = await get_content_request_by_token(session, token)
         if not req:
             await message.answer("Ссылка устарела или недействительна.")
             return
 
         url = req.content_url
 
-        # Проверка подписки
+        # Повторная проверка подписки
         sub = await get_subscription(session, user_id)
         if not _is_sub_active(sub.end_at):
             kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -110,7 +104,7 @@ async def handle_start_with_token(message: Message) -> None:
     try:
         item = rezka.get(url)
         if not item:
-            await message.answer("Контент не найден или недоступен.")
+            await message.answer("Контент не найден или временно недоступен.")
             return
 
         title = item.title
@@ -118,12 +112,15 @@ async def handle_start_with_token(message: Message) -> None:
         poster = item.poster
         description = getattr(item, 'description', 'Описание отсутствует')[:600]
 
-        # Если сериал — выбор сезона
+        # Сериал — выбор сезона
         if hasattr(item, 'seasons') and item.seasons:
             kb = InlineKeyboardMarkup(inline_keyboard=[])
             for season_num in sorted(item.seasons.keys()):
                 kb.inline_keyboard.append([
-                    InlineKeyboardButton(text=f"Сезон {season_num}", callback_data=f"season:{season_num}:{url}")
+                    InlineKeyboardButton(
+                        text=f"Сезон {season_num}",
+                        callback_data=f"season:{season_num}:{url}"
+                    )
                 ])
             text = f"<b>{title} ({year})</b>\n\n{description}\n\nВыберите сезон:"
             if poster:
@@ -131,7 +128,7 @@ async def handle_start_with_token(message: Message) -> None:
             else:
                 await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-        # Если фильм — сразу качества
+        # Фильм — сразу качества
         else:
             streams = item.videos if hasattr(item, 'videos') else {}
             if not streams and hasattr(item, 'player'):
@@ -157,13 +154,13 @@ async def handle_start_with_token(message: Message) -> None:
 @router.callback_query(F.data.startswith("season:"))
 async def handle_season(callback: CallbackQuery) -> None:
     """Выбор сезона → список серий"""
-    parts = callback.data.split(":")
+    parts = callback.data.split(":", 2)
     if len(parts) < 3:
         await callback.answer("Ошибка данных.")
         return
 
     season_str = parts[1]
-    url = ":".join(parts[2:])  # на случай если url содержит :
+    url = parts[2]
 
     try:
         season = int(season_str)
@@ -187,14 +184,14 @@ async def handle_season(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("episode:"))
 async def handle_episode(callback: CallbackQuery) -> None:
     """Выбор серии → выбор озвучки"""
-    parts = callback.data.split(":")
+    parts = callback.data.split(":", 3)
     if len(parts) < 4:
         await callback.answer("Ошибка данных.")
         return
 
     season_str = parts[1]
     episode_str = parts[2]
-    url = ":".join(parts[3:])
+    url = parts[3]
 
     try:
         season = int(season_str)
@@ -221,7 +218,7 @@ async def handle_episode(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("trans:"))
 async def handle_translator(callback: CallbackQuery) -> None:
     """Выбор озвучки → показ качеств"""
-    parts = callback.data.split(":")
+    parts = callback.data.split(":", 4)
     if len(parts) < 5:
         await callback.answer("Ошибка данных.")
         return
@@ -229,7 +226,7 @@ async def handle_translator(callback: CallbackQuery) -> None:
     season_str = parts[1]
     episode_str = parts[2]
     trans_id = parts[3]
-    url = ":".join(parts[4:])
+    url = parts[4]
 
     try:
         season = int(season_str)
@@ -257,7 +254,6 @@ def _run_alembic_upgrade_head_best_effort() -> None:
         subprocess.check_call([sys.executable, "-m", "alembic", "upgrade", "head"])
         log.info("✅ Alembic migrations applied: upgrade head")
     except Exception:
-        # best-effort; do not crash player bot
         log.exception("❌ Alembic upgrade head failed. Continuing without migrations.")
 
 
@@ -271,6 +267,7 @@ async def main() -> None:
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
 
+    log.info("🚀 Player bot started")
     await dp.start_polling(bot)
 
 
