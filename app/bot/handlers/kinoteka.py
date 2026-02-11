@@ -10,7 +10,8 @@ from app.bot.keyboards import kb_kinoteka_back
 from app.bot.ui import utcnow
 from app.db.models.user import User
 from app.db.session import session_scope
-from app.repo import get_subscription
+from app.repo import get_subscription, create_content_request
+from app.core.config import settings
 from app.services.rezka.client import rezka_client, RezkaError
 
 router = Router()
@@ -198,12 +199,35 @@ async def on_kino_item(cb: CallbackQuery) -> None:
     if desc:
         text += f"\n\n{desc}"
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🌐 Открыть на Rezka", url=url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:kinoteka")],
-        ]
-    )
+    # Create a short-lived deep-link token for the "player" bot.
+    # Bot2 will additionally check subscription and whitelist domains.
+    token = None
+    try:
+        async with session_scope() as session:
+            sub = await get_subscription(session, cb.from_user.id)
+            if not _is_sub_active(sub.end_at):
+                await cb.message.answer("⛔️ Подписка не активна. Сначала оплати доступ.")
+                return
+            token = await create_content_request(
+                session,
+                cb.from_user.id,
+                content_url=url,
+                ttl_seconds=settings.content_request_ttl_seconds,
+            )
+            await session.commit()
+    except Exception:
+        log.exception("Failed to create content_request token", extra={"tg_id": cb.from_user.id, "url": url})
+
+    player_link = None
+    if token:
+        player_link = f"https://t.me/{settings.player_bot_username}?start={token}"
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    if player_link:
+        keyboard.append([InlineKeyboardButton(text="▶️ Смотреть онлайн", url=player_link)])
+    keyboard.append([InlineKeyboardButton(text="🌐 Открыть на Rezka", url=url)])
+    keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:kinoteka")])
+    kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     poster_url = info.get("thumbnail_hq") or info.get("thumbnail")
     if poster_url:
