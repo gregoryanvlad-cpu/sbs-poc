@@ -340,7 +340,14 @@ async def handle_start_with_token(message: Message) -> None:
                 await message.answer(text, reply_markup=kb, parse_mode="HTML")
             return
 
-        # Фильм — сразу качества
+        # Фильм — сразу качества.
+        # Важно: НЕ используем InlineKeyboardButton(url=...) на прямые CDN-ссылки.
+        # У Rezka/CDN часто включена защита от хотлинка/реферера.
+        # В Telegram in-app browser ссылка открывается без нужных заголовков,
+        # из-за чего пользователя может перекинуть на страницу Rezka,
+        # а само видео не стартует. Поэтому делаем кнопки callback'ами
+        # и отправляем видео через Telegram (answer_video), где Telegram
+        # сам забирает файл по URL.
         translators = getattr(rezka_item, "translators", None) or {}
         translation = None
         try:
@@ -354,13 +361,10 @@ async def handle_start_with_token(message: Message) -> None:
 
         kb = InlineKeyboardMarkup(inline_keyboard=[])
         for quality in videos.keys():
-            try:
-                link = stream(quality)
-            except Exception:
-                continue
-            url1 = _normalize_stream_url(link)
-            if url1:
-                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=url1)])
+            # callback вместо прямого URL, см. комментарий выше
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(text=str(quality), callback_data=f"playfilm:{token}:{quality}")
+            ])
 
         text = f"<b>{title} ({year})</b>\n\n{description}"
         if poster:
@@ -371,6 +375,87 @@ async def handle_start_with_token(message: Message) -> None:
     except Exception:
         log.exception(f"Ошибка обработки контента {url}")
         await message.answer("Не удалось загрузить контент. Попробуйте позже.")
+
+
+@router.callback_query(F.data.startswith("playfilm:"))
+async def handle_play_film(callback: CallbackQuery) -> None:
+    """Кнопка качества для фильма.
+
+    Вместо открытия ссылки в браузере отдаём Telegram прямую ссылку
+    как `video=URL`, чтобы Telegram сам скачал/кешировал и показал видео.
+    Это обходится без реферера, который часто ломает воспроизведение в
+    in-app браузере.
+    """
+
+    parts = (callback.data or "").split(":", 2)
+    if len(parts) < 3:
+        await callback.answer("Ошибка данных.")
+        return
+
+    token = parts[1].strip()
+    quality = parts[2].strip()
+
+    await callback.answer("Загружаю…", show_alert=False)
+
+    # Load request + subscription
+    async with session_scope() as session:
+        req = await get_content_request_by_token(session, token)
+        if not req:
+            await callback.answer("Ссылка устарела.", show_alert=True)
+            return
+
+        sub = await get_subscription(session, callback.from_user.id)
+        if not _is_sub_active(sub.end_at):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Купить подписку", url=f"t.me/{settings.MAIN_BOT_USERNAME}")]
+            ])
+            await callback.message.answer("У вас нет активной подписки. Оформите в основном боте:", reply_markup=kb)
+            return
+
+        url = req.content_url
+
+    try:
+        rezka_item = _load_rezka(url)
+
+        translators = getattr(rezka_item, "translators", None) or {}
+        translation = None
+        if isinstance(translators, dict) and translators:
+            try:
+                translation = next(iter(translators.keys()))
+            except Exception:
+                translation = None
+
+        stream = rezka_item.getStream(translation=translation) if translation else rezka_item.getStream()
+
+        link = None
+        try:
+            link = stream(quality)
+        except Exception:
+            # Иногда quality приходит как "1080p" и т.п.; пробуем ключи из videos
+            videos = getattr(stream, "videos", {}) or {}
+            for q in videos.keys():
+                if str(q) == str(quality):
+                    link = stream(q)
+                    break
+
+        url1 = _normalize_stream_url(link)
+        if not url1:
+            await callback.message.answer("Не удалось получить ссылку на видео. Попробуйте другое качество.")
+            return
+
+        title = getattr(rezka_item, "name", "Фильм")
+        year = getattr(rezka_item, "releaseYear", None) or getattr(rezka_item, "year", None) or ""
+
+        # Отправляем как видео, чтобы запускалось прямо в Telegram
+        await callback.message.answer_video(
+            video=url1,
+            caption=f"<b>{title}{f' ({year})' if year else ''}</b>\nКачество: {quality}",
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        log.exception("Ошибка при отправке видео")
+        await callback.message.answer("Не удалось запустить видео. Попробуйте позже.")
 
 
 @router.callback_query(F.data.startswith("season:"))
