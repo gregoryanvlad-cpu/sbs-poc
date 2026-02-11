@@ -1,18 +1,54 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Payment, Subscription, User, VpnPeer
+from app.db.models import Payment, Subscription, User, VpnPeer, ContentRequest
 
 log = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def create_content_request(
+    session: AsyncSession,
+    tg_id: int,
+    *,
+    content_url: str,
+    ttl_seconds: int = 900,
+) -> str:
+    """Create a short-lived token for Bot2 deep-link.
+
+    Returns:
+        token (uuid4 string)
+    """
+    token = str(uuid4())
+    now = utcnow()
+    expires_at = now + timedelta(seconds=max(60, int(ttl_seconds)))
+    session.add(
+        ContentRequest(
+            user_id=tg_id,
+            token=token,
+            content_url=content_url,
+            created_at=now,
+            expires_at=expires_at,
+        )
+    )
+    await session.flush()
+    return token
+
+
+async def get_content_request_by_token(session: AsyncSession, token: str) -> ContentRequest | None:
+    now = utcnow()
+    q = select(ContentRequest).where(ContentRequest.token == token, ContentRequest.expires_at > now).limit(1)
+    res = await session.execute(q)
+    return res.scalar_one_or_none()
 
 
 async def ensure_user(session: AsyncSession, tg_id: int) -> User:
