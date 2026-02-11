@@ -206,6 +206,41 @@ def _load_rezka(url: str) -> HdRezkaApi:
         raise last_exc
     raise RuntimeError("Rezka mirrors exhausted")
 
+
+def _normalize_stream_url(link) -> str | None:
+    """Convert HdRezkaApi stream(quality) result to a single URL string.
+
+    Telegram InlineKeyboardButton.url must be a single URL.
+    HdRezkaApi may return:
+      - str (URL)
+      - list/tuple/set of URL strings
+      - dict with URL values (rare)
+    """
+    if not link:
+        return None
+
+    if isinstance(link, str):
+        s = link.strip()
+        return s or None
+
+    if isinstance(link, (list, tuple, set)):
+        for item in link:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return None
+
+    if isinstance(link, dict):
+        for item in link.values():
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return None
+
+    # Fallback: try stringify
+    s = str(link).strip()
+    if s.startswith("[") and s.endswith("]"):
+        return None
+    return s or None
+
 # Rate-limit cache (простой, в памяти)
 rate_cache = {}  # user_id → (count, last_time)
 
@@ -323,8 +358,9 @@ async def handle_start_with_token(message: Message) -> None:
                 link = stream(quality)
             except Exception:
                 continue
-            if link:
-                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=str(link))])
+            url1 = _normalize_stream_url(link)
+            if url1:
+                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=url1)])
 
         text = f"<b>{title} ({year})</b>\n\n{description}"
         if poster:
@@ -458,8 +494,9 @@ async def handle_translator(callback: CallbackQuery) -> None:
                 link = stream(quality)
             except Exception:
                 continue
-            if link:
-                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=str(link))])
+            url1 = _normalize_stream_url(link)
+            if url1:
+                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=url1)])
 
         await callback.message.edit_text("Выберите качество:", reply_markup=kb)
         await callback.answer()
