@@ -7,7 +7,6 @@ Required env vars in that service:
  - OWNER_TG_ID (any digits; used by shared config loader)
  - MAIN_BOT_USERNAME (e.g. sbsconnect_bot)
  - PLAYER_RATE_LIMIT_PER_MINUTE (comma-separated)
- - REZKA_MIRROR (optional, default https://rezka.ag)
 """
 
 from __future__ import annotations
@@ -28,12 +27,13 @@ from app.core.config import settings
 from app.db.session import init_engine, session_scope
 from app.repo import get_subscription, get_content_request_by_token
 from app.bot.ui import utcnow
-from HdRezkaApi import HdRezkaApi
+from app.db.models import ContentRequest  # модель content_requests
+from HdRezkaApi import HdRezkaApi  # парсер Rezka
 
 log = logging.getLogger(__name__)
 
-# Инициализация парсера Rezka
-rezka = HdRezkaApi(mirror=os.getenv("REZKA_MIRROR", "https://rezka.ag"))
+# Инициализация парсера Rezka (без 'mirror', если версия не поддерживает — используй дефолт)
+rezka = HdRezkaApi()
 
 # Rate-limit cache (простой, в памяти)
 rate_cache = {}  # user_id → (count, last_time)
@@ -270,3 +270,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+```<|control12|>
