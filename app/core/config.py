@@ -24,6 +24,8 @@ def make_async_db_url(url: str) -> str:
 class Settings:
     bot_token: str
     bot_username: str | None
+    # username of the secondary "player" bot (used by Bot1 to build deep links)
+    player_bot_username: str
     database_url: str
     scheduler_enabled: bool
     auto_delete_seconds: int
@@ -68,11 +70,20 @@ class Settings:
     # HdRezka (search & карточки)
     rezka_origin: str = "https://hdrezka.ag"
 
+    # Deep-link token TTL (Bot1 -> Bot2)
+    content_request_ttl_seconds: int = 900
+
+    # Bot2 (player) settings (used only by main_player.py)
+    main_bot_username: str = "sbsconnect_bot"
+    player_whitelist_domains: tuple[str, ...] = ("youtube.com", "youtu.be")
+    player_rate_limit_per_minute: int = 15
+
 
 def _load_settings() -> Settings:
-    bot_token = os.getenv("BOT_TOKEN", "").strip()
+    # Bot1 uses BOT_TOKEN, Bot2 can use PLAYER_BOT_TOKEN.
+    bot_token = (os.getenv("BOT_TOKEN") or os.getenv("PLAYER_BOT_TOKEN") or "").strip()
     if not bot_token:
-        raise RuntimeError("BOT_TOKEN is missing")
+        raise RuntimeError("BOT_TOKEN is missing (or set PLAYER_BOT_TOKEN for the player bot)")
 
     database_url_raw = os.getenv("DATABASE_URL", "").strip()
     if not database_url_raw:
@@ -86,6 +97,7 @@ def _load_settings() -> Settings:
     return Settings(
         bot_token=bot_token,
         bot_username=(os.getenv("BOT_USERNAME") or "").strip() or None,
+        player_bot_username=(os.getenv("PLAYER_BOT_USERNAME") or "inoteka_secure_bot").strip(),
         database_url=make_async_db_url(database_url_raw),
         scheduler_enabled=_env_bool("SCHEDULER_ENABLED", True),
         auto_delete_seconds=int(os.getenv("AUTO_DELETE_SECONDS", "60")),
@@ -114,6 +126,16 @@ def _load_settings() -> Settings:
         poiskkino_api_key=(os.getenv("POISKKINO_API_KEY") or "").strip() or None,
         # Rezka
         rezka_origin=os.getenv("REZKA_ORIGIN", "https://hdrezka.ag").strip(),
+
+        # Player bot
+        content_request_ttl_seconds=int(os.getenv("CONTENT_REQUEST_TTL_SECONDS", "900")),
+        main_bot_username=(os.getenv("MAIN_BOT_USERNAME") or "sbsconnect_bot").strip(),
+        player_whitelist_domains=tuple(
+            d.strip().lower()
+            for d in (os.getenv("PLAYER_WHITELIST_DOMAINS") or "youtube.com,youtu.be").split(",")
+            if d.strip()
+        ),
+        player_rate_limit_per_minute=int(os.getenv("PLAYER_RATE_LIMIT_PER_MINUTE", "15")),
     )
 
 
