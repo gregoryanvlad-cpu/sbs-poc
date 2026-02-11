@@ -1,13 +1,13 @@
 """
-Secondary bot entrypoint — Player Gateway (inoteka Secure Connection | SBS)
-Запускается в Railway-сервисе kinoteka-player с SERVICE_ROLE=player
-
-Обязательные переменные:
-- SERVICE_ROLE=player
-- PLAYER_BOT_TOKEN (или BOT_TOKEN)
-- DATABASE_URL (общая Postgres)
-- MAIN_BOT_USERNAME (для кнопки "Купить подписку")
-- REZKA_MIRROR (опционально, по умолчанию https://rezka.ag)
+Secondary bot entrypoint (player gateway).
+Run this file in a separate Railway service (kinoteka-player).
+Required env vars in that service:
+ - DATABASE_URL (reference to the shared Postgres)
+ - PLAYER_BOT_TOKEN (or BOT_TOKEN)
+ - OWNER_TG_ID (any digits; used by shared config loader)
+ - MAIN_BOT_USERNAME (e.g. sbsconnect_bot)
+ - PLAYER_RATE_LIMIT_PER_MINUTE (comma-separated)
+ - REZKA_MIRROR (optional, default https://rezka.ag)
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 # Инициализация парсера Rezka
 rezka = HdRezkaApi(mirror=os.getenv("REZKA_MIRROR", "https://rezka.ag"))
 
-# Простой rate-limit в памяти
+# Rate-limit cache (простой, в памяти)
 rate_cache = {}  # user_id → (count, last_time)
 
 router = Router()
@@ -43,7 +43,7 @@ router = Router()
 
 def rate_limit_exceeded(user_id: int) -> bool:
     limit = int(os.getenv("PLAYER_RATE_LIMIT_PER_MINUTE", "15"))
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.utcnow().timestamp()
     if user_id in rate_cache:
         count, last_time = rate_cache[user_id]
         if now - last_time < 60:
@@ -79,7 +79,6 @@ async def handle_start_with_token(message: Message) -> None:
         await message.answer("Слишком много запросов. Подождите минуту.")
         return
 
-    # Достаём url по токену
     async with session_scope() as session:
         req = await get_content_request_by_token(session, token)
         if not req:
@@ -104,7 +103,7 @@ async def handle_start_with_token(message: Message) -> None:
     try:
         item = rezka.get(url)
         if not item:
-            await message.answer("Контент не найден или временно недоступен.")
+            await message.answer("Контент не найден или недоступен.")
             return
 
         title = item.title
@@ -117,10 +116,7 @@ async def handle_start_with_token(message: Message) -> None:
             kb = InlineKeyboardMarkup(inline_keyboard=[])
             for season_num in sorted(item.seasons.keys()):
                 kb.inline_keyboard.append([
-                    InlineKeyboardButton(
-                        text=f"Сезон {season_num}",
-                        callback_data=f"season:{season_num}:{url}"
-                    )
+                    InlineKeyboardButton(text=f"Сезон {season_num}", callback_data=f"season:{season_num}:{url}")
                 ])
             text = f"<b>{title} ({year})</b>\n\n{description}\n\nВыберите сезон:"
             if poster:
@@ -254,6 +250,7 @@ def _run_alembic_upgrade_head_best_effort() -> None:
         subprocess.check_call([sys.executable, "-m", "alembic", "upgrade", "head"])
         log.info("✅ Alembic migrations applied: upgrade head")
     except Exception:
+        # best-effort; do not crash player bot
         log.exception("❌ Alembic upgrade head failed. Continuing without migrations.")
 
 
