@@ -223,17 +223,36 @@ def _normalize_stream_url(link) -> str | None:
         s = link.strip()
         return s or None
 
+    def _pick_best(candidates: list[str]) -> str | None:
+        """Prefer direct MP4 links over HLS (m3u8).
+
+        HdRezka often returns multiple URLs for the same quality.
+        When Telegram tries to play HLS (m3u8) it may only show a short
+        preview/bumper. Direct MP4 works much more reliably in Telegram.
+        """
+        cleaned = [c.strip() for c in candidates if isinstance(c, str) and c.strip()]
+        if not cleaned:
+            return None
+
+        # Prefer obvious MP4 links
+        for c in cleaned:
+            lc = c.lower()
+            if ".mp4" in lc or lc.endswith(".m4v") or "format=mp4" in lc:
+                return c
+
+        # Otherwise prefer non-m3u8
+        for c in cleaned:
+            if "m3u8" not in c.lower():
+                return c
+
+        # Fallback to the last (often the 'real' stream)
+        return cleaned[-1]
+
     if isinstance(link, (list, tuple, set)):
-        for item in link:
-            if isinstance(item, str) and item.strip():
-                return item.strip()
-        return None
+        return _pick_best(list(link))
 
     if isinstance(link, dict):
-        for item in link.values():
-            if isinstance(item, str) and item.strip():
-                return item.strip()
-        return None
+        return _pick_best([v for v in link.values() if isinstance(v, str)])
 
     # Fallback: try stringify
     s = str(link).strip()
@@ -259,6 +278,17 @@ def rate_limit_exceeded(user_id: int) -> bool:
             return False
     rate_cache[user_id] = (1, now)
     return False
+
+
+def _cb(*parts: str) -> str:
+    """Build safe callback_data (Telegram limit is 64 bytes).
+
+    We NEVER put full URLs into callback_data – they are long and trigger
+    BUTTON_DATA_INVALID. Instead we pass a short token and re-load URL from DB.
+    """
+    s = ":".join(str(p) for p in parts)
+    # Hard truncate just in case; better to have a shorter callback than crash.
+    return s[:64]
 
 
 def _is_sub_active(end_at) -> bool:
@@ -331,7 +361,7 @@ async def handle_start_with_token(message: Message) -> None:
             seasons = [s.get("season") for s in episodes_info if isinstance(s, dict) and s.get("season") is not None]
             for season_num in sorted(set(int(s) for s in seasons)):
                 kb.inline_keyboard.append([
-                    InlineKeyboardButton(text=f"Сезон {season_num}", callback_data=f"season:{season_num}:{url}")
+                    InlineKeyboardButton(text=f"Сезон {season_num}", callback_data=_cb("season", token, str(season_num)))
                 ])
             text = f"<b>{title} ({year})</b>\n\n{description}\n\nВыберите сезон:"
             if poster:
@@ -363,7 +393,7 @@ async def handle_start_with_token(message: Message) -> None:
         for quality in videos.keys():
             # callback вместо прямого URL, см. комментарий выше
             kb.inline_keyboard.append([
-                InlineKeyboardButton(text=str(quality), callback_data=f"playfilm:{token}:{quality}")
+                InlineKeyboardButton(text=str(quality), callback_data=_cb("playfilm", token, str(quality)))
             ])
 
         text = f"<b>{title} ({year})</b>\n\n{description}"
@@ -461,13 +491,21 @@ async def handle_play_film(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("season:"))
 async def handle_season(callback: CallbackQuery) -> None:
     """Выбор сезона → список серий"""
-    parts = callback.data.split(":", 2)
+    parts = (callback.data or "").split(":", 2)
     if len(parts) < 3:
         await callback.answer("Ошибка данных.")
         return
 
-    season_str = parts[1]
-    url = parts[2]
+    token = parts[1].strip()
+    season_str = parts[2].strip()
+
+    # Resolve URL from DB
+    async with session_scope() as session:
+        req = await get_content_request_by_token(session, token)
+        if not req:
+            await callback.answer("Ссылка устарела.", show_alert=True)
+            return
+        url = req.content_url
 
     try:
         season = int(season_str)
@@ -487,7 +525,7 @@ async def handle_season(callback: CallbackQuery) -> None:
         kb = InlineKeyboardMarkup(inline_keyboard=[])
         for ep in sorted(set(episodes)):
             kb.inline_keyboard.append([
-                InlineKeyboardButton(text=f"Серия {ep}", callback_data=f"episode:{season}:{ep}:{url}")
+                InlineKeyboardButton(text=f"Серия {ep}", callback_data=_cb("episode", token, str(season), str(ep)))
             ])
 
         await callback.message.edit_text(f"Сезон {season}: выберите серию", reply_markup=kb)
@@ -501,14 +539,21 @@ async def handle_season(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("episode:"))
 async def handle_episode(callback: CallbackQuery) -> None:
     """Выбор серии → выбор озвучки"""
-    parts = callback.data.split(":", 3)
+    parts = (callback.data or "").split(":", 3)
     if len(parts) < 4:
         await callback.answer("Ошибка данных.")
         return
 
-    season_str = parts[1]
-    episode_str = parts[2]
-    url = parts[3]
+    token = parts[1].strip()
+    season_str = parts[2].strip()
+    episode_str = parts[3].strip()
+
+    async with session_scope() as session:
+        req = await get_content_request_by_token(session, token)
+        if not req:
+            await callback.answer("Ссылка устарела.", show_alert=True)
+            return
+        url = req.content_url
 
     try:
         season = int(season_str)
@@ -535,12 +580,12 @@ async def handle_episode(callback: CallbackQuery) -> None:
             if trans_id is None:
                 continue
             kb.inline_keyboard.append([
-                InlineKeyboardButton(text=str(trans_name), callback_data=f"trans:{season}:{episode}:{trans_id}:{url}")
+                InlineKeyboardButton(text=str(trans_name), callback_data=_cb("trans", token, str(season), str(episode), str(trans_id)))
             ])
 
         if not kb.inline_keyboard:
             kb.inline_keyboard.append([
-                InlineKeyboardButton(text="По умолчанию", callback_data=f"trans:{season}:{episode}:None:{url}")
+                InlineKeyboardButton(text="По умолчанию", callback_data=_cb("trans", token, str(season), str(episode), "None"))
             ])
 
         await callback.message.edit_text(f"Серия {episode} (сезон {season}): выберите озвучку", reply_markup=kb)
@@ -554,15 +599,22 @@ async def handle_episode(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("trans:"))
 async def handle_translator(callback: CallbackQuery) -> None:
     """Выбор озвучки → показ качеств"""
-    parts = callback.data.split(":", 4)
+    parts = (callback.data or "").split(":", 4)
     if len(parts) < 5:
         await callback.answer("Ошибка данных.")
         return
 
-    season_str = parts[1]
-    episode_str = parts[2]
-    trans_id = parts[3]
-    url = parts[4]
+    token = parts[1].strip()
+    season_str = parts[2].strip()
+    episode_str = parts[3].strip()
+    trans_id = parts[4].strip()
+
+    async with session_scope() as session:
+        req = await get_content_request_by_token(session, token)
+        if not req:
+            await callback.answer("Ссылка устарела.", show_alert=True)
+            return
+        url = req.content_url
 
     try:
         season = int(season_str)
@@ -575,13 +627,13 @@ async def handle_translator(callback: CallbackQuery) -> None:
 
         kb = InlineKeyboardMarkup(inline_keyboard=[])
         for quality in videos.keys():
-            try:
-                link = stream(quality)
-            except Exception:
-                continue
-            url1 = _normalize_stream_url(link)
-            if url1:
-                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=url1)])
+            # callback вместо прямого URL (см. комментарий в фильмах)
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=str(quality),
+                    callback_data=_cb("playseries", token, str(season), str(episode), str(trans_id), str(quality)),
+                )
+            ])
 
         await callback.message.edit_text("Выберите качество:", reply_markup=kb)
         await callback.answer()
@@ -589,6 +641,76 @@ async def handle_translator(callback: CallbackQuery) -> None:
     except Exception:
         log.exception("Ошибка обработки озвучки")
         await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("playseries:"))
+async def handle_play_series(callback: CallbackQuery) -> None:
+    """Кнопка качества для серии (HLS/Referer-safe, как у фильмов)."""
+
+    parts = (callback.data or "").split(":", 5)
+    if len(parts) < 6:
+        await callback.answer("Ошибка данных.")
+        return
+
+    token = parts[1].strip()
+    season = int(parts[2])
+    episode = int(parts[3])
+    trans_id = parts[4].strip()
+    quality = parts[5].strip()
+
+    await callback.answer("Загружаю…", show_alert=False)
+
+    async with session_scope() as session:
+        req = await get_content_request_by_token(session, token)
+        if not req:
+            await callback.answer("Ссылка устарела.", show_alert=True)
+            return
+
+        sub = await get_subscription(session, callback.from_user.id)
+        if not _is_sub_active(sub.end_at):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Купить подписку", url=f"t.me/{settings.MAIN_BOT_USERNAME}")]
+            ])
+            await callback.message.answer("У вас нет активной подписки. Оформите в основном боте:", reply_markup=kb)
+            return
+
+        url = req.content_url
+
+    try:
+        rezka_item = _load_rezka(url)
+        translation = None if trans_id in {"None", "none", "null", ""} else trans_id
+        stream = rezka_item.getStream(season, episode, translation=translation)
+
+        link = None
+        try:
+            link = stream(quality)
+        except Exception:
+            videos = getattr(stream, "videos", {}) or {}
+            for q in videos.keys():
+                if str(q) == str(quality):
+                    link = stream(q)
+                    break
+
+        url1 = _normalize_stream_url(link)
+        if not url1:
+            await callback.message.answer("Не удалось получить ссылку на видео. Попробуйте другое качество.")
+            return
+
+        title = getattr(rezka_item, "name", "Сериал")
+        year = getattr(rezka_item, "releaseYear", None) or getattr(rezka_item, "year", None) or ""
+
+        await callback.message.answer_video(
+            video=url1,
+            caption=(
+                f"<b>{title}{f' ({year})' if year else ''}</b>\n"
+                f"Сезон {season}, серия {episode}\nКачество: {quality}"
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        log.exception("Ошибка при отправке серии")
+        await callback.message.answer("Не удалось запустить серию. Попробуйте позже.")
 
 
 def _run_alembic_upgrade_head_best_effort() -> None:
