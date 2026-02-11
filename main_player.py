@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -36,26 +37,53 @@ from urllib.parse import urlparse, urlunparse
 log = logging.getLogger(__name__)
 
 
+def _parse_rezka_mirrors(raw: str) -> list[str]:
+    """Парсит REZKA_MIRROR.
+
+    Поддерживает:
+      - один URL: https://rezka.ag
+      - несколько URL через запятую/пробел/перевод строки:
+        https://rezka.ag, https://rezka.me
+    """
+    if not raw:
+        return []
+    raw = raw.strip().strip('"').strip("'")
+    # разделители: запятая, пробелы, переносы строк
+    parts = re.split(r"[,\s]+", raw)
+    mirrors: list[str] = []
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if "://" not in p:
+            p = "https://" + p
+        mirrors.append(p)
+    return mirrors
+
+
 def _normalize_rezka_url(url: str) -> str:
     """Подменяет домен в ссылке на Rezka на зеркало из env.
 
-    HdRezkaApi (>=11) создаётся *для конкретной страницы* (url фильма/сериала),
-    а не для зеркала. Поэтому зеркало надо вшивать в сам URL.
+    Важно: HdRezkaApi создаётся *для конкретной страницы* (url фильма/сериала),
+    поэтому зеркало надо вшивать в сам URL.
     """
+    mirrors = _parse_rezka_mirrors(os.getenv("REZKA_MIRROR", ""))
 
-    mirror = os.getenv("REZKA_MIRROR")
-    if not mirror:
+    if not mirrors:
         return url
 
-    try:
-        src = urlparse(url)
-        dst = urlparse(mirror)
-        if not dst.scheme or not dst.netloc:
-            return url
-        return urlunparse((dst.scheme, dst.netloc, src.path, src.params, src.query, src.fragment))
-    except Exception:
-        return url
+    src = urlparse(url)
 
+    for mirror in mirrors:
+        try:
+            dst = urlparse(mirror)
+            if not dst.scheme or not dst.netloc:
+                continue
+            return urlunparse((dst.scheme, dst.netloc, src.path, src.params, src.query, src.fragment))
+        except Exception:
+            continue
+
+    return url
 
 def _load_rezka(url: str) -> HdRezkaApi:
     """Создаёт объект HdRezkaApi для конкретного контента и валидирует ok."""
