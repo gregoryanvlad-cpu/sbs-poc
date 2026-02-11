@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -30,73 +29,182 @@ from app.db.session import init_engine, session_scope
 from app.repo import get_subscription, get_content_request_by_token
 from app.bot.ui import utcnow
 from app.db.models import ContentRequest  # модель content_requests
-from HdRezkaApi import HdRezkaApi  # парсер Rezka
+from HdRezkaApi import HdRezkaApi, errors as rezka_errors  # парсер Rezka
 
 from urllib.parse import urlparse, urlunparse
+
+
+# ----------------------------- Rezka helpers -----------------------------
+
+# Cookie cache in-memory (per mirror). Railway service is long-lived, so this
+# prevents re-login on every request.
+_rezka_cookies_by_mirror: dict[str, dict] = {}
+_rezka_login_attempted: set[str] = set()
+
+
+def _parse_mirrors(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    # allow comma/space/newline separated
+    parts = []
+    for chunk in raw.replace("\n", ",").replace(" ", ",").split(","):
+        s = chunk.strip().strip('"').strip("'")
+        if not s:
+            continue
+        if not s.startswith("http://") and not s.startswith("https://"):
+            s = "https://" + s
+        parts.append(s.rstrip("/"))
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _build_proxy() -> dict:
+    """Build proxy dict for HdRezkaApi from environment.
+
+    Supports:
+      - PROXY_URL (applies to http+https)
+      - HTTPS_PROXY / HTTP_PROXY
+    """
+    proxy_url = (os.getenv("PROXY_URL") or "").strip()
+    https_p = (os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or "").strip()
+    http_p = (os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or "").strip()
+
+    if proxy_url:
+        return {"http": proxy_url, "https": proxy_url}
+    proxy = {}
+    if http_p:
+        proxy["http"] = http_p
+    if https_p:
+        proxy["https"] = https_p
+    return proxy
+
+
+def _get_auth_cookies(mirror_key: str) -> dict:
+    """Return cookies (possibly empty) for this mirror."""
+    return _rezka_cookies_by_mirror.get(mirror_key, {})
+
+
+def _maybe_login_and_store(url_for_login: str, mirror_key: str) -> None:
+    """Try to authenticate to Rezka if credentials are provided in env.
+
+    Env options:
+      - REZKA_USER_ID + REZKA_PASSWORD_HASH (best; no network login)
+      - REZKA_EMAIL + REZKA_PASSWORD (network login)
+    """
+    if mirror_key in _rezka_login_attempted:
+        return
+
+    user_id = (os.getenv("REZKA_USER_ID") or "").strip()
+    pwd_hash = (os.getenv("REZKA_PASSWORD_HASH") or "").strip()
+    email = (os.getenv("REZKA_EMAIL") or "").strip()
+    password = (os.getenv("REZKA_PASSWORD") or "").strip()
+
+    if not ((user_id and pwd_hash) or (email and password)):
+        return
+
+    _rezka_login_attempted.add(mirror_key)
+
+    try:
+        if user_id and pwd_hash:
+            # No network login required, just synth cookies.
+            cookies = HdRezkaApi.make_cookies(user_id=user_id, password_hash=pwd_hash)
+            if isinstance(cookies, dict) and cookies:
+                _rezka_cookies_by_mirror[mirror_key] = cookies
+                log.info("✅ Rezka cookies built from REZKA_USER_ID/REZKA_PASSWORD_HASH")
+            return
+
+        # Network login
+        rezka_obj = HdRezkaApi(url_for_login, proxy=_build_proxy())
+        rezka_obj.login(email=email, password=password, raise_exception=True)
+        cookies = getattr(rezka_obj, "cookies", None)
+        if isinstance(cookies, dict) and cookies:
+            _rezka_cookies_by_mirror[mirror_key] = cookies
+            log.info("✅ Rezka login succeeded; cookies stored")
+    except Exception:
+        log.exception("❌ Rezka login attempt failed")
+
 
 log = logging.getLogger(__name__)
 
 
-def _parse_rezka_mirrors(raw: str) -> list[str]:
-    """Парсит REZKA_MIRROR.
-
-    Поддерживает:
-      - один URL: https://rezka.ag
-      - несколько URL через запятую/пробел/перевод строки:
-        https://rezka.ag, https://rezka.me
-    """
-    if not raw:
-        return []
-    raw = raw.strip().strip('"').strip("'")
-    # разделители: запятая, пробелы, переносы строк
-    parts = re.split(r"[,\s]+", raw)
-    mirrors: list[str] = []
-    for p in parts:
-        p = (p or "").strip()
-        if not p:
-            continue
-        if "://" not in p:
-            p = "https://" + p
-        mirrors.append(p)
-    return mirrors
-
-
-def _normalize_rezka_url(url: str) -> str:
-    """Подменяет домен в ссылке на Rezka на зеркало из env.
-
-    Важно: HdRezkaApi создаётся *для конкретной страницы* (url фильма/сериала),
-    поэтому зеркало надо вшивать в сам URL.
-    """
-    mirrors = _parse_rezka_mirrors(os.getenv("REZKA_MIRROR", ""))
-
-    if not mirrors:
+def _swap_domain(url: str, mirror: str) -> str:
+    """Replace domain in `url` with `mirror` (scheme+netloc)."""
+    try:
+        src = urlparse(url)
+        dst = urlparse(mirror)
+        if not dst.scheme or not dst.netloc:
+            return url
+        return urlunparse((dst.scheme, dst.netloc, src.path, src.params, src.query, src.fragment))
+    except Exception:
         return url
 
-    src = urlparse(url)
-
-    for mirror in mirrors:
-        try:
-            dst = urlparse(mirror)
-            if not dst.scheme or not dst.netloc:
-                continue
-            return urlunparse((dst.scheme, dst.netloc, src.path, src.params, src.query, src.fragment))
-        except Exception:
-            continue
-
-    return url
 
 def _load_rezka(url: str) -> HdRezkaApi:
-    """Создаёт объект HdRezkaApi для конкретного контента и валидирует ok."""
+    """Create HdRezkaApi object for a specific title URL.
 
-    normalized = _normalize_rezka_url(url)
-    rezka_obj = HdRezkaApi(normalized)
-    if not getattr(rezka_obj, "ok", True):
-        # В библиотеке есть rezka.exception
-        exc = getattr(rezka_obj, "exception", None)
-        if exc:
-            raise exc
-        raise RuntimeError("HdRezkaApi returned ok=False")
-    return rezka_obj
+    Features:
+      - mirror fallback (REZKA_MIRROR can be a list)
+      - proxy support (PROXY_URL / HTTP(S)_PROXY)
+      - optional auth cookies (via env login or prebuilt cookies)
+    """
+
+    mirrors = _parse_mirrors(os.getenv("REZKA_MIRROR"))
+    if not mirrors:
+        mirrors = ["https://rezka.ag"]
+
+    proxy = _build_proxy()
+    last_exc: Exception | None = None
+
+    for mirror in mirrors:
+        normalized = _swap_domain(url, mirror)
+        mirror_key = urlparse(mirror).netloc
+        cookies = _get_auth_cookies(mirror_key)
+
+        try:
+            rezka_obj = HdRezkaApi(normalized, proxy=proxy, cookies=cookies)
+
+            if not getattr(rezka_obj, "ok", True):
+                exc = getattr(rezka_obj, "exception", None)
+                if exc:
+                    raise exc
+                raise RuntimeError("HdRezkaApi returned ok=False")
+
+            return rezka_obj
+
+        except rezka_errors.LoginRequiredError as e:
+            # Try login (once per mirror) and retry.
+            last_exc = e
+            _maybe_login_and_store(normalized, mirror_key)
+            cookies2 = _get_auth_cookies(mirror_key)
+            if cookies2 and cookies2 != cookies:
+                try:
+                    rezka_obj = HdRezkaApi(normalized, proxy=proxy, cookies=cookies2)
+                    if getattr(rezka_obj, "ok", True):
+                        return rezka_obj
+                    exc = getattr(rezka_obj, "exception", None)
+                    if exc:
+                        raise exc
+                except Exception as e2:
+                    last_exc = e2
+
+        except rezka_errors.HTTP as e:
+            # 403/503 etc. — try next mirror.
+            last_exc = e
+            continue
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Rezka mirrors exhausted")
 
 # Rate-limit cache (простой, в памяти)
 rate_cache = {}  # user_id → (count, last_time)
