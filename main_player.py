@@ -31,37 +31,44 @@ from app.bot.ui import utcnow
 from app.db.models import ContentRequest  # модель content_requests
 from HdRezkaApi import HdRezkaApi  # парсер Rezka
 
+from urllib.parse import urlparse, urlunparse
+
 log = logging.getLogger(__name__)
 
 
-def init_rezka_api(mirror_url: str) -> HdRezkaApi:
-    """Создаёт клиент HdRezkaApi, совместимый с разными версиями библиотеки.
+def _normalize_rezka_url(url: str) -> str:
+    """Подменяет домен в ссылке на Rezka на зеркало из env.
 
-    В логах Railway у тебя падало:
-    TypeError: HdRezkaApi.__init__() got an unexpected keyword argument 'mirror'
-
-    Это значит, что установленная версия (см. requirements.txt) ожидает аргумент
-    `url`, а не `mirror`. На всякий случай поддерживаем оба.
+    HdRezkaApi (>=11) создаётся *для конкретной страницы* (url фильма/сериала),
+    а не для зеркала. Поэтому зеркало надо вшивать в сам URL.
     """
 
-    # Новые версии (в проекте закреплено HdRezkaApi==11.1.0) принимают url=
+    mirror = os.getenv("REZKA_MIRROR")
+    if not mirror:
+        return url
+
     try:
-        return HdRezkaApi(url=mirror_url)
-    except TypeError:
-        pass
-
-    # Старые версии принимали mirror=
-    try:
-        return HdRezkaApi(mirror=mirror_url)  # type: ignore[arg-type]
-    except TypeError:
-        pass
-
-    # Совсем на всякий случай — без аргументов
-    return HdRezkaApi()
+        src = urlparse(url)
+        dst = urlparse(mirror)
+        if not dst.scheme or not dst.netloc:
+            return url
+        return urlunparse((dst.scheme, dst.netloc, src.path, src.params, src.query, src.fragment))
+    except Exception:
+        return url
 
 
-# Инициализация парсера Rezka
-rezka = init_rezka_api(os.getenv("REZKA_MIRROR", "https://rezka.ag"))
+def _load_rezka(url: str) -> HdRezkaApi:
+    """Создаёт объект HdRezkaApi для конкретного контента и валидирует ok."""
+
+    normalized = _normalize_rezka_url(url)
+    rezka_obj = HdRezkaApi(normalized)
+    if not getattr(rezka_obj, "ok", True):
+        # В библиотеке есть rezka.exception
+        exc = getattr(rezka_obj, "exception", None)
+        if exc:
+            raise exc
+        raise RuntimeError("HdRezkaApi returned ok=False")
+    return rezka_obj
 
 # Rate-limit cache (простой, в памяти)
 rate_cache = {}  # user_id → (count, last_time)
@@ -129,20 +136,21 @@ async def handle_start_with_token(message: Message) -> None:
 
     # Парсинг контента из Rezka
     try:
-        item = rezka.get(url)
-        if not item:
-            await message.answer("Контент не найден или недоступен.")
-            return
+        rezka_item = _load_rezka(url)
 
-        title = item.title
-        year = item.year or "—"
-        poster = item.poster
-        description = getattr(item, 'description', 'Описание отсутствует')[:600]
+        title = getattr(rezka_item, "name", "Без названия")
+        year = getattr(rezka_item, "releaseYear", None) or getattr(rezka_item, "year", None) or "—"
+        poster = getattr(rezka_item, "thumbnail", None) or getattr(rezka_item, "thumbnailHQ", None)
+        description = (getattr(rezka_item, "description", "Описание отсутствует") or "Описание отсутствует")[:600]
+
+        episodes_info = getattr(rezka_item, "episodesInfo", None) or []
+        is_series = bool(episodes_info)
 
         # Сериал — выбор сезона
-        if hasattr(item, 'seasons') and item.seasons:
+        if is_series:
             kb = InlineKeyboardMarkup(inline_keyboard=[])
-            for season_num in sorted(item.seasons.keys()):
+            seasons = [s.get("season") for s in episodes_info if isinstance(s, dict) and s.get("season") is not None]
+            for season_num in sorted(set(int(s) for s in seasons)):
                 kb.inline_keyboard.append([
                     InlineKeyboardButton(text=f"Сезон {season_num}", callback_data=f"season:{season_num}:{url}")
                 ])
@@ -151,26 +159,36 @@ async def handle_start_with_token(message: Message) -> None:
                 await message.answer_photo(photo=poster, caption=text, reply_markup=kb, parse_mode="HTML")
             else:
                 await message.answer(text, reply_markup=kb, parse_mode="HTML")
+            return
 
         # Фильм — сразу качества
+        translators = getattr(rezka_item, "translators", None) or {}
+        translation = None
+        try:
+            if isinstance(translators, dict) and translators:
+                translation = next(iter(translators.keys()))
+        except Exception:
+            translation = None
+
+        stream = rezka_item.getStream(translation=translation) if translation else rezka_item.getStream()
+        videos = getattr(stream, "videos", {}) or {}
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+        for quality in videos.keys():
+            try:
+                link = stream(quality)
+            except Exception:
+                continue
+            if link:
+                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=str(link))])
+
+        text = f"<b>{title} ({year})</b>\n\n{description}"
+        if poster:
+            await message.answer_photo(photo=poster, caption=text, reply_markup=kb, parse_mode="HTML")
         else:
-            streams = item.videos if hasattr(item, 'videos') else {}
-            if not streams and hasattr(item, 'player'):
-                streams = {"Смотреть": item.player}
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-            kb = InlineKeyboardMarkup(inline_keyboard=[])
-            for quality, link in streams.items():
-                kb.inline_keyboard.append([
-                    InlineKeyboardButton(text=quality, url=link)
-                ])
-
-            text = f"<b>{title} ({year})</b>\n\n{description}"
-            if poster:
-                await message.answer_photo(photo=poster, caption=text, reply_markup=kb, parse_mode="HTML")
-            else:
-                await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
-    except Exception as e:
+    except Exception:
         log.exception(f"Ошибка обработки контента {url}")
         await message.answer("Не удалось загрузить контент. Попробуйте позже.")
 
@@ -188,11 +206,21 @@ async def handle_season(callback: CallbackQuery) -> None:
 
     try:
         season = int(season_str)
-        item = rezka.get(url)
-        episodes = item.seasons.get(season, {}).get('episodes', []) if hasattr(item, 'seasons') else []
+        rezka_item = _load_rezka(url)
+        episodes_info = getattr(rezka_item, "episodesInfo", None) or []
+
+        episodes: list[int] = []
+        for s in episodes_info:
+            if not isinstance(s, dict):
+                continue
+            if int(s.get("season", -1)) != season:
+                continue
+            for ep in s.get("episodes", []) or []:
+                if isinstance(ep, dict) and ep.get("episode") is not None:
+                    episodes.append(int(ep["episode"]))
 
         kb = InlineKeyboardMarkup(inline_keyboard=[])
-        for ep in sorted(episodes):
+        for ep in sorted(set(episodes)):
             kb.inline_keyboard.append([
                 InlineKeyboardButton(text=f"Серия {ep}", callback_data=f"episode:{season}:{ep}:{url}")
             ])
@@ -200,7 +228,7 @@ async def handle_season(callback: CallbackQuery) -> None:
         await callback.message.edit_text(f"Сезон {season}: выберите серию", reply_markup=kb)
         await callback.answer()
 
-    except Exception as e:
+    except Exception:
         log.exception("Ошибка обработки сезона")
         await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
 
@@ -220,21 +248,40 @@ async def handle_episode(callback: CallbackQuery) -> None:
     try:
         season = int(season_str)
         episode = int(episode_str)
-        item = rezka.get(url)
-        translators = item.get_translators(season, episode) if hasattr(item, 'get_translators') else [{"id": "default", "name": "Основная"}]
+        rezka_item = _load_rezka(url)
+        episodes_info = getattr(rezka_item, "episodesInfo", None) or []
+
+        translations = []
+        for s in episodes_info:
+            if not isinstance(s, dict) or int(s.get("season", -1)) != season:
+                continue
+            for ep in s.get("episodes", []) or []:
+                if not isinstance(ep, dict) or int(ep.get("episode", -1)) != episode:
+                    continue
+                translations = ep.get("translations", []) or []
+                break
 
         kb = InlineKeyboardMarkup(inline_keyboard=[])
-        for trans in translators:
-            trans_id = trans.get("id", "default")
-            trans_name = trans.get("name", "Озвучка")
+        for t in translations:
+            if not isinstance(t, dict):
+                continue
+            trans_id = t.get("translator_id") or t.get("id")
+            trans_name = t.get("translator_name") or t.get("name") or "Озвучка"
+            if trans_id is None:
+                continue
             kb.inline_keyboard.append([
-                InlineKeyboardButton(text=trans_name, callback_data=f"trans:{season}:{episode}:{trans_id}:{url}")
+                InlineKeyboardButton(text=str(trans_name), callback_data=f"trans:{season}:{episode}:{trans_id}:{url}")
+            ])
+
+        if not kb.inline_keyboard:
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(text="По умолчанию", callback_data=f"trans:{season}:{episode}:None:{url}")
             ])
 
         await callback.message.edit_text(f"Серия {episode} (сезон {season}): выберите озвучку", reply_markup=kb)
         await callback.answer()
 
-    except Exception as e:
+    except Exception:
         log.exception("Ошибка обработки серии")
         await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
 
@@ -255,19 +302,25 @@ async def handle_translator(callback: CallbackQuery) -> None:
     try:
         season = int(season_str)
         episode = int(episode_str)
-        item = rezka.get(url)
-        streams = item.get_videos(season=season, episode=episode, translator=trans_id) if hasattr(item, 'get_videos') else item.videos
+        rezka_item = _load_rezka(url)
+
+        translation = None if trans_id in {"None", "none", "null", ""} else trans_id
+        stream = rezka_item.getStream(season, episode, translation=translation)
+        videos = getattr(stream, "videos", {}) or {}
 
         kb = InlineKeyboardMarkup(inline_keyboard=[])
-        for quality, link in streams.items():
-            kb.inline_keyboard.append([
-                InlineKeyboardButton(text=quality, url=link)
-            ])
+        for quality in videos.keys():
+            try:
+                link = stream(quality)
+            except Exception:
+                continue
+            if link:
+                kb.inline_keyboard.append([InlineKeyboardButton(text=str(quality), url=str(link))])
 
         await callback.message.edit_text("Выберите качество:", reply_markup=kb)
         await callback.answer()
 
-    except Exception as e:
+    except Exception:
         log.exception("Ошибка обработки озвучки")
         await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
 
