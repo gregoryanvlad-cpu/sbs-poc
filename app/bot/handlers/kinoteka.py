@@ -1,7 +1,7 @@
 from __future__ import annotations
-
 import json
 import logging
+from datetime import datetime
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,9 +15,7 @@ from app.core.config import settings
 from app.services.rezka.client import rezka_client, RezkaError
 
 router = Router()
-
 log = logging.getLogger(__name__)
-
 
 def _is_sub_active(end_at) -> bool:
     if not end_at:
@@ -31,8 +29,7 @@ def _is_sub_active(end_at) -> bool:
 @router.callback_query(F.data == "kino:search")
 async def on_kino_search(cb: CallbackQuery) -> None:
     await cb.answer()
-
-    # Check subscription (same as VPN/Yandex locks)
+    # Проверка подписки (как для VPN/Yandex)
     async with session_scope() as session:
         sub = await get_subscription(session, cb.from_user.id)
         if not _is_sub_active(sub.end_at):
@@ -41,8 +38,9 @@ async def on_kino_search(cb: CallbackQuery) -> None:
 
         user = await session.get(User, cb.from_user.id)
         if not user:
-            # ensure_user is called inside get_subscription
+            # ensure_user вызывается внутри get_subscription
             user = await session.get(User, cb.from_user.id)
+
         if user:
             user.flow_state = "await_kino_query"
             user.flow_data = json.dumps({"started_at": utcnow().isoformat()})
@@ -68,9 +66,8 @@ async def on_kino_query_input(msg: Message) -> None:
         if not user or user.flow_state != "await_kino_query":
             return
 
-        # stop flow no matter what (avoid stuck state)
+        # Сбрасываем состояние в любом случае (чтобы не висело)
         user.flow_state = None
-        # flow_data will be overwritten with search results below
         await session.commit()
 
     try:
@@ -96,7 +93,7 @@ async def on_kino_query_input(msg: Message) -> None:
         )
         return
 
-    # Store results in user flow_data so we can open by index (callback_data is limited)
+    # Сохраняем результаты в flow_data (чтобы не превышать лимит callback_data)
     async with session_scope() as session:
         user = await session.get(User, tg_id)
         if user:
@@ -106,10 +103,10 @@ async def on_kino_query_input(msg: Message) -> None:
             )
             await session.commit()
 
-    # Render compact list with buttons (up to 6)
+    # Формируем компактный список с кнопками
     kb: list[list[InlineKeyboardButton]] = []
     lines = ["🎬 <b>Результаты</b>:"]
-    # IMPORTANT: callback_data is limited, so we store full results in DB and pass only index (0-based)
+
     for idx, m in enumerate(results[:6]):
         n = idx + 1
         name = m.get("title") or "Без названия"
@@ -134,12 +131,13 @@ async def on_kino_query_input(msg: Message) -> None:
 @router.callback_query(F.data.startswith("kino:item:"))
 async def on_kino_item(cb: CallbackQuery) -> None:
     await cb.answer()
+
     try:
         idx = int(cb.data.split(":", 2)[2])
     except Exception:
         return
 
-    # Load saved results
+    # Загружаем сохранённые результаты из flow_data
     async with session_scope() as session:
         user = await session.get(User, cb.from_user.id)
         data = {}
@@ -148,6 +146,7 @@ async def on_kino_item(cb: CallbackQuery) -> None:
                 data = json.loads(user.flow_data)
             except Exception:
                 data = {}
+
     results = (data or {}).get("rezka_results") or []
     if not isinstance(results, list) or idx < 0 or idx >= len(results):
         await cb.message.answer("⚠️ Не удалось открыть карточку. Сделай поиск заново.", reply_markup=kb_kinoteka_back())
@@ -199,8 +198,7 @@ async def on_kino_item(cb: CallbackQuery) -> None:
     if desc:
         text += f"\n\n{desc}"
 
-    # Create a short-lived deep-link token for the "player" bot.
-    # Bot2 will additionally check subscription and whitelist domains.
+    # Генерируем короткий токен для плеер-бота
     token = None
     try:
         async with session_scope() as session:
@@ -208,6 +206,7 @@ async def on_kino_item(cb: CallbackQuery) -> None:
             if not _is_sub_active(sub.end_at):
                 await cb.message.answer("⛔️ Подписка не активна. Сначала оплати доступ.")
                 return
+
             token = await create_content_request(
                 session,
                 cb.from_user.id,
@@ -215,6 +214,7 @@ async def on_kino_item(cb: CallbackQuery) -> None:
                 ttl_seconds=settings.content_request_ttl_seconds,
             )
             await session.commit()
+
     except Exception:
         log.exception("Failed to create content_request token", extra={"tg_id": cb.from_user.id, "url": url})
 
@@ -225,16 +225,23 @@ async def on_kino_item(cb: CallbackQuery) -> None:
     keyboard: list[list[InlineKeyboardButton]] = []
     if player_link:
         keyboard.append([InlineKeyboardButton(text="▶️ Смотреть онлайн", url=player_link)])
+
     keyboard.append([InlineKeyboardButton(text="🌐 Открыть на Rezka", url=url)])
     keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:kinoteka")])
+
     kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     poster_url = info.get("thumbnail_hq") or info.get("thumbnail")
     if poster_url:
         try:
-            await cb.message.answer_photo(poster_url, caption=text, parse_mode="HTML", reply_markup=kb)
+            await cb.message.answer_photo(
+                photo=poster_url,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=kb
+            )
             return
         except Exception:
-            pass
+            pass  # если фото не загрузилось — просто текст
 
     await cb.message.answer(text, parse_mode="HTML", reply_markup=kb)
