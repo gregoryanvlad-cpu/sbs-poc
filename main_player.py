@@ -27,9 +27,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from app.core.logging import setup_logging
 from app.core.config import settings
 from app.db.session import init_engine, session_scope
-from app.db.models.user import User  # если нужно, подставь свою модель
-from app.repo import get_content_request, get_subscription  # твои репо
+from app.repo import get_subscription  # твои репо
 from app.bot.ui import utcnow  # твоя утилита
+from app.db.models import ContentRequest  # модель для content_requests (предполагаю в models.py)
 from HdRezkaApi import HdRezkaApi  # парсер Rezka
 
 log = logging.getLogger(__name__)
@@ -81,12 +81,18 @@ async def handle_start_with_token(message: Message) -> None:
         await message.answer("Слишком много запросов. Подождите минуту.")
         return
 
-    # Достаем content_url по токену
+    # Достаем content_url по токену из БД
     async with session_scope() as session:
-        req = await get_content_request(session, token)
-        if not req or req.expires_at < utcnow():
+        req = await session.query(ContentRequest).filter(
+            ContentRequest.token == token,
+            ContentRequest.expires_at > utcnow()
+        ).first()
+
+        if not req:
             await message.answer("Ссылка устарела или недействительна.")
             return
+
+        url = req.content_url
 
         # Проверка подписки
         sub = await get_subscription(session, user_id)
@@ -99,8 +105,6 @@ async def handle_start_with_token(message: Message) -> None:
                 reply_markup=kb
             )
             return
-
-        url = req.content_url
 
     # Парсинг контента из Rezka
     try:
@@ -159,7 +163,7 @@ async def handle_season(callback: CallbackQuery) -> None:
         return
 
     season_str = parts[1]
-    url = ":".join(parts[2:])  # на случай, если url с :
+    url = ":".join(parts[2:])  # на случай если url содержит :
 
     try:
         season = int(season_str)
@@ -262,7 +266,7 @@ async def main() -> None:
     init_engine(settings.database_url)
     _run_alembic_upgrade_head_best_effort()
 
-    bot = Bot(settings.player_bot_token or settings.bot_token)
+    bot = Bot(token=settings.player_bot_token or settings.bot_token)
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
