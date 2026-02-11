@@ -33,8 +33,35 @@ from HdRezkaApi import HdRezkaApi  # парсер Rezka
 
 log = logging.getLogger(__name__)
 
-# Инициализация парсера Rezka (требует url в твоей версии)
-rezka = HdRezkaApi(url=os.getenv("REZKA_MIRROR", "https://rezka.ag"))
+
+def init_rezka_api(mirror_url: str) -> HdRezkaApi:
+    """Создаёт клиент HdRezkaApi, совместимый с разными версиями библиотеки.
+
+    В логах Railway у тебя падало:
+    TypeError: HdRezkaApi.__init__() got an unexpected keyword argument 'mirror'
+
+    Это значит, что установленная версия (см. requirements.txt) ожидает аргумент
+    `url`, а не `mirror`. На всякий случай поддерживаем оба.
+    """
+
+    # Новые версии (в проекте закреплено HdRezkaApi==11.1.0) принимают url=
+    try:
+        return HdRezkaApi(url=mirror_url)
+    except TypeError:
+        pass
+
+    # Старые версии принимали mirror=
+    try:
+        return HdRezkaApi(mirror=mirror_url)  # type: ignore[arg-type]
+    except TypeError:
+        pass
+
+    # Совсем на всякий случай — без аргументов
+    return HdRezkaApi()
+
+
+# Инициализация парсера Rezka
+rezka = init_rezka_api(os.getenv("REZKA_MIRROR", "https://rezka.ag"))
 
 # Rate-limit cache (простой, в памяти)
 rate_cache = {}  # user_id → (count, last_time)
