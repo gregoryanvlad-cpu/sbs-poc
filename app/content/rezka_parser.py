@@ -6,7 +6,13 @@ logger = logging.getLogger(__name__)
 
 class RezkaParser:
     def __init__(self, mirror="https://rezka.ag"):
-        self.api = HdRezkaApi(mirror=mirror)
+        # В разных версиях HdRezkaApi аргумент зеркала назывался по-разному.
+        # В этом проекте закреплено HdRezkaApi==11.1.0 (ожидает url=),
+        # но на всякий случай поддержим и старый mirror=.
+        try:
+            self.api = HdRezkaApi(url=mirror)
+        except TypeError:
+            self.api = HdRezkaApi(mirror=mirror)
 
     def search(self, query, limit=6):
         try:
