@@ -287,7 +287,7 @@ async def main() -> None:
     init_engine(settings.database_url)
     _run_alembic_upgrade_head_best_effort()
 
-    bot = Bot(token=settings.player_bot_token or settings.bot_token)
+    bot = Bot(token=settings.bot_token)
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
