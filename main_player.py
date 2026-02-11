@@ -279,8 +279,16 @@ async def handle_start_with_token(message: Message) -> None:
         poster = getattr(rezka_item, "thumbnail", None) or getattr(rezka_item, "thumbnailHQ", None)
         description = (getattr(rezka_item, "description", "Описание отсутствует") or "Описание отсутствует")[:600]
 
-        episodes_info = getattr(rezka_item, "episodesInfo", None) or []
-        is_series = bool(episodes_info)
+        # `episodesInfo` is a property in HdRezkaApi and raises ValueError for non-TVSeries (e.g., films).
+        # So we must only access it when we are confident the URL points to a series.
+        is_series = ("/series/" in url) or ("/serials/" in url)
+        episodes_info = []
+        if is_series:
+            try:
+                episodes_info = rezka_item.episodesInfo or []
+            except Exception:
+                episodes_info = []
+                is_series = False
 
         # Сериал — выбор сезона
         if is_series:
