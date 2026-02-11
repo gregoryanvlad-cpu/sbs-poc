@@ -22,5 +22,11 @@ if [ $rc -ne 0 ]; then
   exit $rc
 fi
 
-echo "[boot] starting bot..."
-python main.py
+role="${SERVICE_ROLE:-main}"
+echo "[boot] starting bot... (SERVICE_ROLE=${role})"
+
+if [ "${role}" = "player" ]; then
+  exec python main_player.py
+else
+  exec python main.py
+fi
