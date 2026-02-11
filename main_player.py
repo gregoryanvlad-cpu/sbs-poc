@@ -7,7 +7,7 @@ Required env vars in that service:
  - OWNER_TG_ID (any digits; used by shared config loader)
  - MAIN_BOT_USERNAME (e.g. sbsconnect_bot)
  - PLAYER_RATE_LIMIT_PER_MINUTE (comma-separated)
- - REZKA_MIRROR (optional, default https://rezka.ag)
+ - REZKA_MIRROR (optional, default https://hdrezka-home.tv)
 """
 from __future__ import annotations
 import asyncio
@@ -15,7 +15,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
@@ -110,15 +110,21 @@ def _swap_domain(url: str, mirror: str) -> str:
 def _load_rezka(url: str) -> HdRezkaApi:
     mirrors = _parse_mirrors(os.getenv("REZKA_MIRROR"))
     if not mirrors:
-        mirrors = ["https://rezka.ag"]
+        mirrors = ["https://hdrezka-home.tv"]
     proxy = _build_proxy()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": mirrors[0],
+        "Accept": "*/*",
+        "Origin": mirrors[0]
+    }
     last_exc: Exception | None = None
     for mirror in mirrors:
         normalized = _swap_domain(url, mirror)
         mirror_key = urlparse(mirror).netloc
         cookies = _get_auth_cookies(mirror_key)
         try:
-            rezka_obj = HdRezkaApi(normalized, proxy=proxy, cookies=cookies)
+            rezka_obj = HdRezkaApi(normalized, proxy=proxy, cookies=cookies, headers=headers)
             if not getattr(rezka_obj, "ok", True):
                 exc = getattr(rezka_obj, "exception", None)
                 if exc:
@@ -131,7 +137,7 @@ def _load_rezka(url: str) -> HdRezkaApi:
             cookies2 = _get_auth_cookies(mirror_key)
             if cookies2 and cookies2 != cookies:
                 try:
-                    rezka_obj = HdRezkaApi(normalized, proxy=proxy, cookies=cookies2)
+                    rezka_obj = HdRezkaApi(normalized, proxy=proxy, cookies=cookies2, headers=headers)
                     if getattr(rezka_obj, "ok", True):
                         return rezka_obj
                     exc = getattr(rezka_obj, "exception", None)
@@ -190,7 +196,7 @@ router = Router()
 
 def rate_limit_exceeded(user_id: int) -> bool:
     limit = int(os.getenv("PLAYER_RATE_LIMIT_PER_MINUTE", "15"))
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     if user_id in rate_cache:
         count, last_time = rate_cache[user_id]
         if now - last_time < 60:
@@ -351,8 +357,6 @@ async def handle_play_film(callback: CallbackQuery) -> None:
     except Exception:
         log.exception("Ошибка при получении ссылки на фильм")
         await callback.message.answer("Не удалось получить ссылку. Попробуйте позже.")
-
-# Остальные хендлеры (сериалы) остаются почти без изменений, только меняем answer_video → answer с текстом
 
 @router.callback_query(F.data.startswith("season:"))
 async def handle_season(callback: CallbackQuery) -> None:
