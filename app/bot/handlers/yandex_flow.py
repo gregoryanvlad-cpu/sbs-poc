@@ -5,7 +5,7 @@ import re
 from datetime import timedelta
 
 from aiogram import Router, F
-from aiogram.exceptions import SkipHandler
+from aiogram.filters import BaseFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select
 
@@ -23,6 +23,23 @@ _LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$", re.IGNORECASE)
 
 # TTL для инвайта (сколько держим слот, если пользователь не вступил)
 INVITE_TTL_MINUTES = 15
+
+
+class _UserFlowStateFilter(BaseFilter):
+    """Match only when DB flow_state equals the expected value.
+
+    Avoids using SkipHandler, which is not available in the installed aiogram
+    version (and was causing ImportError at startup).
+    """
+
+    def __init__(self, expected_state: str):
+        self.expected_state = expected_state
+
+    async def __call__(self, message: Message) -> bool:  # type: ignore[override]
+        tg_id = message.from_user.id
+        async with session_scope() as session:
+            user = await session.get(User, tg_id)
+            return bool(user and user.flow_state == self.expected_state)
 
 
 def _kb_confirm_login() -> InlineKeyboardMarkup:
@@ -68,18 +85,14 @@ async def _is_sub_active(tg_id: int) -> bool:
         return sub.end_at > utcnow()
 
 
-@router.message(F.text)
+@router.message(F.text, _UserFlowStateFilter("await_yandex_login"))
 async def on_yandex_login_input(msg: Message) -> None:
     tg_id = msg.from_user.id
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
-        # Важно: этот хендлер повешен на F.text (ловит все текстовые сообщения).
-        # Если мы просто `return`, aiogram считает апдейт обработанным и
-        # не даёт другим хендлерам (в т.ч. FSM в админке) его обработать.
-        # Поэтому в нерелевантных случаях делаем SkipHandler.
-        if not user or user.flow_state != "await_yandex_login":
-            raise SkipHandler
+        # Фильтр уже гарантирует, что flow_state == await_yandex_login.
+        # Здесь просто достаём и валидируем логин.
 
         login = (msg.text or "").strip()
         login = login.replace("@", "").strip()
