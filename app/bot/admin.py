@@ -223,6 +223,166 @@ async def admin_menu(cb: CallbackQuery) -> None:
             raise
 
 
+
+# ==========================
+# ADMIN: VPN STATUS / ACTIVE PROFILES + REFERRALS MENU
+# ==========================
+
+
+def _kb_admin_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")]]
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:status")
+async def admin_vpn_status(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    st = await vpn_service.get_server_status()
+    if st.get("ok"):
+        cpu = st.get("cpu_load_percent")
+        act = st.get("active_peers")
+        tot = st.get("total_peers")
+        cpu_s = "—" if cpu is None else f"{cpu:.0f}%"
+        act_s = "—" if act is None else str(act)
+        tot_s = "—" if tot is None else str(tot)
+        text = (
+            "📊 <b>Статус VPN</b>\n\n"
+            f"CPU: <b>{cpu_s}</b>\n"
+            f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>\n\n"
+            "Окно активности: последние ~3 минуты."
+        )
+    else:
+        text = (
+            "📊 <b>Статус VPN</b>\n\n"
+            "⚠️ Статус сейчас недоступен (SSH/сервер не отвечает).\n"
+            "Попробуй позже."
+        )
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
+async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    recent = await vpn_service.get_recent_peer_handshakes(window_seconds=180)
+    if not recent:
+        text = (
+            "👥 <b>Активные VPN-профили</b>\n\n"
+            "Сейчас не найдено активных пиров (за последние ~3 минуты)."
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+            else:
+                raise
+        return
+
+    keys = [x.get("public_key") for x in recent if x.get("public_key")]
+    keys = keys[:200]
+
+    from app.db.models.vpn_peer import VpnPeer
+    from app.db.models.subscription import Subscription
+
+    peer_rows: dict[str, VpnPeer] = {}
+    subs_by_tg: dict[int, Subscription] = {}
+
+    async with session_scope() as session:
+        res = await session.execute(
+            select(VpnPeer).where(VpnPeer.client_public_key.in_(keys), VpnPeer.is_active == True)  # noqa: E712
+        )
+        for row in res.scalars().all():
+            peer_rows[row.client_public_key] = row
+
+        tg_ids = sorted({row.tg_id for row in peer_rows.values()})
+        if tg_ids:
+            res2 = await session.execute(select(Subscription).where(Subscription.tg_id.in_(tg_ids)))
+            for sub in res2.scalars().all():
+                subs_by_tg[int(sub.tg_id)] = sub
+
+    lines = ["👥 <b>Активные VPN-профили</b>", "", f"Найдено активных рукопожатий: <b>{len(recent)}</b>", ""]
+
+    shown = 0
+    for item in recent:
+        k = item.get("public_key")
+        age = item.get("age_seconds")
+        if not k or k not in peer_rows:
+            continue
+        row = peer_rows[k]
+        sub = subs_by_tg.get(int(row.tg_id))
+        sub_state = "✅" if (sub and bool(getattr(sub, "is_active", False))) else "—"
+        age_s = "—" if age is None else f"{int(age)}s"
+        shown += 1
+        lines.append(f"{shown}. <code>{row.tg_id}</code> | {row.client_ip} | sub {sub_state} | hs {age_s}")
+        if shown >= 25:
+            break
+
+    if shown == 0:
+        lines.append("(Не удалось сопоставить активные рукопожатия с пирами в БД.)")
+
+    if len(recent) > shown:
+        lines.append("")
+        lines.append(f"Показано: <b>{shown}</b> (лимит 25)")
+
+    text = "\n".join(lines)
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: c.data == "admin:referrals:menu")
+async def admin_referrals_menu(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.clear()
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    text = "🔁 <b>Управление рефералами</b>\n\nВыберите действие:"
+
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_admin_referrals_menu(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=kb_admin_referrals_menu(), parse_mode="HTML")
+        else:
+            raise
+
+
 @router.callback_query(lambda c: c.data == "admin:ref:take:self")
 async def admin_ref_take_self(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
