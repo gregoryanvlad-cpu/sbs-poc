@@ -175,10 +175,12 @@ class AdminReferralOwnerFSM(StatesGroup):
 @router.callback_query(lambda c: c.data == "admin:menu")
 async def admin_menu(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
+        # Не показываем админку не-владельцам, но обязательно отвечаем на callback,
+        # иначе у пользователя будет "часики" и ощущение, что бот завис.
         await cb.answer()
         return
 
-    # Answer ASAP to avoid "query is too old" when we do network calls below.
+    # Answer ASAP to avoid "query is too old" когда мы делаем сетевые вызовы ниже.
     try:
         await cb.answer()
     except Exception:
@@ -193,9 +195,32 @@ async def admin_menu(cb: CallbackQuery) -> None:
             act = st.get("active_peers")
             tot = st.get("total_peers")
             if cpu is not None and act is not None and tot is not None:
-                vpn_line = f"🌍 VPN: загрузка CPU ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
+                vpn_line = (
+                    f"🌍 VPN: загрузка CPU ~<b>{cpu:.0f}%</b> | "
+                    f"активных пиров <b>{act}</b>/<b>{tot}</b>"
+                )
     except Exception:
         pass
+
+    text = (
+        "🛠 <b>Админка</b>\n\n"
+        f"{vpn_line}\n\n"
+        "Выберите действие:"
+    )
+
+    # Telegram не разрешает редактировать сообщение, если контент/клавиатура не изменились.
+    # В таком случае отправим новое сообщение, чтобы пользователь увидел результат.
+    try:
+        await cb.message.edit_text(
+            text,
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+        else:
+            raise
 
 
 @router.callback_query(lambda c: c.data == "admin:ref:take:self")
