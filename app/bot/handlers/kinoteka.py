@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 from aiogram import Router, F
+from aiogram.exceptions import SkipHandler
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.bot.keyboards import kb_kinoteka_back
@@ -59,12 +60,15 @@ async def on_kino_query_input(msg: Message) -> None:
     tg_id = msg.from_user.id
     query = (msg.text or "").strip()
     if not query:
-        return
+        # Не наш сценарий — даём шанс другим хендлерам.
+        raise SkipHandler
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
+        # Этот хендлер ловит все текстовые сообщения. Если мы просто `return`,
+        # апдейт считается обработанным и FSM/другие сценарии не сработают.
         if not user or user.flow_state != "await_kino_query":
-            return
+            raise SkipHandler
 
         # Сбрасываем состояние в любом случае (чтобы не висело)
         user.flow_state = None
