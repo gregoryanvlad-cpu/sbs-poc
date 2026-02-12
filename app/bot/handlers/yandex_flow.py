@@ -5,6 +5,7 @@ import re
 from datetime import timedelta
 
 from aiogram import Router, F
+from aiogram.exceptions import SkipHandler
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select
 
@@ -73,8 +74,12 @@ async def on_yandex_login_input(msg: Message) -> None:
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
+        # Важно: этот хендлер повешен на F.text (ловит все текстовые сообщения).
+        # Если мы просто `return`, aiogram считает апдейт обработанным и
+        # не даёт другим хендлерам (в т.ч. FSM в админке) его обработать.
+        # Поэтому в нерелевантных случаях делаем SkipHandler.
         if not user or user.flow_state != "await_yandex_login":
-            return
+            raise SkipHandler
 
         login = (msg.text or "").strip()
         login = login.replace("@", "").strip()
