@@ -9,6 +9,7 @@ from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
@@ -196,233 +197,6 @@ async def admin_menu(cb: CallbackQuery) -> None:
     except Exception:
         pass
 
-    await cb.message.edit_text(
-        "🛠 <b>Админка</b>\n"
-        f"{vpn_line}\n\n"
-        "🟡 <b>Yandex Plus (ручной режим)</b>\n"
-        "— добавляешь аккаунт и дату окончания Plus\n"
-        "— загружаешь 3 готовые ссылки-приглашения (слоты 1..3)\n"
-        "— бот выдаёт ссылки пользователям автоматически\n\n"
-        "💰 <b>Рефералка</b>\n"
-        "— накрутка тестовых начислений (mint)\n"
-        "— заявки на вывод + approve/reject\n"
-        "— холды: approve pending→available\n\n"
-        "⚠️ Исключение пользователей из семьи делается вручную.\n",
-        reply_markup=kb_admin_menu(),
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(lambda c: c.data == "admin:referrals:menu")
-async def admin_referrals_menu(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    await cb.answer()
-    await cb.message.edit_text(
-        "🔁 <b>Управление рефералами</b>\n\nВыбери действие:",
-        reply_markup=kb_admin_referrals_menu(),
-        parse_mode="HTML",
-    )
-
-
-# Backward compatibility (older keyboards used these callback_data values).
-# Keeping them prevents "Update ... is not handled" if some old messages are still in chats.
-@router.callback_query(lambda c: c.data == "admin:referrals:take")
-async def _admin_referrals_take_legacy(cb: CallbackQuery, state: FSMContext) -> None:
-    await admin_ref_take_self(cb, state)
-
-
-@router.callback_query(lambda c: c.data == "admin:referrals:assign")
-async def _admin_referrals_assign_legacy(cb: CallbackQuery, state: FSMContext) -> None:
-    await admin_ref_assign(cb, state)
-
-
-@router.callback_query(lambda c: c.data == "admin:referrals:owner")
-async def _admin_referrals_owner_legacy(cb: CallbackQuery, state: FSMContext) -> None:
-    await admin_ref_owner(cb, state)
-
-
-@router.callback_query(lambda c: c.data == "admin:vpn:status")
-async def admin_vpn_status(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    # Answer ASAP to avoid callback timeout (we do SSH / network calls below).
-    await cb.answer()
-
-    try:
-        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=6)
-    except Exception:
-        st = {"ok": False}
-
-    if not st.get("ok"):
-        text = (
-            "📊 <b>Статус VPN</b>\n\n"
-            "❌ Не удалось получить статус сервера.\n"
-            "Проверь SSH (WG_SSH_*) и доступность сервера."
-        )
-    else:
-        cpu = st.get("cpu_load_percent")
-        act = st.get("active_peers")
-        tot = st.get("total_peers")
-        text = (
-            "📊 <b>Статус VPN</b>\n\n"
-            f"— Загрузка CPU: <b>{cpu:.1f}%</b>\n"
-            f"— Активных пиров (handshake &lt; 3 мин): <b>{act}</b>\n"
-            f"— Всего пиров на интерфейсе: <b>{tot}</b>\n"
-        )
-
-    try:
-        await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
-    except Exception:
-        pass
-    return
-
-
-@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
-async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
-    """Show which user profiles have an active WireGuard peer (recent handshake)."""
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-
-    # Answer ASAP to avoid callback timeout (we do SSH + DB work below).
-    try:
-        await cb.answer()
-    except Exception:
-        pass
-
-    # 1) recent handshakes from the server
-    recent = await vpn_service.get_recent_peer_handshakes(window_seconds=180)
-    if not recent:
-        text = (
-            "👥 <b>Активные VPN-профили</b>\n\n"
-            "Сейчас нет пиров с handshake за последние 3 минуты."
-        )
-        try:
-            await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
-        except Exception:
-            pass
-        return
-
-    keys = [x["public_key"] for x in recent if x.get("public_key")]
-
-    # 2) map public_key -> VpnPeer row (active peers only)
-    from sqlalchemy import select
-    from app.db.models.vpn_peer import VpnPeer
-    from app.db.session import session_scope
-
-    async with session_scope() as session:
-        q = select(VpnPeer).where(VpnPeer.is_active == True, VpnPeer.client_public_key.in_(keys))  # noqa: E712
-        res = await session.execute(q)
-        rows = list(res.scalars().all())
-
-    by_key = {r.client_public_key: r for r in rows}
-
-    # 3) render
-    lines: list[str] = ["👥 <b>Активные VPN-профили</b>", ""]
-    for item in recent[:25]:
-        k = item.get("public_key")
-        row = by_key.get(k)
-        if not row:
-            # Peer exists on server but not in DB (or not active in DB)
-            continue
-
-        label = await _format_user_label(cb.bot, int(row.tg_id))
-        hs_ts = int(item.get("handshake_ts") or 0)
-        age = int(item.get("age_seconds") or 0)
-
-        # Human readable timestamp (UTC) + age.
-        try:
-            from datetime import datetime, timezone
-
-            dt = datetime.fromtimestamp(hs_ts, tz=timezone.utc)
-            hs_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-        except Exception:
-            hs_str = "—"
-
-        lines.append(f"{label}")
-        lines.append(f"   └ Устройство: —")
-        lines.append(f"   └ Последний handshake: <code>{hs_str}</code> (~{age}с назад)")
-        lines.append("")
-
-    if len(lines) <= 2:
-        lines = [
-            "👥 <b>Активные VPN-профили</b>",
-            "",
-            "Не удалось сопоставить активные peer'ы с профилями в базе (vpn_peers).",
-        ]
-
-    try:
-        await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
-    except Exception:
-        pass
-
-    return
-
-
-# ==========================
-# REFERRALS MANAGEMENT (ADMIN-ONLY)
-# ==========================
-
-
-def _kb_ref_manage() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="👑 Забрать реферала себе", callback_data="admin:ref:take:self")],
-            [InlineKeyboardButton(text="🔁 Назначить реферала", callback_data="admin:ref:assign")],
-            [InlineKeyboardButton(text="🔍 Узнать владельца", callback_data="admin:ref:owner")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
-        ]
-    )
-
-
-async def _resolve_tg_id_from_text(bot, text: str) -> int | None:
-    """Accepts tg id or @username. Returns tg_id or None."""
-    t = (text or "").strip()
-    if not t:
-        return None
-    if t.isdigit():
-        return int(t)
-    if t.startswith("@"):  # username
-        try:
-            chat = await bot.get_chat(t)
-            return int(chat.id)
-        except Exception:
-            return None
-    return None
-
-
-async def _format_user_label(bot, tg_id: int) -> str:
-    """Best-effort: Иван (@ivan) / Иван / ID 123"""
-    try:
-        chat = await bot.get_chat(tg_id)
-        name = (chat.full_name or "").strip() or (chat.first_name or "").strip() or f"ID {tg_id}"
-        uname = getattr(chat, "username", None)
-        if uname:
-            return f"{name} (@{uname})"
-        return name
-    except Exception:
-        return f"ID {tg_id}"
-
-
-@router.callback_query(lambda c: c.data == "admin:ref:manage")
-async def admin_ref_manage(cb: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cb.from_user.id):
-        await cb.answer()
-        return
-    await state.clear()
-    await cb.message.edit_text(
-        "🔁 <b>Управление рефералами</b>\n\n"
-        "Здесь можно принудительно переназначать рефералов.\n"
-        "Пользователи сами никого присваивать не могут.",
-        reply_markup=_kb_ref_manage(),
-        parse_mode="HTML",
-    )
-    await cb.answer()
-
 
 @router.callback_query(lambda c: c.data == "admin:ref:take:self")
 async def admin_ref_take_self(cb: CallbackQuery, state: FSMContext) -> None:
@@ -592,14 +366,19 @@ async def admin_yandex_add(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(AdminYandexFSM.waiting_label)
 
-    await cb.message.edit_text(
-        "➕ <b>Добавление Yandex-аккаунта</b>\n\n"
-        "1) Отправь <b>название аккаунта</b> (LABEL)\n"
-        "Пример: <code>YA_ACC_1</code>\n\n"
-        "Дальше я спрошу дату окончания Plus и 3 ссылки.",
-        reply_markup=kb_admin_menu(),
-        parse_mode="HTML",
-    )
+    try:
+        await cb.message.edit_text(
+            "➕ <b>Добавление Yandex-аккаунта</b>\n\n"
+            "1) Отправь <b>название аккаунта</b> (LABEL)\n"
+            "Пример: <code>YA_ACC_1</code>\n\n"
+            "Дальше я спрошу дату окончания Plus и 3 ссылки.",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as e:
+        # Telegram не даёт отредактировать сообщение, если текст/клавиатура не изменились.
+        if "message is not modified" not in str(e):
+            raise
     await cb.answer()
 
 
