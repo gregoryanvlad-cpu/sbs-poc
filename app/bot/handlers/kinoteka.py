@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 
 from aiogram import Router, F
-from aiogram.exceptions import SkipHandler
+from aiogram.filters import BaseFilter
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.bot.keyboards import kb_kinoteka_back
@@ -17,6 +17,23 @@ from app.services.rezka.client import rezka_client, RezkaError
 
 router = Router()
 log = logging.getLogger(__name__)
+
+
+class _UserFlowStateFilter(BaseFilter):
+    """Async filter which matches only when user.flow_state equals the expected value.
+
+    We use this instead of SkipHandler because the installed aiogram version
+    in this project doesn't expose SkipHandler.
+    """
+
+    def __init__(self, expected_state: str):
+        self.expected_state = expected_state
+
+    async def __call__(self, message: Message) -> bool:  # type: ignore[override]
+        tg_id = message.from_user.id
+        async with session_scope() as session:
+            user = await session.get(User, tg_id)
+            return bool(user and user.flow_state == self.expected_state)
 
 def _is_sub_active(end_at) -> bool:
     if not end_at:
@@ -55,24 +72,24 @@ async def on_kino_search(cb: CallbackQuery) -> None:
     )
 
 
-@router.message(F.text)
+@router.message(F.text, _UserFlowStateFilter("await_kino_query"))
 async def on_kino_query_input(msg: Message) -> None:
     tg_id = msg.from_user.id
     query = (msg.text or "").strip()
     if not query:
-        # Не наш сценарий — даём шанс другим хендлерам.
-        raise SkipHandler
+        # Для нашего сценария пустой запрос — просто просим повторить.
+        await msg.answer(
+            "❗️Пустой запрос. Напиши названием фильма/сериала одним сообщением.",
+            reply_markup=kb_kinoteka_back(),
+        )
+        return
 
     async with session_scope() as session:
         user = await session.get(User, tg_id)
-        # Этот хендлер ловит все текстовые сообщения. Если мы просто `return`,
-        # апдейт считается обработанным и FSM/другие сценарии не сработают.
-        if not user or user.flow_state != "await_kino_query":
-            raise SkipHandler
-
         # Сбрасываем состояние в любом случае (чтобы не висело)
-        user.flow_state = None
-        await session.commit()
+        if user:
+            user.flow_state = None
+            await session.commit()
 
     try:
         results = await rezka_client.search(query, limit=6)
