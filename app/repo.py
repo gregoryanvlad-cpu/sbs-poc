@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+
+# ---- Runtime settings (admin-tunable) ----------------------------------------
+def _app_setting_model():
+    """Import AppSetting lazily to avoid startup failures if migrations are not applied yet."""
+    try:
+        from app.db.models.app_setting import AppSetting  # type: ignore
+        return AppSetting
+    except Exception:
+        return None
+
 import logging
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
@@ -198,3 +208,26 @@ async def set_subscription_expired(session: AsyncSession, tg_id: int) -> None:
     sub.is_active = False
     sub.status = "expired"
     await session.flush()
+
+async def get_setting_int(session, key: str) -> int | None:
+    AppSetting = _app_setting_model()
+    if AppSetting is None:
+        return None
+    obj = await session.get(AppSetting, key)
+    return None if obj is None else obj.int_value
+
+
+async def set_setting_int(session, key: str, value: int | None) -> None:
+    AppSetting = _app_setting_model()
+    if AppSetting is None:
+        return
+    obj = await session.get(AppSetting, key)
+    if obj is None:
+        obj = AppSetting(key=key, int_value=value)
+        session.add(obj)
+    else:
+        obj.int_value = value
+    try:
+        obj.touch()
+    except Exception:
+        pass
