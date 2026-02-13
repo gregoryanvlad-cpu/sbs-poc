@@ -657,7 +657,10 @@ async def on_pay_check(cb: CallbackQuery) -> None:
 
         status = (st.status or "").upper()
 
-        if status in ("SUCCESS", "PAID", "COMPLETED"):
+        # Platega callback docs use status="CONFIRMED".
+        # The status API page doesn't enumerate all terminal statuses,
+        # so we treat CONFIRMED as success too.
+        if status in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
             # extend subscription and mark payment
             sub = await get_subscription(session, cb.from_user.id)
             now = utcnow()
@@ -697,7 +700,7 @@ async def on_pay_check(cb: CallbackQuery) -> None:
             )
             return
 
-        if status in ("FAILED", "CANCELLED", "EXPIRED"):
+        if status in ("FAILED", "CANCELLED", "EXPIRED", "REJECTED"):
             pay.status = "failed"
             await session.commit()
             await cb.answer("Платеж не завершён")
