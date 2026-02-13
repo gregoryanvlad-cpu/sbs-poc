@@ -22,7 +22,7 @@ def kb_back_home() -> InlineKeyboardMarkup:
 
 def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="💳 Продлить на 1 мес", callback_data="pay:mock:1m")
+    b.button(text="💳 Продлить на 1 мес", callback_data="pay:buy:1m")
     b.button(text="👥 Рефералы", callback_data="nav:referrals")
     if is_owner:
         b.button(text="🛠 Админка", callback_data="admin:menu")
@@ -33,7 +33,7 @@ def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
 
 def kb_pay() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Тест-оплата 299 ₽ (успех)", callback_data="pay:mock:1m")
+    b.button(text="✅ Оплатить 299 ₽", callback_data="pay:buy:1m")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
