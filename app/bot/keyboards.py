@@ -22,7 +22,7 @@ def kb_back_home() -> InlineKeyboardMarkup:
 
 def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="💳 Продлить на 1 мес", callback_data="pay:buy:1m")
+    b.button(text="💳 Продлить", callback_data="pay:buy:1m")
     b.button(text="👥 Рефералы", callback_data="nav:referrals")
     if is_owner:
         b.button(text="🛠 Админка", callback_data="admin:menu")
@@ -111,6 +111,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="💸 Заявки на вывод", callback_data="admin:payouts")
     b.button(text="⏳ Холды (рефералка)", callback_data="admin:ref:holds")
     b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
+    b.button(text="💲 Цена подписки", callback_data="admin:price")
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
 
     # Legacy / test
