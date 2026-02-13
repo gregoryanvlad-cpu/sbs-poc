@@ -38,6 +38,16 @@ class Settings:
     period_months: int = 1
     period_days: int = 30  # legacy compatibility (payments.period_days is NOT NULL)
 
+    # Payments
+    # mock: instantly extends subscription (dev/test)
+    # platega: uses Platega API to create a payment link and then checks payment status
+    payment_provider: str = "mock"  # mock | platega
+    platega_merchant_id: str | None = None
+    platega_secret: str | None = None
+    platega_payment_method: int = 2
+    platega_return_url: str = "https://example.com/success"
+    platega_failed_url: str = "https://example.com/fail"
+
     # VPN (still mock by default)
     vpn_mode: str = "mock"
     vpn_endpoint: str = "1.2.3.4:51820"
@@ -102,6 +112,14 @@ def _load_settings() -> Settings:
         scheduler_enabled=_env_bool("SCHEDULER_ENABLED", True),
         auto_delete_seconds=int(os.getenv("AUTO_DELETE_SECONDS", "60")),
         owner_tg_id=owner_tg_id,
+
+        # Payments
+        payment_provider=os.getenv("PAYMENT_PROVIDER", "mock").strip().lower(),
+        platega_merchant_id=(os.getenv("PLATEGA_MERCHANT_ID") or "").strip() or None,
+        platega_secret=(os.getenv("PLATEGA_SECRET") or "").strip() or None,
+        platega_payment_method=int(os.getenv("PLATEGA_PAYMENT_METHOD", "2")),
+        platega_return_url=os.getenv("PLATEGA_RETURN_URL", "https://example.com/success").strip(),
+        platega_failed_url=os.getenv("PLATEGA_FAILED_URL", "https://example.com/fail").strip(),
         vpn_mode=os.getenv("VPN_MODE", "mock").strip().lower(),
         vpn_endpoint=os.getenv("VPN_ENDPOINT", "1.2.3.4:51820").strip(),
         vpn_server_public_key=os.getenv("VPN_SERVER_PUBLIC_KEY", "REPLACE_ME").strip(),
