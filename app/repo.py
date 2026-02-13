@@ -157,7 +157,27 @@ async def extend_subscription(
 
     await session.flush()
 
-    # also insert payment row for history (mock-compatible)
+    # also insert/update payment row for history (idempotent by provider_payment_id)
+    if provider_payment_id:
+        q = select(Payment).where(Payment.provider_payment_id == provider_payment_id).limit(1)
+        res = await session.execute(q)
+        existing = res.scalar_one_or_none()
+    else:
+        existing = None
+
+    if existing:
+        # Update the existing row (e.g. pending -> success) instead of inserting a duplicate
+        existing.amount = int(amount_rub)
+        existing.currency = "RUB"
+        existing.provider = provider
+        existing.status = status
+        existing.period_days = int(days_legacy)
+        existing.period_months = int(months)
+        if status == "success":
+            existing.paid_at = utcnow()
+        await session.flush()
+        return sub
+
     payment = Payment(
         tg_id=tg_id,
         amount=int(amount_rub),
