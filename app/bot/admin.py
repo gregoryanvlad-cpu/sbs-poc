@@ -21,6 +21,7 @@ from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
+from app.repo import get_price_rub, set_app_setting_int
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
 
@@ -178,6 +179,10 @@ class AdminReferralOwnerFSM(StatesGroup):
     waiting_referred = State()
 
 
+class AdminPriceFSM(StatesGroup):
+    waiting_price = State()
+
+
 # ==========================
 # ADMIN MENU
 # ==========================
@@ -242,6 +247,67 @@ async def admin_menu(cb: CallbackQuery) -> None:
 def _kb_admin_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")]]
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:price")
+async def admin_price(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        current_price = await get_price_rub(session)
+
+    text = (
+        "💲 <b>Цена подписки</b>\n\n"
+        f"Текущая цена: <b>{current_price} ₽</b>\n\n"
+        "Введите новую цену (целое число в рублях), например: <code>299</code>"
+    )
+
+    await state.set_state(AdminPriceFSM.waiting_price)
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+    await cb.answer()
+
+
+@router.message(AdminPriceFSM.waiting_price)
+async def admin_price_set(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    raw = (message.text or "").strip()
+    # allow formats like "299", "299 ₽"
+    raw = re.sub(r"[^0-9]", "", raw)
+    if not raw:
+        await message.answer("❌ Введите цену числом, например: 299", reply_markup=_kb_admin_back())
+        return
+
+    try:
+        new_price = int(raw)
+    except Exception:
+        await message.answer("❌ Введите цену числом, например: 299", reply_markup=_kb_admin_back())
+        return
+
+    if new_price <= 0 or new_price > 1_000_000:
+        await message.answer("❌ Некорректная цена. Укажите значение от 1 до 1 000 000 ₽", reply_markup=_kb_admin_back())
+        return
+
+    async with session_scope() as session:
+        await set_app_setting_int(session, "price_rub", new_price)
+        await session.commit()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Цена подписки обновлена: <b>{new_price} ₽</b>",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
     )
 
 
