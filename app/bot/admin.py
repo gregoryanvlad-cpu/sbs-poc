@@ -118,6 +118,16 @@ async def _tg_label(bot, tg_id: int) -> str:
         return f"ID {tg_id}"
 
 
+def _kb_ref_manage() -> InlineKeyboardMarkup:
+    """Keyboard used inside referral management flows (assign/take)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:referrals:menu")],
+            [InlineKeyboardButton(text="🏠 Админка", callback_data="admin:menu")],
+        ]
+    )
+
+
 def _kb_user_nav() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -326,6 +336,21 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
 
     lines = ["👥 <b>Активные VPN-профили</b>", "", f"Найдено активных рукопожатий: <b>{len(recent)}</b>", ""]
 
+    # Resolve Telegram usernames for readability (best-effort)
+    tg_label: dict[int, str] = {}
+    try:
+        unique_tg_ids = sorted({int(peer_rows[x.get("public_key")].tg_id) for x in recent if x.get("public_key") in peer_rows})
+        # keep it bounded to avoid too many API calls
+        unique_tg_ids = unique_tg_ids[:50]
+        labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in unique_tg_ids], return_exceptions=True)
+        for tid, lbl in zip(unique_tg_ids, labels):
+            if isinstance(lbl, Exception):
+                tg_label[tid] = f"ID {tid}"
+            else:
+                tg_label[tid] = str(lbl)
+    except Exception:
+        tg_label = {}
+
     shown = 0
     for item in recent:
         k = item.get("public_key")
@@ -337,7 +362,9 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
         sub_state = "✅" if (sub and bool(getattr(sub, "is_active", False))) else "—"
         age_s = "—" if age is None else f"{int(age)}s"
         shown += 1
-        lines.append(f"{shown}. <code>{row.tg_id}</code> | {row.client_ip} | sub {sub_state} | hs {age_s}")
+        who = tg_label.get(int(row.tg_id)) or f"ID {row.tg_id}"
+        # keep tg_id in the end for unambiguous matching
+        lines.append(f"{shown}. {who} | <code>{row.client_public_key[:8]}…</code> | {row.client_ip} | sub {sub_state} | hs {age_s} | id <code>{row.tg_id}</code>")
         if shown >= 25:
             break
 
