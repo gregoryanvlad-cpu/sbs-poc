@@ -7,13 +7,36 @@ from uuid import uuid4
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Payment, Subscription, User, VpnPeer, ContentRequest
+from app.db.models import Payment, Subscription, User, VpnPeer, ContentRequest, AppSetting
+from app.core.config import settings
 
 log = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def get_app_setting_int(session: AsyncSession, key: str, *, default: int) -> int:
+    row = await session.get(AppSetting, key)
+    if not row or row.int_value is None:
+        return int(default)
+    return int(row.int_value)
+
+
+async def set_app_setting_int(session: AsyncSession, key: str, value: int) -> None:
+    row = await session.get(AppSetting, key)
+    if not row:
+        row = AppSetting(key=key)
+        session.add(row)
+    row.int_value = int(value)
+    row.updated_at = utcnow()
+    await session.flush()
+
+
+async def get_price_rub(session: AsyncSession) -> int:
+    """Runtime-tunable price. Falls back to static settings.price_rub."""
+    return await get_app_setting_int(session, "price_rub", default=settings.price_rub)
 
 
 async def create_content_request(
