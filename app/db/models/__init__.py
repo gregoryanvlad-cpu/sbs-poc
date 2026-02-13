@@ -6,6 +6,7 @@ from .referral import Referral
 from .referral_earning import ReferralEarning
 from .payout_request import PayoutRequest
 from .content_request import ContentRequest
+from .app_setting import AppSetting
 
 __all__ = [
     "User",
@@ -16,4 +17,5 @@ __all__ = [
     "ReferralEarning",
     "PayoutRequest",
     "ContentRequest",
+    "AppSetting",
 ]
