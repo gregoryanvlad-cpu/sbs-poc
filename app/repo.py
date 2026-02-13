@@ -97,7 +97,17 @@ async def get_subscription(session: AsyncSession, tg_id: int) -> Subscription:
     return sub
 
 
-async def extend_subscription(session: AsyncSession, tg_id: int, *, months: int, days_legacy: int) -> Subscription:
+async def extend_subscription(
+    session: AsyncSession,
+    tg_id: int,
+    *,
+    months: int,
+    days_legacy: int,
+    amount_rub: int = 299,
+    provider: str = "mock",
+    status: str = "success",
+    provider_payment_id: str | None = None,
+) -> Subscription:
     """Extends subscription end_at by calendar months.
 
     Caller is responsible for computing end_at and setting sub.end_at.
@@ -117,12 +127,13 @@ async def extend_subscription(session: AsyncSession, tg_id: int, *, months: int,
     # also insert payment row for history (mock-compatible)
     payment = Payment(
         tg_id=tg_id,
-        amount=299,
+        amount=int(amount_rub),
         currency="RUB",
-        provider="mock",
-        status="success",
+        provider=provider,
+        status=status,
         period_days=days_legacy,
         period_months=months,
+        provider_payment_id=provider_payment_id,
     )
     session.add(payment)
     await session.flush()
