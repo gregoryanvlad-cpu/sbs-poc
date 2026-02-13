@@ -447,9 +447,18 @@ async def on_nav(cb: CallbackQuery) -> None:
     await cb.answer("Неизвестный раздел")
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("pay:mock"))
-async def on_mock_pay(cb: CallbackQuery) -> None:
+@router.callback_query(lambda c: c.data and (c.data.startswith("pay:buy") or c.data.startswith("pay:mock")))
+async def on_buy(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
+
+    # legacy support: old buttons used pay:mock
+    provider = settings.payment_provider
+    if cb.data and cb.data.startswith("pay:mock"):
+        provider = "mock"
+
+    if provider == "platega":
+        await _start_platega_payment(cb, tg_id=tg_id)
+        return
 
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
@@ -462,6 +471,9 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
             tg_id,
             months=settings.period_months,
             days_legacy=settings.period_days,
+            amount_rub=settings.price_rub,
+            provider="mock",
+            status="success",
         )
 
         # process referral earnings (first payment activates referral)
@@ -495,6 +507,226 @@ async def on_mock_pay(cb: CallbackQuery) -> None:
         parse_mode="HTML",
     )
     return
+
+
+async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
+    """Creates a Platega transaction and sends user the payment link + check button."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    from app.services.payments.platega import PlategaClient, PlategaError
+
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        await cb.answer("Платежи временно недоступны")
+        try:
+            await cb.message.edit_text(
+                "💳 <b>Оплата</b>\n\n"
+                "Платежи временно отключены (не настроены переменные окружения).\n"
+                "Админу: добавь PLATEGA_MERCHANT_ID и PLATEGA_SECRET в Variables.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
+
+    # We pack some useful info into payload for easier troubleshooting.
+    payload = f"tg_id={tg_id};period={settings.period_months}m"
+    description = f"Подписка SBS: {settings.period_months} мес (TG {tg_id})"
+
+    try:
+        res = await client.create_transaction(
+            payment_method=settings.platega_payment_method,
+            amount=settings.price_rub,
+            currency="RUB",
+            description=description,
+            return_url=settings.platega_return_url,
+            failed_url=settings.platega_failed_url,
+            payload=payload,
+        )
+    except PlategaError:
+        await cb.answer("Ошибка платежного провайдера")
+        try:
+            await cb.message.edit_text(
+                "💳 <b>Оплата</b>\n\n"
+                "Не удалось создать платеж. Попробуйте позже или обратитесь в поддержку.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    # Store pending payment
+    from sqlalchemy import select
+    from app.db.models import Payment
+
+    async with session_scope() as session:
+        p = Payment(
+            tg_id=tg_id,
+            amount=settings.price_rub,
+            currency="RUB",
+            provider="platega",
+            status="pending",
+            period_days=settings.period_days,
+            period_months=settings.period_months,
+            provider_payment_id=res.transaction_id,
+        )
+        session.add(p)
+        await session.commit()
+        payment_db_id = p.id
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Перейти к оплате", url=res.redirect_url)],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pay:check:{payment_db_id}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+    await cb.answer("Ссылка на оплату создана")
+    await cb.message.edit_text(
+        "💳 <b>Оплата подписки</b>\n\n"
+        f"Сумма: <b>{settings.price_rub} ₽</b>\n"
+        "1) Нажмите «✅ Перейти к оплате»\n"
+        "2) После оплаты вернитесь и нажмите «🔄 Проверить оплату»\n\n"
+        "Если статус не обновился сразу — подождите 10–20 секунд и попробуйте ещё раз.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pay:check:"))
+async def on_pay_check(cb: CallbackQuery) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    from app.services.payments.platega import PlategaClient, PlategaError
+    from app.db.models import Payment
+
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    try:
+        payment_id = int(parts[2])
+    except Exception:
+        await cb.answer()
+        return
+
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        await cb.answer("Платежи не настроены")
+        return
+
+    async with session_scope() as session:
+        pay = await session.get(Payment, payment_id)
+        if not pay or pay.tg_id != cb.from_user.id:
+            await cb.answer("Платеж не найден")
+            return
+        if not pay.provider_payment_id:
+            await cb.answer("Платеж без ID")
+            return
+        if pay.status == "success":
+            await cb.answer("Уже оплачено")
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+            )
+            await cb.message.edit_text(
+                "✅ <b>Оплата уже подтверждена</b>",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+        client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
+        try:
+            st = await client.get_transaction_status(transaction_id=pay.provider_payment_id)
+        except PlategaError:
+            await cb.answer("Не удалось проверить статус")
+            return
+
+        status = (st.status or "").upper()
+
+        if status in ("SUCCESS", "PAID", "COMPLETED"):
+            # extend subscription and mark payment
+            sub = await get_subscription(session, cb.from_user.id)
+            now = utcnow()
+            base = sub.end_at if sub.end_at and sub.end_at > now else now
+            new_end = base + relativedelta(months=settings.period_months)
+
+            await extend_subscription(
+                session,
+                cb.from_user.id,
+                months=settings.period_months,
+                days_legacy=settings.period_days,
+                amount_rub=int(pay.amount),
+                provider="platega",
+                status="success",
+                provider_payment_id=pay.provider_payment_id,
+            )
+
+            # referral earnings processing: use the newest successful payment row
+            # (extend_subscription inserts a Payment row). We keep original pending row too.
+            pay.status = "success"
+            await referral_service.on_successful_payment(session, pay)
+
+            sub.end_at = new_end
+            sub.is_active = True
+            sub.status = "active"
+            await session.commit()
+
+            await cb.answer("Оплата подтверждена")
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+            )
+            await cb.message.edit_text(
+                "✅ <b>Оплата подтверждена!</b>\n\n"
+                "Подписка активирована.",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+        if status in ("FAILED", "CANCELLED", "EXPIRED"):
+            pay.status = "failed"
+            await session.commit()
+            await cb.answer("Платеж не завершён")
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Попробовать снова", callback_data="pay:buy:1m")],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                ]
+            )
+            await cb.message.edit_text(
+                "❌ <b>Платеж не завершён</b>\n\n"
+                "Если вы оплатили, подождите минуту и попробуйте проверить ещё раз.\n"
+                "Если оплата не прошла — создайте новый платеж.",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+        await cb.answer("Пока не оплачено")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data=f"pay:check:{payment_id}")],
+                [InlineKeyboardButton(text="💳 Создать новый платеж", callback_data="pay:buy:1m")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+            ]
+        )
+        try:
+            await cb.message.edit_text(
+                f"💳 <b>Статус платежа:</b> <code>{status}</code>\n\n"
+                "Если вы оплатили — подождите 10–20 секунд и нажмите «Проверить ещё раз».",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(lambda c: c.data == "vpn:guide")
