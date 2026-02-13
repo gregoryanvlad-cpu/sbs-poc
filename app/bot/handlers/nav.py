@@ -38,7 +38,7 @@ from app.core.config import settings
 from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription
+from app.repo import extend_subscription, get_subscription, get_price_rub
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 
@@ -343,9 +343,11 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "pay":
+        async with session_scope() as session:
+            price_rub = await get_price_rub(session)
         try:
             await cb.message.edit_text(
-                f"💳 Оплата\n\nТариф: {settings.price_rub} ₽ / {settings.period_months} мес.",
+                f"💳 Оплата\n\nТариф: {price_rub} ₽ / {settings.period_months} мес.",
                 reply_markup=kb_pay(),
             )
         except Exception:
@@ -461,6 +463,7 @@ async def on_buy(cb: CallbackQuery) -> None:
         return
 
     async with session_scope() as session:
+        price_rub = await get_price_rub(session)
         sub = await get_subscription(session, tg_id)
         now = utcnow()
         base = sub.end_at if sub.end_at and sub.end_at > now else now
@@ -471,7 +474,7 @@ async def on_buy(cb: CallbackQuery) -> None:
             tg_id,
             months=settings.period_months,
             days_legacy=settings.period_days,
-            amount_rub=settings.price_rub,
+            amount_rub=price_rub,
             provider="mock",
             status="success",
         )
@@ -533,6 +536,9 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
 
     client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
 
+    async with session_scope() as session:
+        price_rub = await get_price_rub(session)
+
     # We pack some useful info into payload for easier troubleshooting.
     payload = f"tg_id={tg_id};period={settings.period_months}m"
     description = f"Подписка SBS: {settings.period_months} мес (TG {tg_id})"
@@ -540,7 +546,7 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
     try:
         res = await client.create_transaction(
             payment_method=settings.platega_payment_method,
-            amount=settings.price_rub,
+            amount=price_rub,
             currency="RUB",
             description=description,
             return_url=settings.platega_return_url,
@@ -569,7 +575,7 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
     async with session_scope() as session:
         p = Payment(
             tg_id=tg_id,
-            amount=settings.price_rub,
+            amount=price_rub,
             currency="RUB",
             provider="platega",
             status="pending",
@@ -592,7 +598,7 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
     await cb.answer("Ссылка на оплату создана")
     await cb.message.edit_text(
         "💳 <b>Оплата подписки</b>\n\n"
-        f"Сумма: <b>{settings.price_rub} ₽</b>\n"
+        f"Сумма: <b>{price_rub} ₽</b>\n"
         "1) Нажмите «✅ Перейти к оплате»\n"
         "2) После оплаты вернитесь и нажмите «🔄 Проверить оплату»\n\n"
         "Если статус не обновился сразу — подождите 10–20 секунд и попробуйте ещё раз.",
