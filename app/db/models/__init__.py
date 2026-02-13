@@ -6,7 +6,10 @@ from .referral import Referral
 from .referral_earning import ReferralEarning
 from .payout_request import PayoutRequest
 from .content_request import ContentRequest
-from .app_setting import AppSetting
+try:
+    from .app_setting import AppSetting  # optional
+except Exception:  # pragma: no cover
+    AppSetting = None  # type: ignore
 
 __all__ = [
     "User",
