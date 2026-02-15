@@ -138,8 +138,23 @@ async def _build_home_text() -> str:
 
     # Default showcase list (can be overridden by VPN_SERVERS_JSON).
     if not servers:
+        # IMPORTANT: The first (current) server must include SSH connection params,
+        # otherwise it will always show as "Недоступно" even though WG_SSH_* is configured.
+        # Other servers may be left without host/user until they are actually connected.
+        pwd = os.environ.get("WG_SSH_PASSWORD")
+        if pwd is not None and pwd.strip() == "":
+            pwd = None
+
         servers = [
-            {"code": os.environ.get("VPN_COUNTRY_CODE", "NL"), "name": os.environ.get("VPN_NAME", "VPN-Нидерланды")},
+            {
+                "code": os.environ.get("VPN_COUNTRY_CODE", "NL"),
+                "name": os.environ.get("VPN_NAME", "VPN-Нидерланды"),
+                "host": os.environ.get("WG_SSH_HOST"),
+                "port": int(os.environ.get("WG_SSH_PORT", "22")),
+                "user": os.environ.get("WG_SSH_USER"),
+                "password": pwd,
+                "interface": os.environ.get("VPN_INTERFACE", "wg0"),
+            },
             {"code": "DE", "name": "VPN-Германия"},
             {"code": "TR", "name": "VPN-Турция"},
             {"code": "US", "name": "VPN-США"},
