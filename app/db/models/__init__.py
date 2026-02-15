@@ -6,6 +6,7 @@ from .referral import Referral
 from .referral_earning import ReferralEarning
 from .payout_request import PayoutRequest
 from .content_request import ContentRequest
+from .region_vpn_session import RegionVpnSession
 try:
     from .app_setting import AppSetting  # optional
 except Exception:  # pragma: no cover
@@ -21,4 +22,6 @@ __all__ = [
     "PayoutRequest",
     "ContentRequest",
     "AppSetting",
+    "RegionVpnSession",
 ]
+
