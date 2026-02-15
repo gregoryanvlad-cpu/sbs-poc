@@ -554,6 +554,40 @@ async def admin_regionvpn_profiles(cb: CallbackQuery) -> None:
         else:
             raise
 
+@router.callback_query(lambda c: c.data == "admin:regionvpn:active")
+async def admin_regionvpn_active(cb: CallbackQuery) -> None:
+    """List active VPN-Region sessions (last device IP per user)."""
+    try:
+        async with session_scope() as s:
+            rows = (
+                await s.execute(
+                    select(RegionVpnSession)
+                    .where(RegionVpnSession.active_ip.isnot(None))
+                    .order_by(RegionVpnSession.last_seen_at.desc().nullslast())
+                    .limit(100)
+                )
+            ).scalars().all()
+
+            if not rows:
+                await cb.message.answer("📡 Активные VPN-Region: пока пусто.")
+                await cb.answer()
+                return
+
+            lines = ["📡 *Активные VPN-Region (последнее устройство)*\n"]
+            for row in rows:
+                user = await s.get(User, row.tg_id)
+                uname = (getattr(user, "username", None) or "").strip()
+                label = f"@{uname}" if uname else f"tg:{row.tg_id}"
+                ip = (row.active_ip or "").strip()
+                seen = row.last_seen_at.isoformat() if row.last_seen_at else "-"
+                lines.append(f"• {label} — `{ip}`\n  _last seen:_ {seen}")
+
+            await cb.message.answer("\n".join(lines), parse_mode="Markdown")
+            await cb.answer()
+    except Exception:
+        await cb.message.answer("❌ Не удалось получить активные VPN-Region сессии. Проверь логи.")
+        await cb.answer()
+
 
 @router.callback_query(lambda c: c.data == "admin:referrals:menu")
 async def admin_referrals_menu(cb: CallbackQuery, state: FSMContext) -> None:
