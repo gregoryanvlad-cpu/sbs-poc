@@ -40,7 +40,11 @@ from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription, get_price_rub
-from app
+
+from app.services.vpn.service import vpn_service
+from app.services.referrals.service import referral_service
+
+router = Router()
 
 # --- VPN-Region (VLESS + Reality) ---
 
@@ -161,14 +165,6 @@ async def on_region_get(cb: CallbackQuery) -> None:
     asyncio.create_task(_del_later(msg2.message_id))
 
     await _safe_cb_answer(cb)
-
-
-
-.services.vpn.service import vpn_service
-from app.services.referrals.service import referral_service
-
-router = Router()
-
 
 @router.callback_query(lambda c: c.data == "noop")
 async def _noop(cb: CallbackQuery) -> None:
