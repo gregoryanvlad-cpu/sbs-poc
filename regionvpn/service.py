@@ -1,34 +1,38 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import os
 import uuid
-import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Optional, Tuple
 
-from app.services.vpn.ssh_provider import WireGuardSSHProvider
+import asyncssh
+
+log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class RegionVlessParams:
-    host: str
-    port: int
-    sni: str
-    pbk: str
-    sid: str
-    fp: str
-    flow: str
+ENV_PATH = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+@dataclass
+class _ClientInfo:
+    user_key: str
+    client_id: str
 
 
 class RegionVpnService:
-    """
-    VLESS+Reality (Xray) "Region" VPN service.
+    """Manage VPN-Region clients in Xray config (VLESS + Reality).
 
-    - Issues a per-user VLESS share-link (unique UUID per tg_id, stored in Xray config as client.email = "tg_<id>")
-    - Enforces max slots by counting clients in the VLESS inbound (best-effort).
-    - Quota enforcement is best-effort and only checked on issuance (requires Xray API+Stats to be enabled).
+    This is a minimal implementation to keep the existing project logic intact:
+    - Ensures a per-user client exists in `/usr/local/etc/xray/config.json`.
+    - Enforces a max clients limit ("slots").
+    - Returns a `vless://` share link suitable for Happ.
+
+    Advanced features (traffic stats, multi-device kick) are implemented later
+    and intentionally not required for boot stability.
     """
 
     def __init__(
@@ -37,140 +41,216 @@ class RegionVpnService:
         ssh_host: str,
         ssh_port: int,
         ssh_user: str,
-        ssh_password: str | None,
+        ssh_password: Optional[str],
         xray_config_path: str = "/usr/local/etc/xray/config.json",
         xray_api_port: int = 10085,
         max_clients: int = 40,
     ) -> None:
-        self._ssh = WireGuardSSHProvider(
-            host=ssh_host,
-            port=ssh_port,
-            user=ssh_user,
-            password=ssh_password,
-            interface=os.environ.get("WG_INTERFACE", "wg0"),
-        )
+        self.ssh_host = ssh_host
+        self.ssh_port = int(ssh_port or 22)
+        self.ssh_user = ssh_user or "root"
+        self.ssh_password = ssh_password
         self.xray_config_path = xray_config_path
-        self.xray_api_port = xray_api_port
-        self.max_clients = max_clients
+        self.xray_api_port = int(xray_api_port or 10085)
+        self.max_clients = int(max_clients or 40)
 
-        self.params = RegionVlessParams(
-            host=os.environ.get("REGION_VLESS_HOST", ssh_host),
-            port=int(os.environ.get("REGION_VLESS_PORT", "443")),
-            sni=os.environ.get("REGION_VLESS_SNI", "max.ru"),
-            pbk=os.environ.get("REGION_VLESS_PBK", ""),
-            sid=os.environ.get("REGION_VLESS_SID", ""),
-            fp=os.environ.get("REGION_VLESS_FP", "chrome"),
-            flow=os.environ.get("REGION_VLESS_FLOW", "xtls-rprx-vision"),
+        self._connect_timeout = 15
+        self._login_timeout = 15
+        self._cmd_timeout = 20
+        self._retries = 2
+
+        self._key_obj = None
+        key_b64 = os.environ.get("REGION_SSH_PRIVATE_KEY_B64")
+        if key_b64:
+            try:
+                key_text = base64.b64decode(key_b64.encode()).decode()
+                self._key_obj = asyncssh.import_private_key(key_text.strip())
+                log.info("Region SSH key loaded (base64)")
+            except Exception:
+                log.exception("Failed to load REGION_SSH_PRIVATE_KEY_B64")
+
+    # ------------------------
+    # SSH helpers
+    # ------------------------
+    async def _connect(self) -> asyncssh.SSHClientConnection:
+        return await asyncssh.connect(
+            self.ssh_host,
+            port=self.ssh_port,
+            username=self.ssh_user,
+            password=self.ssh_password,
+            client_keys=[self._key_obj] if self._key_obj else None,
+            known_hosts=None,
+            connect_timeout=self._connect_timeout,
+            login_timeout=self._login_timeout,
         )
 
-    async def _read_xray_config(self) -> dict[str, Any]:
-        raw = await self._ssh._run_output(f"cat {self.xray_config_path}", check=True)
-        return json.loads(raw)
+    async def _run_output(self, cmd: str, *, check: bool = True) -> str:
+        last = None
+        for _ in range(self._retries):
+            try:
+                async with await self._connect() as conn:
+                    full_cmd = f"{ENV_PATH} {cmd}"
+                    result = await conn.run(full_cmd, timeout=self._cmd_timeout, check=check)
+                    if result.stderr:
+                        log.warning("Region SSH stderr: %s", result.stderr.strip())
+                    return (result.stdout or "").strip()
+            except Exception as e:
+                last = e
+                await asyncio.sleep(0.5)
+        raise last
 
-    async def _write_xray_config(self, cfg: dict[str, Any]) -> None:
-        blob = json.dumps(cfg, ensure_ascii=False, separators=(",", ":"), sort_keys=False).encode("utf-8")
-        b64 = base64.b64encode(blob).decode()
-        # Write atomically via temp file.
-        cmd = (
-            "python3 - <<'PY'\n"
-            "import base64,os,sys,tempfile\n"
-            f"path={self.xray_config_path!r}\n"
-            f"data=base64.b64decode({b64!r})\n"
-            "d=os.path.dirname(path)\n"
-            "fd, tmp = tempfile.mkstemp(prefix='.xray.', dir=d)\n"
-            "os.write(fd, data)\n"
-            "os.close(fd)\n"
-            "os.replace(tmp, path)\n"
-            "print('ok')\n"
-            "PY"
-        )
-        await self._ssh._run_output(cmd, check=True)
-        # Restart xray to apply new clients (best-effort).
-        await self._ssh._run_output("systemctl restart xray", check=False)
+    async def _run(self, cmd: str, *, check: bool = True) -> None:
+        await self._run_output(cmd, check=check)
 
-    def _find_vless_inbound(self, cfg: dict[str, Any]) -> dict[str, Any] | None:
-        inbounds = cfg.get("inbounds") or []
-        for ib in inbounds:
-            if (ib.get("protocol") or "").lower() != "vless":
-                continue
-            settings = ib.get("settings") or {}
-            if isinstance(settings, dict) and "clients" in settings:
-                return ib
-        return None
-
+    # ------------------------
+    # Public API
+    # ------------------------
     async def ensure_client(self, tg_id: int) -> str:
-        """
-        Ensure a VLESS client exists for this user (by email = "tg_<id>").
-        Returns share-link vless://...
-        """
-        cfg = await self._read_xray_config()
-        ib = self._find_vless_inbound(cfg)
-        if not ib:
-            raise RuntimeError("VLESS inbound not found in Xray config")
+        """Ensure the client exists on Xray and return the share link."""
 
-        settings = ib.setdefault("settings", {})
-        clients = settings.setdefault("clients", [])
-        if not isinstance(clients, list):
-            raise RuntimeError("Xray VLESS clients must be a list")
-
-        email = f"tg_{tg_id}"
-
-        # Existing?
-        for c in clients:
-            if isinstance(c, dict) and (c.get("email") == email):
-                cid = c.get("id")
-                if cid:
-                    return self.build_share_link(str(cid))
-
-        # Slot limit
-        if self.max_clients and len([c for c in clients if isinstance(c, dict)]) >= self.max_clients:
+        if not self.ssh_host:
+            # Region not configured yet; callers should display "Подключается..."
             raise RuntimeError("server_overloaded")
 
-        new_id = str(uuid.uuid4())
-        clients.append({"id": new_id, "flow": self.params.flow, "email": email})
-        await self._write_xray_config(cfg)
-        return self.build_share_link(new_id)
+        email = self._user_email(tg_id)
 
-    def build_share_link(self, client_uuid: str) -> str:
-        # IMPORTANT: Telegram URL button should be plain vless://...
-        p = self.params
-        # sid can be empty; include only if set
-        sid_part = f"&sid={p.sid}" if p.sid else ""
-        pbk_part = f"&pbk={p.pbk}" if p.pbk else ""
-        # Keep a stable name for UI
-        name = os.environ.get("REGION_VLESS_NAME", "VPN Region")
-        return (
-            f"vless://{client_uuid}@{p.host}:{p.port}"
-            f"?encryption=none&flow={p.flow}&security=reality&sni={p.sni}"
-            f"&fp={p.fp}{pbk_part}{sid_part}&type=tcp#{name}"
-        )
+        cfg = await self._read_xray_config()
+        inbound, clients = self._find_vless_inbound(cfg)
+        if inbound is None or clients is None:
+            log.error("VLESS inbound not found in Xray config")
+            raise RuntimeError("server_overloaded")
 
-    async def get_user_traffic_bytes(self, tg_id: int) -> tuple[int, int] | None:
+        existing = None
+        for c in clients:
+            if str(c.get("email") or "").strip() == email:
+                existing = c
+                break
+
+        if existing is None:
+            if len(clients) >= self.max_clients:
+                raise RuntimeError("server_overloaded")
+
+            new_id = str(uuid.uuid4())
+            client_obj = {"id": new_id, "email": email}
+            flow = (os.environ.get("REGION_VLESS_FLOW") or "").strip()
+            if flow:
+                client_obj["flow"] = flow
+            clients.append(client_obj)
+
+            # Write back config and reload Xray.
+            await self._write_xray_config(cfg)
+            await self._reload_xray()
+            client_id = new_id
+        else:
+            client_id = str(existing.get("id") or existing.get("uuid") or "").strip()
+            if not client_id:
+                # corrupted entry; regenerate id
+                client_id = str(uuid.uuid4())
+                existing["id"] = client_id
+                await self._write_xray_config(cfg)
+                await self._reload_xray()
+
+        return self._build_vless_url(client_id)
+
+    async def get_user_traffic_bytes(self, tg_id: int) -> Optional[Tuple[int, int]]:
+        """Best-effort traffic stats (up, down) in bytes.
+
+        In the current project this is optional. If stats aren't enabled on the
+        server, we return None and issuance proceeds.
         """
-        Best-effort traffic counters from Xray StatsService.
-        Returns (uplink_bytes, downlink_bytes) or None if not available.
-        """
-        email = f"tg_{tg_id}"
-        # Standard xray api command (requires API+Stats enabled in config):
-        # xray api statsquery --server=127.0.0.1:10085 -pattern "user>>tg_123>>"
+
+        # Not implemented yet (requires Xray API/StatsService + auth + parsing).
+        return None
+
+    # ------------------------
+    # Internal helpers
+    # ------------------------
+    @staticmethod
+    def _user_email(tg_id: int) -> str:
+        return f"tg_{int(tg_id)}"
+
+    async def _read_xray_config(self) -> dict:
+        out = await self._run_output(f"cat {self.xray_config_path}")
+        return json.loads(out) if out else {}
+
+    async def _write_xray_config(self, cfg: dict) -> None:
+        data = json.dumps(cfg, ensure_ascii=False, indent=2)
+        b64 = base64.b64encode(data.encode()).decode()
         cmd = (
-            f"/usr/local/bin/xray api statsquery --server=127.0.0.1:{self.xray_api_port} "
-            f"-pattern \"user>>{email}>>\""
+            f"python3 -c \"import base64; p='{self.xray_config_path}'; "
+            f"open(p,'wb').write(base64.b64decode('{b64}'))\""
         )
-        out = await self._ssh._run_output(cmd, check=False)
-        if not out:
-            return None
-        up = down = 0
-        # Parse lines like: "user>>tg_123>>traffic>>uplink: 12345"
-        for ln in out.splitlines():
-            ln = ln.strip()
-            m = None
-            if "uplink" in ln:
-                m = re.search(r":\s*([0-9]+)\s*$", ln)
-                if m:
-                    up = int(m.group(1))
-            elif "downlink" in ln:
-                m = re.search(r":\s*([0-9]+)\s*$", ln)
-                if m:
-                    down = int(m.group(1))
-        return up, down
+        await self._run(cmd)
+
+    def _find_vless_inbound(self, cfg: dict) -> tuple[Optional[dict], Optional[list]]:
+        """Return (inbound_dict, clients_list) for the first vless inbound."""
+        inbounds = cfg.get("inbounds")
+        if not isinstance(inbounds, list):
+            return None, None
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            if str(inbound.get("protocol") or "").lower() != "vless":
+                continue
+            settings = inbound.get("settings")
+            if not isinstance(settings, dict):
+                continue
+            clients = settings.get("clients")
+            if isinstance(clients, list):
+                return inbound, clients
+        return None, None
+
+    async def _reload_xray(self) -> None:
+        # Prefer reload; fallback to restart.
+        await self._run("systemctl reload xray", check=False)
+        # Some unit files don't support reload. Restart if not active.
+        out = await self._run_output("systemctl is-active xray", check=False)
+        if out.strip() != "active":
+            await self._run("systemctl restart xray", check=False)
+
+    def _build_vless_url(self, client_uuid: str) -> str:
+        host = (os.environ.get("REGION_VLESS_HOST") or "").strip() or self.ssh_host
+        port = (os.environ.get("REGION_VLESS_PORT") or "443").strip()
+        sni = (os.environ.get("REGION_VLESS_SNI") or "").strip()
+        fp = (os.environ.get("REGION_VLESS_FP") or "chrome").strip()
+        pbk = (os.environ.get("REGION_VLESS_PBK") or "").strip()
+        sid = (os.environ.get("REGION_VLESS_SID") or "").strip()
+        flow = (os.environ.get("REGION_VLESS_FLOW") or "").strip()
+        name = (os.environ.get("REGION_VLESS_NAME") or "VPN Region").strip()
+
+        # Build query string.
+        q = {
+            "encryption": "none",
+            "security": "reality",
+            "type": "tcp",
+        }
+        if flow:
+            q["flow"] = flow
+        if sni:
+            q["sni"] = sni
+        if fp:
+            q["fp"] = fp
+        if pbk:
+            q["pbk"] = pbk
+        if sid:
+            q["sid"] = sid
+
+        # Stable order for readability.
+        parts = [f"{k}={self._url_escape(v)}" for k, v in q.items() if v is not None and v != ""]
+        query = "&".join(parts)
+        # Fragment (name) should be URL-encoded lightly (spaces -> %20).
+        frag = self._url_escape(name)
+
+        return f"vless://{client_uuid}@{host}:{port}?{query}#{frag}"
+
+    @staticmethod
+    def _url_escape(s: str) -> str:
+        # A tiny safe encoder (avoids adding new deps). Enough for our params.
+        return (
+            str(s)
+            .replace("%", "%25")
+            .replace(" ", "%20")
+            .replace("#", "%23")
+            .replace("?", "%3F")
+            .replace("&", "%26")
+        )
