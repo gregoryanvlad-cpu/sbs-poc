@@ -238,6 +238,46 @@ class VPNService:
                 "total_peers": None,
             }
 
+    async def get_server_status_for(
+        self,
+        *,
+        host: str,
+        port: int,
+        user: str,
+        password: str | None,
+        interface: str,
+    ) -> Dict[str, Any]:
+        """Best-effort status for an arbitrary WireGuard SSH server.
+
+        This does NOT change existing logic; it is only used for UI to show multi-server load.
+        """
+        try:
+            provider = WireGuardSSHProvider(
+                host=host,
+                port=int(port),
+                user=user,
+                password=password,
+                interface=interface,
+            )
+            cpu = await provider.get_cpu_load_percent(sample_seconds=1)
+            active = await provider.get_active_peers(window_seconds=180)
+            total = await provider.get_total_peers()
+            return {
+                "ok": True,
+                "cpu_load_percent": cpu,
+                "active_peers": active,
+                "total_peers": total,
+            }
+        except Exception as e:
+            log.warning("vpn_status_unavailable(%s): %s", host, e)
+            return {
+                "ok": False,
+                "cpu_load_percent": None,
+                "active_peers": None,
+                "total_peers": None,
+            }
+
+
     async def get_recent_peer_handshakes(self, window_seconds: int = 180) -> list[dict[str, Any]]:
         """List recent peers by latest handshake.
 
