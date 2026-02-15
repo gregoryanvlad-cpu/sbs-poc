@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -44,6 +45,12 @@ from app.services.referrals.service import referral_service
 
 router = Router()
 
+
+@router.callback_query(lambda c: c.data == "noop")
+async def _noop(cb: CallbackQuery) -> None:
+    # UI-only buttons
+    await _safe_cb_answer(cb)
+
 # Store message ids of iOS guide screenshots to delete on Back
 VPN_BUNDLE_COUNTER: dict[int, tuple[str, int]] = {}
 
@@ -51,6 +58,83 @@ IOS_GUIDE_MEDIA: dict[int, list[int]] = {}
 
 # Auto payment status watchers (in-process). Keyed by Payment.id.
 _PAY_WATCH_TASKS: dict[int, asyncio.Task] = {}
+
+# VPN location migration watchers (in-process). Keyed by tg_id.
+_VPN_MIGRATE_TASKS: dict[int, asyncio.Task] = {}
+
+
+def _vpn_flag(code: str) -> str:
+    code = (code or "").upper()
+    return {
+        "NL": "🇳🇱",
+        "DE": "🇩🇪",
+        "TR": "🇹🇷",
+        "US": "🇺🇸",
+    }.get(code, "🌍")
+
+
+def _load_vpn_servers() -> list[dict]:
+    """Load VPN servers from VPN_SERVERS_JSON or build a safe default list.
+
+    Each server dict may contain:
+      code, name, host, port, user, password, interface,
+      server_public_key, endpoint, dns
+
+    Servers without host/user/endpoint/public_key are shown as "Подключается...".
+    """
+
+    servers_json = (os.environ.get("VPN_SERVERS_JSON") or "").strip()
+    servers: list[dict] = []
+    if servers_json:
+        try:
+            v = json.loads(servers_json)
+            if isinstance(v, list):
+                servers = [x for x in v if isinstance(x, dict)]
+        except Exception:
+            servers = []
+
+    if not servers:
+        # Default showcase list.
+        # Populate NL from current WG_* env vars so at least one server works.
+        pwd = os.environ.get("WG_SSH_PASSWORD")
+        if pwd is not None and pwd.strip() == "":
+            pwd = None
+        servers = [
+            {
+                "code": os.environ.get("VPN_CODE", "NL"),
+                "name": os.environ.get("VPN_NAME", "VPN-Нидерланды"),
+                "host": os.environ.get("WG_SSH_HOST"),
+                "port": int(os.environ.get("WG_SSH_PORT", "22")),
+                "user": os.environ.get("WG_SSH_USER"),
+                "password": pwd,
+                "interface": os.environ.get("VPN_INTERFACE", "wg0"),
+                "server_public_key": os.environ.get("VPN_SERVER_PUBLIC_KEY"),
+                "endpoint": os.environ.get("VPN_ENDPOINT"),
+                "dns": os.environ.get("VPN_DNS", "1.1.1.1"),
+            },
+            {"code": "DE", "name": "VPN-Германия"},
+            {"code": "TR", "name": "VPN-Турция"},
+            {"code": "US", "name": "VPN-США"},
+        ]
+
+    out: list[dict] = []
+    for s in servers:
+        code = str(s.get("code") or "").upper() or "XX"
+        out.append(
+            {
+                "code": code,
+                "name": str(s.get("name") or f"VPN-{code}"),
+                "host": s.get("host"),
+                "port": int(s.get("port") or 22),
+                "user": s.get("user"),
+                "password": s.get("password"),
+                "interface": str(s.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                "server_public_key": s.get("server_public_key") or s.get("server_public") or s.get("public_key"),
+                "endpoint": s.get("endpoint"),
+                "dns": s.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1"),
+            }
+        )
+    return out
 
 
 
@@ -940,6 +1024,233 @@ async def on_vpn_guide(cb: CallbackQuery) -> None:
     await cb.message.edit_text(text, reply_markup=kb_vpn_guide_platforms(), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
+
+# --- VPN location selection / migration ---
+
+
+def _server_is_ready(srv: dict) -> bool:
+    return bool(srv.get("host") and srv.get("user") and srv.get("server_public_key") and srv.get("endpoint"))
+
+
+async def _vpn_server_label(srv: dict) -> str:
+    """Return UI label: recommend/overloaded/connecting.
+
+    We intentionally DO NOT show occupied/total places.
+    """
+
+    if not _server_is_ready(srv):
+        return "Подключается…"
+
+    # Best-effort CPU-based indicator
+    st = await vpn_service.get_server_status_for(
+        host=str(srv["host"]),
+        port=int(srv.get("port") or 22),
+        user=str(srv["user"]),
+        password=srv.get("password"),
+        interface=str(srv.get("interface") or "wg0"),
+    )
+    cpu = st.get("cpu_load_percent")
+    if st.get("ok") and isinstance(cpu, (int, float)):
+        if float(cpu) >= 85.0:
+            return "Перегружен"
+        if float(cpu) <= 70.0:
+            return "<i>(Рекомендуем)</i>"
+    return "Доступен"
+
+
+@router.callback_query(lambda c: c.data == "vpn:loc")
+async def on_vpn_location_menu(cb: CallbackQuery) -> None:
+    servers = _load_vpn_servers()
+
+    lines = ["🌍 <b>Выбор локации VPN</b>", "", "Выберите сервер. Мы не показываем занятость мест; статус — общий."]
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for srv in servers:
+        code = srv.get("code")
+        name = srv.get("name")
+        flag = _vpn_flag(str(code))
+        label = await _vpn_server_label(srv)
+        lines.append(f"{flag} <b>{name}</b> — {label}")
+
+        if _server_is_ready(srv):
+            kb_rows.append([InlineKeyboardButton(text=f"{flag} {name}", callback_data=f"vpn:loc:sel:{code}")])
+        else:
+            # Not clickable yet
+            kb_rows.append([InlineKeyboardButton(text=f"{flag} {name} (подключается)", callback_data="noop")])
+
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:vpn")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    try:
+        await cb.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await _safe_cb_answer(cb)
+
+
+async def _start_vpn_migration_watch(
+    *,
+    bot,
+    tg_id: int,
+    new_srv: dict,
+    new_public_key: str,
+    old_peers: list[tuple[dict, str]],
+) -> None:
+    """Poll new server handshakes; once user connects, disable old peers immediately."""
+
+    # Cancel existing watcher for this user
+    t = _VPN_MIGRATE_TASKS.pop(tg_id, None)
+    if t and not t.done():
+        t.cancel()
+
+    async def _run() -> None:
+        start_ts = int(utcnow().timestamp())
+        deadline = start_ts + 15 * 60  # 15 minutes
+        while int(utcnow().timestamp()) < deadline:
+            try:
+                hs = await vpn_service.get_peer_handshake_for_server(
+                    public_key=new_public_key,
+                    host=str(new_srv["host"]),
+                    port=int(new_srv.get("port") or 22),
+                    user=str(new_srv["user"]),
+                    password=new_srv.get("password"),
+                    interface=str(new_srv.get("interface") or "wg0"),
+                )
+            except Exception:
+                hs = 0
+
+            if hs and int(hs) >= start_ts:
+                # User has connected to the new location — disable old peers right away.
+                async with session_scope() as session:
+                    for old_srv, old_pub in old_peers:
+                        try:
+                            await vpn_service.remove_peer_for_server(
+                                public_key=old_pub,
+                                host=str(old_srv["host"]),
+                                port=int(old_srv.get("port") or 22),
+                                user=str(old_srv["user"]),
+                                password=old_srv.get("password"),
+                                interface=str(old_srv.get("interface") or "wg0"),
+                            )
+                        except Exception:
+                            pass
+
+                    # Mark old peer rows inactive in DB (best-effort)
+                    from app.db.models import VpnPeer
+                    q = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
+                    res = await session.execute(q)
+                    rows = list(res.scalars().all())
+                    for r in rows:
+                        if r.client_public_key != new_public_key:
+                            r.is_active = False
+                            r.revoked_at = utcnow()
+                            r.rotation_reason = "migrated"
+                    await session.commit()
+
+                try:
+                    await bot.send_message(
+                        tg_id,
+                        "✅ <b>Локация переключена</b>\n\nСтарый конфиг отключён, вы подключены к новому серверу.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                return
+
+            await asyncio.sleep(5)
+
+    _VPN_MIGRATE_TASKS[tg_id] = asyncio.create_task(_run())
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("vpn:loc:sel:"))
+async def on_vpn_location_select(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    parts = (cb.data or "").split(":")
+    if len(parts) != 4:
+        await _safe_cb_answer(cb)
+        return
+    code = parts[3].upper()
+
+    # Require active subscription
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            return
+
+    servers = _load_vpn_servers()
+    srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
+    if not srv or not _server_is_ready(srv):
+        await cb.answer("Сервер пока недоступен", show_alert=True)
+        return
+
+    # Find currently active peers (could be more than one if previous migration was interrupted)
+    from app.db.models import VpnPeer
+    async with session_scope() as session:
+        q = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True).order_by(VpnPeer.id.desc())  # noqa: E712
+        res = await session.execute(q)
+        active_rows = list(res.scalars().all())
+
+        # Build list of old peers (server def + public key) excluding target server.
+        old: list[tuple[dict, str]] = []
+        for r in active_rows:
+            r_code = (r.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+            if r_code == code:
+                continue
+            old_srv = next((s for s in servers if str(s.get("code")).upper() == r_code), None)
+            if old_srv and _server_is_ready(old_srv):
+                old.append((old_srv, r.client_public_key))
+
+        try:
+            peer = await vpn_service.ensure_peer_for_server(
+                session,
+                tg_id,
+                server_code=code,
+                host=str(srv["host"]),
+                port=int(srv.get("port") or 22),
+                user=str(srv["user"]),
+                password=srv.get("password"),
+                interface=str(srv.get("interface") or "wg0"),
+            )
+            await session.commit()
+        except Exception:
+            await cb.answer("⚠️ Сервер временно недоступен", show_alert=True)
+            return
+
+    conf_text = vpn_service.build_wg_conf(
+        peer,
+        user_label=str(tg_id),
+        server_public_key=str(srv.get("server_public_key")),
+        endpoint=str(srv.get("endpoint")),
+        dns=str(srv.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+    )
+
+    qr_img = qrcode.make(conf_text)
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+
+    conf_file = BufferedInputFile(conf_text.encode(), filename=_next_vpn_bundle_filename(tg_id))
+    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+
+    await cb.message.answer_document(
+        document=conf_file,
+        caption=f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
+        "Старый конфиг отключится сразу после подключения к новой локации.",
+        parse_mode="HTML",
+    )
+    await cb.message.answer_photo(photo=qr_file, caption="QR для WireGuard")
+
+    await cb.answer("Конфиг отправлен")
+
+    # Start watcher to disable old peers immediately once user connects to new location.
+    await _start_vpn_migration_watch(
+        bot=cb.bot,
+        tg_id=tg_id,
+        new_srv=srv,
+        new_public_key=str(peer.get("public_key") or ""),
+        old_peers=old,
+    )
 
 @router.callback_query(lambda c: c.data and c.data.startswith("vpn:howto:"))
 async def on_vpn_howto(cb: CallbackQuery) -> None:
