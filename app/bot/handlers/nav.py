@@ -48,6 +48,8 @@ router = Router()
 
 # --- VPN-Region (VLESS + Reality) ---
 
+# --- VPN-Region (VLESS + Reality) ---
+
 from app.services.regionvpn import RegionVpnService
 
 
@@ -63,21 +65,38 @@ def _region_service() -> RegionVpnService:
     )
 
 
-@router.callback_query(lambda c: c.data == "nav:region")
-async def on_nav_region(cb: CallbackQuery) -> None:
-    text = (
-        "🌐 <b>VPN-Region</b>\n\n"
-        "Вы получите конфигурацию для протокола <b>VLESS + Reality</b>.\n"
-        "Импорт можно сделать в приложении <b>Happ</b> (iOS) или любом клиенте, поддерживающем vless:// ссылки.\n\n"
-        f"Конфиг/QR будут удалены автоматически через <b>{settings.auto_delete_seconds} сек.</b>"
-    )
-    kb = InlineKeyboardMarkup(
+def _kb_region_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📦 Получить конфиг", callback_data="region:get")],
+            [InlineKeyboardButton(text="🔄 Сбросить VPN-Region", callback_data="region:reset")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:home")],
         ]
     )
-    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+def _kb_region_after_get() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 VPN-Region", callback_data="nav:region")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+@router.callback_query(lambda c: c.data == "nav:region")
+async def on_nav_region(cb: CallbackQuery) -> None:
+    text = f"""🌐 <b>VPN-Region</b>
+
+Здесь выдается конфигурация для <b>VLESS + Reality</b> (обход блокировок).
+
+📌 После выдачи вы получите:
+• QR-код (можно сохранить в галерею и импортировать в Happ)
+• ссылку <b>vless://</b> (можно скопировать и импортировать «Из буфера»)
+
+⏳ Ссылка и QR удаляются автоматически через <b>{settings.auto_delete_seconds} сек.</b>
+"""
+    await cb.message.edit_text(text, reply_markup=_kb_region_menu(), parse_mode="HTML", disable_web_page_preview=True)
     await _safe_cb_answer(cb)
 
 
@@ -97,8 +116,7 @@ async def on_region_get(cb: CallbackQuery) -> None:
     # Optional quota gating (best-effort)
     if settings.region_quota_gb and settings.region_quota_gb > 0:
         try:
-            svc = _region_service()
-            traffic = await svc.get_user_traffic_bytes(tg_id)
+            traffic = await _region_service().get_user_traffic_bytes(tg_id)
             if traffic:
                 up, down = traffic
                 used_gb = (up + down) / (1024 ** 3)
@@ -113,12 +131,14 @@ async def on_region_get(cb: CallbackQuery) -> None:
             # If stats are unavailable, don't block issuance.
             pass
 
-    svc = _region_service()
     try:
-        vless_url = await svc.ensure_client(tg_id)
+        vless_url = await _region_service().ensure_client(tg_id)
     except RuntimeError as e:
         if str(e) == "server_overloaded":
-            await cb.message.answer("⚠️ Сервер VPN-Region сейчас перегружен. Попробуйте позже или выберите обычный VPN.")
+            await cb.message.answer(
+                "⚠️ Сервер VPN-Region сейчас перегружен.\n"
+                "Попробуйте позже или используйте обычный VPN."
+            )
             await _safe_cb_answer(cb)
             return
         raise
@@ -128,35 +148,31 @@ async def on_region_get(cb: CallbackQuery) -> None:
     buf = io.BytesIO()
     qr_img.save(buf, format="PNG")
     buf.seek(0)
-    qr_file = BufferedInputFile(buf.getvalue(), filename="vless.png")
+    qr_file = BufferedInputFile(buf.getvalue(), filename="vpn-region.png")
 
-    # Telegram inline keyboard buttons do NOT support custom URL schemes like vless://
-    # (TelegramBadRequest: Unsupported URL protocol). We'll provide a callback button
-    # which sends a clickable link inside the message body.
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📲 Импорт в Happ", callback_data="region:open")],
-            [InlineKeyboardButton(text="🔄 Сбросить VPN-Region", callback_data="region:reset")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-        ]
-    )
+    info_text = f"""✅ <b>VPN-Region конфиг готов</b>
 
-    msg1 = await cb.message.answer(
-        "✅ <b>VPN-Region конфиг готов</b>\n\n"
-        "Самый быстрый способ — отсканировать QR-код в Happ.\n"
-        "Или нажмите «📲 Импорт в Happ» — я пришлю ссылку отдельным сообщением (её можно скопировать/нажать).\n\n"
-        f"Автоудаление через <b>{settings.auto_delete_seconds} сек.</b>",
-        reply_markup=kb,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    msg_link = await cb.message.answer(vless_url)
-    msg2 = await cb.message.answer_photo(
+📲 <b>Happ Plus (iOS)</b>
+1) <b>По QR</b>: сохраните QR (долгий тап → «Сохранить») и импортируйте в Happ из галереи.
+2) <b>По ссылке</b>: скопируйте ссылку ниже (долгий тап → «Копировать») и в Happ выберите «+» → <b>Из буфера</b>.
+
+⏳ Ссылка и QR удалятся через <b>{settings.auto_delete_seconds} сек.</b>
+"""
+    await cb.message.answer(info_text, reply_markup=_kb_region_after_get(), parse_mode="HTML", disable_web_page_preview=True)
+
+    # Important: keep URL on its own line so Telegram makes it clickable/selectable.
+    link_text = f"""🔗 Ссылка для импорта (скопируйте её):
+
+{vless_url}
+
+🧹 Это сообщение удалится через {settings.auto_delete_seconds} сек."""
+    msg_link = await cb.message.answer(link_text, disable_web_page_preview=True)
+
+    msg_qr = await cb.message.answer_photo(
         photo=qr_file,
-        caption="📷 QR для быстрого импорта (VPN-Region).",
+        caption="📷 QR для импорта (VPN-Region).",
     )
 
-    # Auto-delete like WG configs
     async def _del_later(mid: int) -> None:
         await asyncio.sleep(settings.auto_delete_seconds)
         try:
@@ -164,41 +180,14 @@ async def on_region_get(cb: CallbackQuery) -> None:
         except Exception:
             pass
 
-    asyncio.create_task(_del_later(msg1.message_id))
     asyncio.create_task(_del_later(msg_link.message_id))
-    asyncio.create_task(_del_later(msg2.message_id))
+    asyncio.create_task(_del_later(msg_qr.message_id))
 
-    await _safe_cb_answer(cb)
-
-
-@router.callback_query(lambda c: c.data == "region:open")
-async def on_region_open(cb: CallbackQuery) -> None:
-    """Send a clickable vless:// link in message body (Telegram buttons can't use vless://)."""
-    tg_id = int(cb.from_user.id)
-    try:
-        vless_url = await _region_service().ensure_client(tg_id)
-    except Exception:
-        await cb.message.answer("⚠️ Сейчас не удалось получить ссылку. Попробуйте ещё раз.")
-        await _safe_cb_answer(cb)
-        return
-
-    # Telegram often blocks custom schemes in HTML links/buttons, so we send the vless://
-    # URL as plain text in a separate message (it can be copied and sometimes opened by the OS).
-    await cb.message.answer(
-        "📲 <b>Импорт в Happ</b>\n\n"
-        "1) Откройте Happ → «+» → Import from Clipboard (или Scan QR).\n"
-        "2) Я отправил(а) ссылку ниже — скопируйте её в буфер обмена и вставьте в Happ.\n\n"
-        "Если Happ не установлено — используйте любой клиент, поддерживающий VLESS (Reality).",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await cb.message.answer(vless_url)
     await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data == "region:reset")
 async def on_region_reset(cb: CallbackQuery) -> None:
-    """Confirm reset of Region VPN client (removes it from Xray)."""
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Да, сбросить", callback_data="region:reset:do")],
@@ -218,17 +207,30 @@ async def on_region_reset(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "region:reset:do")
 async def on_region_reset_do(cb: CallbackQuery) -> None:
     tg_id = int(cb.from_user.id)
+
+    # Сначала отвечаем на callback, чтобы не ловить "query is too old"
+    await _safe_cb_answer(cb)
+
     try:
         removed = await _region_service().revoke_client(tg_id)
     except Exception:
         removed = False
 
-    if removed:
-        await cb.message.answer("✅ VPN-Region сброшен. Теперь можно получить новый конфиг.", reply_markup=kb_back_home)
-    else:
-        await cb.message.answer("ℹ️ Активный VPN-Region конфиг не найден. Можно сразу нажать «📦 Получить конфиг».", reply_markup=kb_back_home)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Получить конфиг", callback_data="region:get")],
+            [InlineKeyboardButton(text="🌐 VPN-Region", callback_data="nav:region")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
 
-    await _safe_cb_answer(cb)
+    if removed:
+        text = "✅ <b>VPN-Region сброшен</b>\n\nТекущий конфиг отключён на сервере. Теперь можно получить новый."
+    else:
+        text = "ℹ️ <b>Активный VPN-Region конфиг не найден</b>\n\nМожно сразу нажать «📦 Получить конфиг»."
+
+    await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
 
 @router.callback_query(lambda c: c.data == "noop")
 async def _noop(cb: CallbackQuery) -> None:
