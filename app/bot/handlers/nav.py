@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+from html import escape as html_escape
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,6 +18,12 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
+# Copy-to-clipboard button (Bot API 7.11+). aiogram exposes it as CopyTextButton.
+try:
+    from aiogram.types import CopyTextButton  # type: ignore
+except Exception:  # pragma: no cover
+    CopyTextButton = None  # type: ignore
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import select
 
@@ -150,28 +157,73 @@ async def on_region_get(cb: CallbackQuery) -> None:
     buf.seek(0)
     qr_file = BufferedInputFile(buf.getvalue(), filename="vpn-region.png")
 
-    info_text = f"""✅ <b>VPN-Region конфиг готов</b>
+    # Button that copies link to clipboard in 1 tap (supported in newer Telegram clients).
+    copy_btn: InlineKeyboardButton | None = None
+    if CopyTextButton is not None and 1 <= len(vless_url) <= 256:
+        try:
+            copy_btn = InlineKeyboardButton(
+                text="📋 Скопировать ссылку",
+                copy_text=CopyTextButton(text=vless_url),  # type: ignore[arg-type]
+            )
+        except Exception:
+            copy_btn = None
 
-📲 <b>Happ Plus (iOS)</b>
-1) <b>По QR</b>: сохраните QR (долгий тап → «Сохранить») и импортируйте в Happ из галереи.
-2) <b>По ссылке</b>: скопируйте ссылку ниже (долгий тап → «Копировать») и в Happ выберите «+» → <b>Из буфера</b>.
+    # We can't use vless:// in InlineKeyboardButton.url (Telegram blocks non-http(s) schemes).
+    # Provide a copy button + App Store link.
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if copy_btn:
+        kb_rows.append([copy_btn])
+
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="🍏 Happ Plus (App Store)",
+                url="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+            )
+        ]
+    )
+    kb_rows.append([InlineKeyboardButton(text="🌐 VPN-Region", callback_data="nav:region")])
+    kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+    kb_link = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    # Make the message clean and user-friendly.
+    if copy_btn:
+        howto = (
+            "1) Нажмите кнопку <b>«📋 Скопировать ссылку»</b> — она копируется сразу.\n"
+            "2) Откройте <b>Happ Plus</b> → «<b>+</b>» → <b>Из буфера</b>."
+        )
+    else:
+        # Fallback if CopyTextButton isn't supported in current runtime.
+        howto = (
+            "1) Скопируйте ссылку ниже (долгий тап → «Копировать»).\n"
+            "2) Откройте <b>Happ Plus</b> → «<b>+</b>» → <b>Из буфера</b>."
+        )
+
+    # Show full link in a code block so it is easy to copy manually as well.
+    link_block = f"<code>{html_escape(vless_url)}</code>"
+
+    link_text = f"""✅ <b>VPN-Region конфиг готов</b>
+
+📌 <b>Как добавить в Happ Plus</b>
+{howto}
+
+📷 <b>Через QR</b>: сохраните QR (долгий тап → «Сохранить») и импортируйте в Happ из галереи.
+
+🔗 <b>Ссылка для импорта</b>:
+{link_block}
 
 ⏳ Ссылка и QR удалятся через <b>{settings.auto_delete_seconds} сек.</b>
 """
-    await cb.message.answer(info_text, reply_markup=_kb_region_after_get(), parse_mode="HTML", disable_web_page_preview=True)
 
-    # Important: keep URL on its own line so Telegram makes it clickable/selectable.
-    link_text = f"""🔗 Ссылка для импорта (скопируйте её):
+    msg_link = await cb.message.answer(link_text, reply_markup=kb_link, parse_mode="HTML", disable_web_page_preview=True)
+    msg_qr = await cb.message.answer_photo(photo=qr_file, caption="📷 QR для импорта (VPN-Region).")
 
-{vless_url}
-
-🧹 Это сообщение удалится через {settings.auto_delete_seconds} сек."""
-    msg_link = await cb.message.answer(link_text, disable_web_page_preview=True)
-
-    msg_qr = await cb.message.answer_photo(
-        photo=qr_file,
-        caption="📷 QR для импорта (VPN-Region).",
-    )
+    # If we couldn't add a 1-tap copy button, also send the raw URL as plain text
+    # (some clients treat it as selectable/clickable).
+    msg_plain: int | None = None
+    if copy_btn is None:
+        msg_plain_obj = await cb.message.answer(vless_url, disable_web_page_preview=True)
+        msg_plain = msg_plain_obj.message_id
 
     async def _del_later(mid: int) -> None:
         await asyncio.sleep(settings.auto_delete_seconds)
@@ -182,6 +234,8 @@ async def on_region_get(cb: CallbackQuery) -> None:
 
     asyncio.create_task(_del_later(msg_link.message_id))
     asyncio.create_task(_del_later(msg_qr.message_id))
+    if msg_plain is not None:
+        asyncio.create_task(_del_later(msg_plain))
 
     await _safe_cb_answer(cb)
 
