@@ -158,3 +158,13 @@ def _load_settings() -> Settings:
 
 
 settings = _load_settings()
+
+    # --- VPN-Region (VLESS+Reality) ---
+    region_ssh_host: str = os.environ.get("REGION_SSH_HOST", "")
+    region_ssh_port: int = int(os.environ.get("REGION_SSH_PORT", "22"))
+    region_ssh_user: str = os.environ.get("REGION_SSH_USER", "root")
+    region_ssh_password: str | None = os.environ.get("REGION_SSH_PASSWORD")
+    region_xray_config_path: str = os.environ.get("REGION_XRAY_CONFIG_PATH", "/usr/local/etc/xray/config.json")
+    region_xray_api_port: int = int(os.environ.get("REGION_XRAY_API_PORT", "10085"))
+    region_max_clients: int = int(os.environ.get("REGION_MAX_CLIENTS", "40"))
+    region_quota_gb: int = int(os.environ.get("REGION_QUOTA_GB", "0"))  # 0 = no quota enforcement
