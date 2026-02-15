@@ -40,7 +40,131 @@ from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription, get_price_rub
-from app.services.vpn.service import vpn_service
+from app
+
+# --- VPN-Region (VLESS + Reality) ---
+
+from app.services.regionvpn import RegionVpnService
+
+
+def _region_service() -> RegionVpnService:
+    return RegionVpnService(
+        ssh_host=settings.region_ssh_host,
+        ssh_port=settings.region_ssh_port,
+        ssh_user=settings.region_ssh_user,
+        ssh_password=settings.region_ssh_password,
+        xray_config_path=settings.region_xray_config_path,
+        xray_api_port=settings.region_xray_api_port,
+        max_clients=settings.region_max_clients,
+    )
+
+
+@router.callback_query(lambda c: c.data == "nav:region")
+async def on_nav_region(cb: CallbackQuery) -> None:
+    text = (
+        "🌐 <b>VPN-Region</b>\\n\\n"
+        "Вы получите конфигурацию для протокола <b>VLESS + Reality</b>.\\n"
+        "Импорт можно сделать в приложении <b>Happ</b> (iOS) или любом клиенте, поддерживающем vless:// ссылки.\\n\\n"
+        f"Конфиг/QR будут удалены автоматически через <b>{settings.auto_delete_seconds} сек.</b>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Получить конфиг", callback_data="region:get")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:home")],
+        ]
+    )
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "region:get")
+async def on_region_get(cb: CallbackQuery) -> None:
+    tg_id = int(cb.from_user.id)
+
+    # Subscription required (same gating as VPN)
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+
+    if not sub or not sub.is_active:
+        await cb.message.answer("❌ Для доступа нужен активный тариф. Оформите подписку в разделе «💳 Оплата».")
+        await _safe_cb_answer(cb)
+        return
+
+    # Optional quota gating (best-effort)
+    if settings.region_quota_gb and settings.region_quota_gb > 0:
+        try:
+            svc = _region_service()
+            traffic = await svc.get_user_traffic_bytes(tg_id)
+            if traffic:
+                up, down = traffic
+                used_gb = (up + down) / (1024 ** 3)
+                if used_gb >= settings.region_quota_gb:
+                    await cb.message.answer(
+                        "⚠️ Достигнут лимит трафика для VPN-Region.\\n"
+                        "Если это ошибка — обратитесь в поддержку."
+                    )
+                    await _safe_cb_answer(cb)
+                    return
+        except Exception:
+            # If stats are unavailable, don't block issuance.
+            pass
+
+    svc = _region_service()
+    try:
+        vless_url = await svc.ensure_client(tg_id)
+    except RuntimeError as e:
+        if str(e) == "server_overloaded":
+            await cb.message.answer("⚠️ Сервер VPN-Region сейчас перегружен. Попробуйте позже или выберите обычный VPN.")
+            await _safe_cb_answer(cb)
+            return
+        raise
+
+    # QR
+    qr_img = qrcode.make(vless_url)
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+    qr_file = BufferedInputFile(buf.getvalue(), filename="vless.png")
+
+    # Button to open in Happ (or any client) via vless:// URL
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📲 Открыть в Happ", url=vless_url)],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+    msg1 = await cb.message.answer(
+        "✅ <b>VPN-Region конфиг готов</b>\\n\\n"
+        "1) Нажмите «📲 Открыть в Happ» и импортируйте.\\n"
+        "2) Или скопируйте ссылку ниже в любой VLESS-клиент.\\n\\n"
+        f"<code>{vless_url}</code>\\n\\n"
+        f"Автоудаление через <b>{settings.auto_delete_seconds} сек.</b>",
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    msg2 = await cb.message.answer_photo(
+        photo=qr_file,
+        caption="📷 QR для быстрого импорта (VPN-Region).",
+    )
+
+    # Auto-delete like WG configs
+    async def _del_later(mid: int) -> None:
+        await asyncio.sleep(settings.auto_delete_seconds)
+        try:
+            await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=mid)
+        except Exception:
+            pass
+
+    asyncio.create_task(_del_later(msg1.message_id))
+    asyncio.create_task(_del_later(msg2.message_id))
+
+    await _safe_cb_answer(cb)
+
+
+
+.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 
 router = Router()
