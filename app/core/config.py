@@ -99,6 +99,9 @@ class Settings:
     region_xray_api_port: int = 10085
     region_max_clients: int = 40
     region_quota_gb: int = 0  # 0 = no quota enforcement
+    region_access_log_path: str = "/var/log/xray/access.log"
+    region_session_guard_enabled: bool = True
+    region_session_guard_period_seconds: int = 5
 
 
 def _load_settings() -> Settings:
@@ -176,6 +179,9 @@ def _load_settings() -> Settings:
         region_xray_api_port=int(os.getenv("REGION_XRAY_API_PORT", "10085")),
         region_max_clients=int(os.getenv("REGION_MAX_CLIENTS", "40")),
         region_quota_gb=int(os.getenv("REGION_QUOTA_GB", "0")),
+        region_access_log_path=os.getenv("REGION_ACCESS_LOG_PATH", "/var/log/xray/access.log").strip(),
+        region_session_guard_enabled=_env_bool("REGION_SESSION_GUARD_ENABLED", True),
+        region_session_guard_period_seconds=int(os.getenv("REGION_SESSION_GUARD_PERIOD_SECONDS", "5")),
     )
 
 
