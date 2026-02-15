@@ -99,6 +99,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     # VPN
     b.button(text="📊 Статус VPN", callback_data="admin:vpn:status")
     b.button(text="👥 Активные VPN-профили", callback_data="admin:vpn:active_profiles")
+    b.button(text="🌐 VPN-Region профили", callback_data="admin:regionvpn:profiles")
 
     # Yandex
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
