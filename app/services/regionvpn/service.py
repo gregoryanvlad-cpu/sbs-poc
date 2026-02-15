@@ -227,6 +227,49 @@ class RegionVpnService:
 
         return self.build_vless_url(client_uuid)
 
+    async def revoke_client(self, tg_id: int) -> bool:
+        """Remove a client from Xray config by tg_id.
+
+        The bot identifies a client by email `tg:<telegram_id>`.
+        Returns True if a client was removed, False if nothing matched.
+        """
+
+        email_variants = {f"tg:{tg_id}", str(tg_id)}
+
+        cfg = await self._read_xray_config()
+        ref = self._find_vless_inbound(cfg)
+
+        before = len(ref.clients)
+        ref.clients[:] = [
+            c
+            for c in ref.clients
+            if not (isinstance(c, dict) and str(c.get("email") or "") in email_variants)
+        ]
+        removed = len(ref.clients) != before
+
+        if removed:
+            await self._write_xray_config(cfg)
+            await self._run("sudo systemctl restart xray")
+
+        return removed
+
+    async def list_clients(self) -> list[dict]:
+        """Return a best-effort list of configured VLESS clients.
+
+        NOTE: This is not "active" sessions, just provisioned clients.
+        """
+        cfg = await self._read_xray_config()
+        ref = self._find_vless_inbound(cfg)
+        out: list[dict] = []
+        for c in ref.clients:
+            if isinstance(c, dict):
+                out.append({
+                    "id": str(c.get("id") or ""),
+                    "email": str(c.get("email") or ""),
+                    "flow": str(c.get("flow") or ""),
+                })
+        return out
+
     async def get_user_traffic_bytes(self, tg_id: int) -> Optional[Tuple[int, int]]:
         """Best-effort traffic stats (up, down).
 
