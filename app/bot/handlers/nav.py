@@ -130,10 +130,13 @@ async def on_region_get(cb: CallbackQuery) -> None:
     buf.seek(0)
     qr_file = BufferedInputFile(buf.getvalue(), filename="vless.png")
 
-    # Button to open in Happ (or any client) via vless:// URL
+    # Telegram inline keyboard buttons do NOT support custom URL schemes like vless://
+    # (TelegramBadRequest: Unsupported URL protocol). We'll provide a callback button
+    # which sends a clickable link inside the message body.
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📲 Открыть в Happ", url=vless_url)],
+            [InlineKeyboardButton(text="📲 Открыть в Happ", callback_data="region:open")],
+            [InlineKeyboardButton(text="🔄 Сбросить VPN-Region", callback_data="region:reset")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
         ]
     )
@@ -163,6 +166,63 @@ async def on_region_get(cb: CallbackQuery) -> None:
 
     asyncio.create_task(_del_later(msg1.message_id))
     asyncio.create_task(_del_later(msg2.message_id))
+
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "region:open")
+async def on_region_open(cb: CallbackQuery) -> None:
+    """Send a clickable vless:// link in message body (Telegram buttons can't use vless://)."""
+    tg_id = int(cb.from_user.id)
+    try:
+        vless_url = await _region_service().ensure_client(tg_id)
+    except Exception:
+        await cb.message.answer("⚠️ Сейчас не удалось получить ссылку. Попробуйте ещё раз.")
+        await _safe_cb_answer(cb)
+        return
+
+    # Most clients will treat this as a clickable deep-link.
+    text = (
+        "📲 <b>Импорт в Happ</b>\n\n"
+        "Нажмите на ссылку ниже (она откроет приложение, если оно установлено):\n"
+        f"<a href=\"{vless_url}\">Открыть VPN-Region в Happ</a>\n\n"
+        "Если не открывается — скопируйте ссылку из сообщения с конфигом и вставьте в клиент вручную."
+    )
+    await cb.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "region:reset")
+async def on_region_reset(cb: CallbackQuery) -> None:
+    """Confirm reset of Region VPN client (removes it from Xray)."""
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, сбросить", callback_data="region:reset:do")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:region")],
+        ]
+    )
+    await cb.message.answer(
+        "⚠️ <b>Сброс VPN-Region</b>\n\n"
+        "Это отключит текущий конфиг на сервере.\n"
+        "После сброса нужно будет заново нажать «📦 Получить конфиг».",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "region:reset:do")
+async def on_region_reset_do(cb: CallbackQuery) -> None:
+    tg_id = int(cb.from_user.id)
+    try:
+        removed = await _region_service().revoke_client(tg_id)
+    except Exception:
+        removed = False
+
+    if removed:
+        await cb.message.answer("✅ VPN-Region сброшен. Теперь можно получить новый конфиг.", reply_markup=kb_back_home)
+    else:
+        await cb.message.answer("ℹ️ Активный VPN-Region конфиг не найден. Можно сразу нажать «📦 Получить конфиг».", reply_markup=kb_back_home)
 
     await _safe_cb_answer(cb)
 
