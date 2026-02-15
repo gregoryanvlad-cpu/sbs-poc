@@ -58,6 +58,7 @@ router = Router()
 # --- VPN-Region (VLESS + Reality) ---
 
 from app.services.regionvpn import RegionVpnService
+from app.db.models.region_vpn_session import RegionVpnSession
 
 
 def _region_service() -> RegionVpnService:
@@ -269,6 +270,14 @@ async def on_region_reset_do(cb: CallbackQuery) -> None:
         removed = await _region_service().revoke_client(tg_id)
     except Exception:
         removed = False
+    # Clean up session tracking (single-device enforcement)
+    try:
+        async with session_scope() as s:
+            row = await s.get(RegionVpnSession, tg_id)
+            if row:
+                await s.delete(row)
+    except Exception:
+        pass
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
