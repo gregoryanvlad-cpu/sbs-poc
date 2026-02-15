@@ -186,7 +186,7 @@ async def _build_home_text() -> str:
     lines.append("")
     lines.append("Форма шифрования: <b>ChaCha20-Poly1305</b>")
 
-    return "🏠 <b>Главное меню</b>
+    return "🏠 <b>Главное меню</b>"
 
 " + "
 ".join(lines)
