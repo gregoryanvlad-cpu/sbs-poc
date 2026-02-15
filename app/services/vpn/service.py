@@ -4,7 +4,7 @@ import base64
 import ipaddress
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -60,6 +60,27 @@ class VPNService:
         self.server_pub = os.environ["VPN_SERVER_PUBLIC_KEY"]
         self.endpoint = os.environ["VPN_ENDPOINT"]
         self.dns = os.environ.get("VPN_DNS", "1.1.1.1")
+
+        # Cache of providers for multi-location servers.
+        # Keyed by (host, port, user, interface).
+        self._providers: dict[Tuple[str, int, str, str], WireGuardSSHProvider] = {}
+
+    def _provider_for(
+        self,
+        *,
+        host: str,
+        port: int,
+        user: str,
+        password: str | None,
+        interface: str,
+    ) -> WireGuardSSHProvider:
+        """Get a cached SSH provider for a given server."""
+        key = (host, int(port), user, interface)
+        p = self._providers.get(key)
+        if p is None:
+            p = WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface)
+            self._providers[key] = p
+        return p
 
     def _alloc_ip(self, tg_id: int) -> str:
         # Stable IP per tg_id until rotate (manual reset).
@@ -128,6 +149,7 @@ class VPNService:
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
+            server_code=None,
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
@@ -142,6 +164,111 @@ class VPNService:
             "client_private_key_enc": row.client_private_key_enc,
             "client_private_key_plain": client_priv,
         }
+
+    async def ensure_peer_for_server(
+        self,
+        session: AsyncSession,
+        tg_id: int,
+        *,
+        server_code: str,
+        host: str,
+        port: int,
+        user: str,
+        password: str | None,
+        interface: str,
+    ) -> Dict[str, Any]:
+        """Create/restore an active peer for a specific server.
+
+        This is an additive feature for multi-location deployments. It does not
+        change existing logic for single-server usage.
+        """
+
+        try:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
+        except Exception:
+            pass
+
+        q = (
+            select(VpnPeer)
+            .where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True, VpnPeer.server_code == server_code)  # noqa: E712
+            .order_by(VpnPeer.id.desc())
+            .limit(1)
+        )
+        res = await session.execute(q)
+        active = res.scalar_one_or_none()
+        if active:
+            return self._row_to_peer_dict(active)
+
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+
+        # Try restore last inactive for this server
+        q = (
+            select(VpnPeer)
+            .where(VpnPeer.tg_id == tg_id, VpnPeer.server_code == server_code)
+            .order_by(VpnPeer.id.desc())
+            .limit(1)
+        )
+        res = await session.execute(q)
+        last = res.scalar_one_or_none()
+        if last and not last.is_active:
+            log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
+            await provider.add_peer(last.client_public_key, last.client_ip)
+            last.is_active = True
+            last.revoked_at = None
+            last.rotation_reason = None
+            await session.flush()
+            return self._row_to_peer_dict(last)
+
+        client_ip = self._alloc_ip(tg_id)
+        client_priv, client_pub = gen_keys()
+        log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
+        await provider.add_peer(client_pub, client_ip)
+
+        row = VpnPeer(
+            tg_id=tg_id,
+            client_public_key=client_pub,
+            client_private_key_enc=crypto.encrypt(client_priv),
+            client_ip=client_ip,
+            server_code=server_code,
+            is_active=True,
+            revoked_at=None,
+            rotation_reason=None,
+        )
+        session.add(row)
+        await session.flush()
+        return {
+            "tg_id": tg_id,
+            "client_ip": client_ip,
+            "public_key": client_pub,
+            "client_private_key_enc": row.client_private_key_enc,
+            "client_private_key_plain": client_priv,
+        }
+
+    async def remove_peer_for_server(
+        self,
+        *,
+        public_key: str,
+        host: str,
+        port: int,
+        user: str,
+        password: str | None,
+        interface: str,
+    ) -> None:
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        await provider.remove_peer(public_key)
+
+    async def get_peer_handshake_for_server(
+        self,
+        *,
+        public_key: str,
+        host: str,
+        port: int,
+        user: str,
+        password: str | None,
+        interface: str,
+    ) -> int:
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        return await provider.get_peer_latest_handshake(public_key)
 
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
         """Manual reset: best-effort remove old peer then create/apply new peer."""
@@ -176,6 +303,7 @@ class VPNService:
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
+            server_code=None,
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
@@ -191,19 +319,31 @@ class VPNService:
             "client_private_key_plain": client_priv,
         }
 
-    def build_wg_conf(self, peer: Dict[str, Any], user_label: Optional[str] = None) -> str:
+    def build_wg_conf(
+        self,
+        peer: Dict[str, Any],
+        user_label: Optional[str] = None,
+        *,
+        server_public_key: str | None = None,
+        endpoint: str | None = None,
+        dns: str | None = None,
+    ) -> str:
         priv = peer.get("client_private_key_plain")
         if not priv:
             raise RuntimeError("Missing client_private_key_plain in peer dict.")
+
+        server_pub = server_public_key or self.server_pub
+        endpoint_v = endpoint or self.endpoint
+        dns_v = dns or self.dns
 
         return (
             "[Interface]\n"
             f"PrivateKey = {priv}\n"
             f"Address = {peer['client_ip']}/32\n"
-            f"DNS = {self.dns}\n\n"
+            f"DNS = {dns_v}\n\n"
             "[Peer]\n"
-            f"PublicKey = {self.server_pub}\n"
-            f"Endpoint = {self.endpoint}\n"
+            f"PublicKey = {server_pub}\n"
+            f"Endpoint = {endpoint_v}\n"
             "AllowedIPs = 0.0.0.0/0\n"
             "PersistentKeepalive = 25\n"
         )
