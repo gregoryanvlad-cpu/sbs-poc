@@ -186,10 +186,12 @@ async def _build_home_text() -> str:
     lines.append("")
     lines.append("Форма шифрования: <b>ChaCha20-Poly1305</b>")
 
-    return "🏠 <b>Главное меню</b>"
-
-" + "
-".join(lines)
+    # Safe string building (prevents SyntaxError due to unterminated literals)
+    return "\n".join([
+        "🏠 <b>Главное меню</b>",
+        "",
+        *lines,
+    ])
 
 
 
@@ -326,18 +328,14 @@ async def on_nav(cb: CallbackQuery) -> None:
         )
         try:
             await cb.message.edit_text(
-                "🚧 <b>Кинотека</b>
-
-Раздел находится в разработке. Скоро будет доступен ✨",
+                "🚧 <b>Кинотека</b>\n\nРаздел находится в разработке. Скоро будет доступен ✨",
                 reply_markup=kb,
                 parse_mode="HTML",
             )
         except Exception:
             try:
                 await cb.message.answer(
-                    "🚧 <b>Кинотека</b>
-
-Раздел находится в разработке. Скоро будет доступен ✨",
+                    "🚧 <b>Кинотека</b>\n\nРаздел находится в разработке. Скоро будет доступен ✨",
                     reply_markup=kb,
                     parse_mode="HTML",
                 )
