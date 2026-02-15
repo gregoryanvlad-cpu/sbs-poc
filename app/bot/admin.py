@@ -24,6 +24,19 @@ from app.db.session import session_scope
 from app.repo import get_price_rub, set_app_setting_int
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
+from app.services.regionvpn import RegionVpnService
+
+
+def _region_service() -> RegionVpnService:
+    return RegionVpnService(
+        ssh_host=settings.region_ssh_host,
+        ssh_port=settings.region_ssh_port,
+        ssh_user=settings.region_ssh_user,
+        ssh_password=settings.region_ssh_password,
+        xray_config_path=settings.region_xray_config_path,
+        xray_api_port=settings.region_xray_api_port,
+        max_clients=settings.region_max_clients,
+    )
 
 router = Router()
 
@@ -440,6 +453,96 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
     if len(recent) > shown:
         lines.append("")
         lines.append(f"Показано: <b>{shown}</b> (лимит 25)")
+
+    text = "\n".join(lines)
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: c.data == "admin:regionvpn:profiles")
+async def admin_regionvpn_profiles(cb: CallbackQuery) -> None:
+    """List provisioned VPN-Region profiles (VLESS clients in Xray config)."""
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    svc = _region_service()
+    try:
+        clients = await svc.list_clients()
+    except Exception:
+        text = (
+            "🌐 <b>VPN-Region профили</b>\n\n"
+            "⚠️ Не удалось подключиться к серверу/прочитать конфиг Xray (SSH).\n"
+            "Проверь REGION_* переменные и доступность сервера."
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+            else:
+                raise
+        return
+
+    # Parse tg_id from email "tg:<id>"
+    parsed: list[tuple[int | None, str, str]] = []
+    for c in clients:
+        email = (c.get("email") or "").strip()
+        cid = (c.get("id") or "").strip()
+        flow = (c.get("flow") or "").strip()
+        tid: int | None = None
+        if email.startswith("tg:"):
+            raw = email.split(":", 1)[1]
+            if raw.isdigit():
+                tid = int(raw)
+        elif email.isdigit():
+            tid = int(email)
+        parsed.append((tid, cid, flow))
+
+    # Resolve usernames for the first N entries
+    tg_ids = [tid for tid, _, _ in parsed if tid is not None]
+    tg_ids = list(dict.fromkeys(tg_ids))[:50]
+    labels: dict[int, str] = {}
+    if tg_ids:
+        res = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in tg_ids], return_exceptions=True)
+        for tid, lbl in zip(tg_ids, res):
+            if isinstance(lbl, Exception):
+                labels[tid] = f"ID {tid}"
+            else:
+                labels[tid] = str(lbl)
+
+    lines = [
+        "🌐 <b>VPN-Region профили</b>",
+        "",
+        f"Всего профилей в Xray: <b>{len(parsed)}</b>",
+        "",
+    ]
+
+    shown = 0
+    for tid, cid, flow in parsed:
+        shown += 1
+        who = labels.get(tid) if tid is not None else "(без tg_id)"
+        tid_s = "—" if tid is None else str(tid)
+        cid_s = cid[:8] + "…" if cid else "—"
+        flow_s = flow or "—"
+        lines.append(f"{shown}. {who} | uuid <code>{cid_s}</code> | flow {flow_s} | id <code>{tid_s}</code>")
+        if shown >= 30:
+            break
+
+    if len(parsed) > shown:
+        lines.append("")
+        lines.append(f"Показано: <b>{shown}</b> (лимит 30)")
 
     text = "\n".join(lines)
 
