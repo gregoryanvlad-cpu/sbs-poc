@@ -66,9 +66,9 @@ def _region_service() -> RegionVpnService:
 @router.callback_query(lambda c: c.data == "nav:region")
 async def on_nav_region(cb: CallbackQuery) -> None:
     text = (
-        "🌐 <b>VPN-Region</b>\\n\\n"
-        "Вы получите конфигурацию для протокола <b>VLESS + Reality</b>.\\n"
-        "Импорт можно сделать в приложении <b>Happ</b> (iOS) или любом клиенте, поддерживающем vless:// ссылки.\\n\\n"
+        "🌐 <b>VPN-Region</b>\n\n"
+        "Вы получите конфигурацию для протокола <b>VLESS + Reality</b>.\n"
+        "Импорт можно сделать в приложении <b>Happ</b> (iOS) или любом клиенте, поддерживающем vless:// ссылки.\n\n"
         f"Конфиг/QR будут удалены автоматически через <b>{settings.auto_delete_seconds} сек.</b>"
     )
     kb = InlineKeyboardMarkup(
@@ -104,7 +104,7 @@ async def on_region_get(cb: CallbackQuery) -> None:
                 used_gb = (up + down) / (1024 ** 3)
                 if used_gb >= settings.region_quota_gb:
                     await cb.message.answer(
-                        "⚠️ Достигнут лимит трафика для VPN-Region.\\n"
+                        "⚠️ Достигнут лимит трафика для VPN-Region.\n"
                         "Если это ошибка — обратитесь в поддержку."
                     )
                     await _safe_cb_answer(cb)
@@ -135,22 +135,22 @@ async def on_region_get(cb: CallbackQuery) -> None:
     # which sends a clickable link inside the message body.
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📲 Открыть в Happ", callback_data="region:open")],
+            [InlineKeyboardButton(text="📲 Импорт в Happ", callback_data="region:open")],
             [InlineKeyboardButton(text="🔄 Сбросить VPN-Region", callback_data="region:reset")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
         ]
     )
 
     msg1 = await cb.message.answer(
-        "✅ <b>VPN-Region конфиг готов</b>\\n\\n"
-        "1) Нажмите «📲 Открыть в Happ» и импортируйте.\\n"
-        "2) Или скопируйте ссылку ниже в любой VLESS-клиент.\\n\\n"
-        f"<code>{vless_url}</code>\\n\\n"
+        "✅ <b>VPN-Region конфиг готов</b>\n\n"
+        "Самый быстрый способ — отсканировать QR-код в Happ.\n"
+        "Или нажмите «📲 Импорт в Happ» — я пришлю ссылку отдельным сообщением (её можно скопировать/нажать).\n\n"
         f"Автоудаление через <b>{settings.auto_delete_seconds} сек.</b>",
         reply_markup=kb,
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+    msg_link = await cb.message.answer(vless_url)
     msg2 = await cb.message.answer_photo(
         photo=qr_file,
         caption="📷 QR для быстрого импорта (VPN-Region).",
@@ -165,6 +165,7 @@ async def on_region_get(cb: CallbackQuery) -> None:
             pass
 
     asyncio.create_task(_del_later(msg1.message_id))
+    asyncio.create_task(_del_later(msg_link.message_id))
     asyncio.create_task(_del_later(msg2.message_id))
 
     await _safe_cb_answer(cb)
@@ -181,14 +182,17 @@ async def on_region_open(cb: CallbackQuery) -> None:
         await _safe_cb_answer(cb)
         return
 
-    # Most clients will treat this as a clickable deep-link.
-    text = (
+    # Telegram often blocks custom schemes in HTML links/buttons, so we send the vless://
+    # URL as plain text in a separate message (it can be copied and sometimes opened by the OS).
+    await cb.message.answer(
         "📲 <b>Импорт в Happ</b>\n\n"
-        "Нажмите на ссылку ниже (она откроет приложение, если оно установлено):\n"
-        f"<a href=\"{vless_url}\">Открыть VPN-Region в Happ</a>\n\n"
-        "Если не открывается — скопируйте ссылку из сообщения с конфигом и вставьте в клиент вручную."
+        "1) Откройте Happ → «+» → Import from Clipboard (или Scan QR).\n"
+        "2) Я отправил(а) ссылку ниже — скопируйте её в буфер обмена и вставьте в Happ.\n\n"
+        "Если Happ не установлено — используйте любой клиент, поддерживающий VLESS (Reality).",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
-    await cb.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await cb.message.answer(vless_url)
     await _safe_cb_answer(cb)
 
 
