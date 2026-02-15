@@ -49,6 +49,10 @@ VPN_BUNDLE_COUNTER: dict[int, tuple[str, int]] = {}
 
 IOS_GUIDE_MEDIA: dict[int, list[int]] = {}
 
+# Auto payment status watchers (in-process). Keyed by Payment.id.
+_PAY_WATCH_TASKS: dict[int, asyncio.Task] = {}
+
+
 
 def _today_key() -> str:
     """Return current date key used for per-day counters (UTC)."""
@@ -115,21 +119,78 @@ def _fmt_instruction_block(lines: list[str]) -> str:
 
 
 async def _build_home_text() -> str:
-    """Main menu text with best-effort VPN status."""
-    line = "🌍 VPN: статус недоступен"
-    try:
-        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
-        if st.get("ok"):
-            cpu = st.get("cpu_load_percent")
-            act = st.get("active_peers")
-            tot = st.get("total_peers")
-            if cpu is not None and act is not None and tot is not None:
-                cpu_str = f"{cpu:.1f}%" if cpu >= 0.1 else ("&lt;0.1%" if cpu > 0 else "0.0%")
-                line = f"🌍 Нагрузка на VPN сейчас составляет: <b>{cpu_str}</b>"
-    except Exception:
-        pass
+    """Main menu text with best-effort VPN status (supports optional multi-server display).
 
-    return "🏠 <b>Главное меню</b>\n" + line
+    If VPN_SERVERS_JSON is provided (list of servers), we will try to query each server status.
+    Otherwise we show a single status line for the current WG_SSH_* server.
+    """
+    import os
+    lines: list[str] = []
+
+    servers_json = (os.environ.get("VPN_SERVERS_JSON") or "").strip()
+    if servers_json:
+        try:
+            servers = json.loads(servers_json)
+        except Exception:
+            servers = []
+    else:
+        servers = []
+
+    # Default showcase list (can be overridden by VPN_SERVERS_JSON).
+    if not servers:
+        servers = [
+            {"code": os.environ.get("VPN_COUNTRY_CODE", "NL"), "name": os.environ.get("VPN_NAME", "VPN-Нидерланды")},
+            {"code": "DE", "name": "VPN-Германия"},
+            {"code": "TR", "name": "VPN-Турция"},
+            {"code": "US", "name": "VPN-США"},
+        ]
+
+    def _flag(code: str) -> str:
+        code = (code or "").upper()
+        flags = {"NL": "🇳🇱", "DE": "🇩🇪", "TR": "🇹🇷", "US": "🇺🇸"}
+        return flags.get(code, "🌍")
+
+    async def _fmt_status(srv: dict) -> str:
+        # If host/user are missing, treat as not connected yet.
+        if not srv.get("host") or not srv.get("user"):
+            return "Недоступно"
+
+        try:
+            st = await asyncio.wait_for(
+                vpn_service.get_server_status_for(
+                    host=str(srv["host"]),
+                    port=int(srv.get("port", 22)),
+                    user=str(srv["user"]),
+                    password=(srv.get("password") or None),
+                    interface=str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                ),
+                timeout=4,
+            )
+            if st.get("ok") and st.get("cpu_load_percent") is not None:
+                cpu = float(st["cpu_load_percent"])
+                cpu_str = f"{cpu:.1f}%" if cpu >= 0.1 else ("&lt;0.1%" if cpu > 0 else "0.0%")
+                return cpu_str
+        except Exception:
+            pass
+        return "Подключается..."
+
+    for srv in servers:
+        code = str(srv.get("code") or "").upper() or "??"
+        name = str(srv.get("name") or f"VPN-{code}")
+        load = await _fmt_status(srv)
+        if load in ("Недоступно", "Подключается..."):
+            lines.append(f'🌍{_flag(code)} "{name}", нагрузка: <b>{load}</b>')
+        else:
+            lines.append(f'🌍{_flag(code)} "{name}", нагрузка составляет: <b>{load}</b>')
+
+    lines.append("")
+    lines.append("Форма шифрования: <b>ChaCha20-Poly1305</b>")
+
+    return "🏠 <b>Главное меню</b>
+
+" + "
+".join(lines)
+
 
 
 def _is_sub_active(sub_end_at: datetime | None) -> bool:
@@ -255,26 +316,33 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "kinoteka":
-        async with session_scope() as session:
-            sub = await get_subscription(session, cb.from_user.id)
-
-        if not _is_sub_active(sub.end_at):
-            await cb.message.answer(
-                "⛔️ Подписка не активна.\n\n"
-                "Раздел <b>Кинотека</b> доступен только при активной подписке.",
-                parse_mode="HTML",
-            )
-            return
-
+        # Temporarily closed: feature is in development.
+        try:
+            await cb.answer()
+        except Exception:
+            pass
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+        )
         try:
             await cb.message.edit_text(
-                "🎬 <b>Кинотека</b>\n\n"
-                "Найду фильм/сериал по названию и покажу карточку с рейтингами.",
-                reply_markup=kb_kinoteka(),
+                "🚧 <b>Кинотека</b>
+
+Раздел находится в разработке. Скоро будет доступен ✨",
+                reply_markup=kb,
                 parse_mode="HTML",
             )
         except Exception:
-            pass
+            try:
+                await cb.message.answer(
+                    "🚧 <b>Кинотека</b>
+
+Раздел находится в разработке. Скоро будет доступен ✨",
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return
 
     if where == "referrals":
@@ -512,6 +580,104 @@ async def on_buy(cb: CallbackQuery) -> None:
     return
 
 
+
+async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) -> None:
+    """Poll Platega status every 5 seconds and auto-confirm payment when it becomes successful.
+
+    This is best-effort: if the process restarts, the watcher stops (manual check still works).
+    """
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from app.services.payments.platega import PlategaClient, PlategaError
+    from app.db.models import Payment
+
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        return
+
+    client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
+
+    # up to 10 minutes
+    for _ in range(int(600 / 5)):
+        await asyncio.sleep(5)
+
+        try:
+            async with session_scope() as session:
+                pay = await session.get(Payment, payment_db_id)
+                if not pay or pay.tg_id != tg_id:
+                    return
+                if pay.status in ("success", "failed"):
+                    return
+                provider_tid = pay.provider_payment_id
+                if not provider_tid:
+                    return
+
+                try:
+                    st = await client.get_transaction_status(transaction_id=provider_tid)
+                except PlategaError:
+                    continue
+
+                status = (st.status or "").upper()
+                if status in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
+                    # Reuse the same logic as manual check
+                    sub = await get_subscription(session, tg_id)
+                    now = utcnow()
+                    base = sub.end_at if sub.end_at and sub.end_at > now else now
+                    new_end = base + relativedelta(months=settings.period_months)
+
+                    await extend_subscription(
+                        session,
+                        tg_id,
+                        months=settings.period_months,
+                        days_legacy=settings.period_days,
+                        amount_rub=int(pay.amount),
+                        provider="platega",
+                        status="success",
+                        provider_payment_id=provider_tid,
+                    )
+
+                    pay.status = "success"
+                    await referral_service.on_successful_payment(session, pay)
+
+                    sub.end_at = new_end
+                    sub.is_active = True
+                    sub.status = "active"
+                    await session.commit()
+
+                    try:
+                        await bot.send_message(
+                            tg_id,
+                            "✅ <b>Оплата подтверждена!</b>\n\nПодписка активирована.",
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(
+                                inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                if status in ("FAILED", "CANCELLED", "EXPIRED", "REJECTED"):
+                    pay.status = "failed"
+                    await session.commit()
+                    return
+        except Exception:
+            # keep polling on transient errors
+            continue
+
+
+def _ensure_pay_watch_task(bot, *, payment_db_id: int, tg_id: int) -> None:
+    """Start a single watcher task per payment id (idempotent)."""
+    t = _PAY_WATCH_TASKS.get(payment_db_id)
+    if t and not t.done():
+        return
+
+    async def _runner():
+        try:
+            await _auto_watch_platega_payment(bot, payment_db_id=payment_db_id, tg_id=tg_id)
+        finally:
+            _PAY_WATCH_TASKS.pop(payment_db_id, None)
+
+    _PAY_WATCH_TASKS[payment_db_id] = asyncio.create_task(_runner())
+
 async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
     """Creates a Platega transaction and sends user the payment link + check button."""
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -605,6 +771,9 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
         reply_markup=kb,
         parse_mode="HTML",
     )
+
+    # Start auto-checking payment status (best-effort, every 5 seconds)
+    _ensure_pay_watch_task(cb.bot, payment_db_id=payment_db_id, tg_id=tg_id)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("pay:check:"))
