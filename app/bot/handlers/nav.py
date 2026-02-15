@@ -1104,8 +1104,29 @@ async def _start_vpn_migration_watch(
         t.cancel()
 
     async def _run() -> None:
+        # IMPORTANT:
+        # A peer on the target server can already have a previous handshake
+        # (e.g., user re-selects the same location or reuses an existing peer).
+        # If we only check `hs >= start_ts`, clock skew or a recent handshake
+        # may immediately trigger migration and disable the old peer *too early*.
+        #
+        # So we snapshot the current handshake first, and only treat as "migrated"
+        # when the handshake value *changes*.
         start_ts = int(utcnow().timestamp())
         deadline = start_ts + 15 * 60  # 15 minutes
+        try:
+            hs0 = await vpn_service.get_peer_handshake_for_server(
+                public_key=new_public_key,
+                host=str(new_srv["host"]),
+                port=int(new_srv.get("port") or 22),
+                user=str(new_srv["user"]),
+                password=new_srv.get("password"),
+                interface=str(new_srv.get("interface") or "wg0"),
+            )
+            hs0 = int(hs0 or 0)
+        except Exception:
+            hs0 = 0
+
         while int(utcnow().timestamp()) < deadline:
             try:
                 hs = await vpn_service.get_peer_handshake_for_server(
@@ -1116,10 +1137,12 @@ async def _start_vpn_migration_watch(
                     password=new_srv.get("password"),
                     interface=str(new_srv.get("interface") or "wg0"),
                 )
+                hs = int(hs or 0)
             except Exception:
                 hs = 0
 
-            if hs and int(hs) >= start_ts:
+            # Trigger only when we observe a *new* handshake after watcher started.
+            if hs and hs > hs0 and hs >= start_ts - 5:
                 # User has connected to the new location — disable old peers right away.
                 async with session_scope() as session:
                     for old_srv, old_pub in old_peers:
@@ -1151,6 +1174,7 @@ async def _start_vpn_migration_watch(
                     await bot.send_message(
                         tg_id,
                         "✅ <b>Локация переключена</b>\n\nСтарый конфиг отключён, вы подключены к новому серверу.",
+                        reply_markup=kb_back_home(),
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -1164,6 +1188,51 @@ async def _start_vpn_migration_watch(
 
 @router.callback_query(lambda c: c.data and c.data.startswith("vpn:loc:sel:"))
 async def on_vpn_location_select(cb: CallbackQuery) -> None:
+    # Step 1: show a warning + confirmation.
+    # We do NOT generate or revoke anything here.
+    tg_id = cb.from_user.id
+    parts = (cb.data or "").split(":")
+    if len(parts) != 4:
+        await _safe_cb_answer(cb)
+        return
+    code = parts[3].upper()
+
+    # Require active subscription
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            return
+
+    servers = _load_vpn_servers()
+    srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
+    if not srv or not _server_is_ready(srv):
+        await cb.answer("Сервер пока недоступен", show_alert=True)
+        return
+
+    warn = (
+        "⚠️ <b>Внимание</b>\n\n"
+        "После того как вы подключитесь к новой локации, <b>старый VPN-конфиг будет отключён</b>.\n"
+        "Чтобы не потерять интернет в момент переключения, рекомендуется <b>выключить VPN</b> перед сменой и включить уже с новым конфигом.\n\n"
+        f"Переключить на {_vpn_flag(code)} <b>{srv['name']}</b>?"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Продолжить", callback_data=f"vpn:loc:go:{code}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:loc")],
+        ]
+    )
+
+    try:
+        await cb.message.edit_text(warn, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    return
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("vpn:loc:go:"))
+async def on_vpn_location_go(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
     parts = (cb.data or "").split(":")
     if len(parts) != 4:
@@ -1233,13 +1302,30 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
     conf_file = BufferedInputFile(conf_text.encode(), filename=_next_vpn_bundle_filename(tg_id))
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
-    await cb.message.answer_document(
+    msg_conf = await cb.message.answer_document(
         document=conf_file,
-        caption=f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
-        "Старый конфиг отключится сразу после подключения к новой локации.",
+        caption=(
+            f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
+            "⚠️ После подключения к новой локации <b>старый конфиг будет отключён</b>.\n"
+            "Рекомендуем на время переключения выключить VPN, затем включить с новым конфигом.\n\n"
+            f"Конфиг будет удалён через <b>{settings.auto_delete_seconds} сек.</b>"
+        ),
         parse_mode="HTML",
     )
-    await cb.message.answer_photo(photo=qr_file, caption="QR для WireGuard")
+    msg_qr = await cb.message.answer_photo(
+        photo=qr_file,
+        caption=f"QR для WireGuard (удалится через {settings.auto_delete_seconds} сек.)",
+    )
+
+    async def _cleanup_msgs() -> None:
+        await asyncio.sleep(settings.auto_delete_seconds)
+        for m in (msg_conf, msg_qr):
+            try:
+                await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=m.message_id)
+            except Exception:
+                pass
+
+    asyncio.create_task(_cleanup_msgs())
 
     await cb.answer("Конфиг отправлен")
 
