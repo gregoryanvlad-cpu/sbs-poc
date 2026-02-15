@@ -7,5 +7,6 @@ This package is intentionally small and defensive:
 """
 
 from .service import RegionVpnService
+from .guard import region_session_guard_loop
 
-__all__ = ["RegionVpnService"]
+__all__ = ["RegionVpnService", "region_session_guard_loop"]
