@@ -66,6 +66,14 @@ class RegionVpnService:
             except Exception:
                 log.warning("[regionvpn] Failed to load REGION_SSH_PRIVATE_KEY_B64")
 
+        # tc/ifb rate limit parameters (optional)
+        self._tc_enabled = os.getenv("REGION_TC_ENABLED", "").strip().lower() in ("1", "true", "yes", "y", "on")
+        try:
+            self._tc_rate_mbit = int(os.getenv("REGION_TC_RATE_MBIT", "25").strip() or "25")
+        except Exception:
+            self._tc_rate_mbit = 25
+        self._tc_dev = (os.getenv("REGION_TC_DEV", "eth0") or "eth0").strip() or "eth0"
+
     def _validate(self) -> None:
         if not self.ssh_host:
             raise RuntimeError("region_not_configured")
@@ -97,6 +105,10 @@ class RegionVpnService:
                 last = e
                 await asyncio.sleep(0.5)
         raise last  # type: ignore[misc]
+
+    async def _restart_xray(self) -> None:
+        # Use systemd restart; keep it centralized so other methods can call it.
+        await self._run("sudo systemctl restart xray")
 
     async def _run(self, cmd: str) -> None:
         await self._run_output(cmd, check=True)
@@ -283,11 +295,9 @@ class RegionVpnService:
         """Read last N lines from Xray access log via SSH."""
         cmd = f"tail -n {int(lines)} {path}"
         try:
-            stdout, _ = await self._run_ssh(cmd)
+            text = (await self._run_output(cmd, check=False) or "").strip()
         except Exception:
-            # Access log might be missing; return empty.
             return []
-        text = (stdout or "").strip()
         if not text:
             return []
         return text.splitlines()
@@ -406,11 +416,9 @@ class RegionVpnService:
             return
 
         cfg = await self._read_xray_config()
-        inbound = self._find_vless_inbound(cfg)
-        if not inbound:
-            raise RuntimeError("VLESS inbound not found in Xray config")
-        self._ensure_region_inbound_tag(inbound)
-        inbound_tag = self._get_region_inbound_tag(inbound)
+        ref = self._find_vless_inbound(cfg)
+        self._ensure_region_inbound_tag(ref.inbound)
+        inbound_tag = self._get_region_inbound_tag(ref.inbound)
 
         # Make sure required outbounds exist
         self._ensure_outbound_tag(cfg, tag="direct", protocol="freedom")
@@ -425,13 +433,84 @@ class RegionVpnService:
         await self._write_xray_config(cfg)
         await self._restart_xray()
 
+    # ------------------------------
+    # tc/ifb per-IP rate limits (optional)
+    # ------------------------------
+
+    def _tc_class_for_tg(self, tg_id: int) -> int:
+        """Stable tc class (minor id) for a Telegram user id.
+
+        We keep it within 10..65000 to be safe.
+        """
+        base = 10
+        span = 65000 - base
+        return base + (int(tg_id) % span)
+
+    async def _tc_init(self) -> None:
+        """Ensure base tc qdiscs exist (eth0 + ifb0 ingress redirect)."""
+        dev = self._tc_dev
+        # Create ifb0 and redirect ingress -> ifb0
+        cmd = (
+            "sudo modprobe ifb || true; "
+            "sudo ip link add ifb0 type ifb 2>/dev/null || true; "
+            "sudo ip link set dev ifb0 up; "
+            f"sudo tc qdisc add dev {dev} handle ffff: ingress 2>/dev/null || true; "
+            f"sudo tc filter add dev {dev} parent ffff: protocol ip u32 match u32 0 0 "
+            "action mirred egress redirect dev ifb0 2>/dev/null || true; "
+            # Root HTB on egress
+            f"sudo tc qdisc add dev {dev} root handle 1: htb default 999 r2q 10 2>/dev/null || true; "
+            f"sudo tc class add dev {dev} parent 1: classid 1:1 htb rate 1gbit ceil 1gbit 2>/dev/null || true; "
+            # Root HTB on ifb0 (ingress shaped)
+            "sudo tc qdisc add dev ifb0 root handle 2: htb default 999 r2q 10 2>/dev/null || true; "
+            "sudo tc class add dev ifb0 parent 2: classid 2:1 htb rate 1gbit ceil 1gbit 2>/dev/null || true"
+        )
+        await self._run(cmd)
+
+    async def tc_apply_limit_for_ip(self, *, tg_id: int, ip: str) -> None:
+        """(Best-effort) apply 25mbit per-IP limit for both directions."""
+        if not self._tc_enabled:
+            return
+        ip = (ip or "").strip()
+        if not ip:
+            return
+        await self._tc_init()
+        dev = self._tc_dev
+        rate = max(1, int(self._tc_rate_mbit))
+        cls = self._tc_class_for_tg(int(tg_id))
+
+        # Delete any previous rules for this class, then add fresh rules for this IP.
+        # We delete by classid first (ignore errors) and then add filters.
+        cmd = (
+            f"sudo tc class del dev {dev} classid 1:{cls} 2>/dev/null || true; "
+            f"sudo tc class del dev ifb0 classid 2:{cls} 2>/dev/null || true; "
+            # best-effort: remove existing filters that reference this class (by flowid)
+            f"sudo tc filter show dev {dev} parent 1: | awk '/flowid 1:{cls}/{{print $0}}' >/dev/null 2>&1 || true; "
+            # add classes
+            f"sudo tc class add dev {dev} parent 1:1 classid 1:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
+            f"sudo tc filter add dev {dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls} 2>/dev/null || true; "
+            f"sudo tc class add dev ifb0 parent 2:1 classid 2:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
+            f"sudo tc filter add dev ifb0 protocol ip parent 2: prio {cls} u32 match ip src {ip}/32 flowid 2:{cls} 2>/dev/null || true"
+        )
+        await self._run(cmd)
+
+    async def tc_clear_limit_for_ip(self, *, tg_id: int, ip: str | None = None) -> None:
+        """Remove tc class for the tg_id (and any best-effort filters)."""
+        if not self._tc_enabled:
+            return
+        dev = self._tc_dev
+        cls = self._tc_class_for_tg(int(tg_id))
+        cmd = (
+            f"sudo tc class del dev {dev} classid 1:{cls} 2>/dev/null || true; "
+            f"sudo tc class del dev ifb0 classid 2:{cls} 2>/dev/null || true"
+        )
+        await self._run(cmd)
+
     async def clear_user_policy(self, tg_id: int) -> None:
         """Remove routing rules for the given user (no restriction)."""
         cfg = await self._read_xray_config()
-        inbound = self._find_vless_inbound(cfg)
-        if not inbound:
-            return
-        inbound_tag = self._get_region_inbound_tag(inbound)
+        ref = self._find_vless_inbound(cfg)
+        self._ensure_region_inbound_tag(ref.inbound)
+        inbound_tag = self._get_region_inbound_tag(ref.inbound)
         rules = self._ensure_routing_rules_list(cfg)
         email = self._email_for_tg(int(tg_id))
         self._remove_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email)
