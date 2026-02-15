@@ -199,7 +199,7 @@ async def _build_home_text() -> str:
             lines.append(f'🌍{_flag(code)} "{name}", нагрузка составляет: <b>{load}</b>')
 
     lines.append("")
-    lines.append("Форма шифрования: <b>ChaCha20-Poly1305</b>")
+    lines.append("🔐 Форма шифрования: <b>ChaCha20-Poly1305</b>")
 
     # Safe string building (prevents SyntaxError due to unterminated literals)
     return "\n".join([
