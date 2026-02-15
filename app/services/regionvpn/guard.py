@@ -47,7 +47,8 @@ async def region_session_guard_loop(bot: Bot) -> None:
     Policy: the most recently connected device becomes active.
     Previous device keeps the config, but its traffic is blackholed until it reconnects (and becomes the latest).
     """
-    if not settings.regionvpn_enabled:
+    # Enabled only when VPN-Region is configured.
+    if not getattr(settings, "region_ssh_host", ""):
         return
     if not getattr(settings, "region_session_guard_enabled", True):
         return
@@ -55,7 +56,15 @@ async def region_session_guard_loop(bot: Bot) -> None:
     period = max(2, int(getattr(settings, "region_session_guard_period_seconds", 5)))
     access_path = getattr(settings, "region_access_log_path", "/var/log/xray/access.log")
 
-    svc = RegionVpnService()
+    svc = RegionVpnService(
+        ssh_host=settings.region_ssh_host,
+        ssh_port=settings.region_ssh_port,
+        ssh_user=settings.region_ssh_user,
+        ssh_password=settings.region_ssh_password,
+        xray_config_path=settings.region_xray_config_path,
+        xray_api_port=settings.region_xray_api_port,
+        max_clients=settings.region_max_clients,
+    )
 
     last_dt: datetime | None = None
 
@@ -103,6 +112,15 @@ async def region_session_guard_loop(bot: Bot) -> None:
             if switches:
                 # Apply all routing changes in one restart
                 await svc.apply_active_ip_map({tg_id: ip for tg_id, ip in switches.items()})
+
+                # Optional per-user bandwidth limit (tc/ifb) on the VPN-Region server.
+                # This is best-effort: even if tc fails, routing policy still works.
+                if getattr(settings, "region_tc_enabled", False):
+                    for tg_id, ip in switches.items():
+                        try:
+                            await svc.tc_apply_limit_for_ip(tg_id=int(tg_id), ip=str(ip))
+                        except Exception:
+                            log.exception("Failed to apply tc limit for tg=%s ip=%s", tg_id, ip)
 
             for tg_id, old_ip, new_ip in notify:
                 try:
