@@ -141,6 +141,28 @@ class WireGuardSSHProvider:
                 res[key] = ts
         return res
 
+    async def has_peer(self, public_key: str) -> bool:
+        """Check if a peer exists on the interface (best-effort)."""
+        if not public_key:
+            return False
+        try:
+            out = await self._run_output(f"{WG_BIN} show {self.interface} peers", check=False)
+        except Exception:
+            return False
+        if not out:
+            return False
+        return public_key.strip() in {ln.strip() for ln in out.splitlines() if ln.strip()}
+
+    async def get_peer_latest_handshake(self, public_key: str) -> int:
+        """Return latest handshake unix ts for a specific peer (0 if never/unknown)."""
+        if not public_key:
+            return 0
+        try:
+            hs = await self.get_latest_handshakes()
+        except Exception:
+            return 0
+        return int(hs.get(public_key, 0) or 0)
+
     async def get_cpu_load_percent(self, sample_seconds: int = 1) -> float:
         """Compute CPU usage percent using /proc/stat deltas.
 
