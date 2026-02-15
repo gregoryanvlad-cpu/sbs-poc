@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.session import init_engine
 from app.scheduler.worker import run_scheduler
+from app.services.regionvpn import region_session_guard_loop
 
 log = logging.getLogger(__name__)
 
@@ -57,10 +58,23 @@ async def main() -> None:
     scheduler_task = None
     if settings.scheduler_enabled:
         scheduler_task = asyncio.create_task(run_scheduler(), name="scheduler")
+    region_task = None
     try:
         bot, dp = run_bot()
+        # VPN-Region single-device guard (runs only when REGIONVPN is enabled)
+        try:
+            if getattr(settings, "regionvpn_enabled", False) and getattr(settings, "region_session_guard_enabled", True):
+                region_task = asyncio.create_task(region_session_guard_loop(bot), name="region_session_guard")
+        except Exception:
+            region_task = None
+
         await dp.start_polling(bot)
     finally:
+        if region_task:
+            region_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await region_task
+
         if scheduler_task:
             scheduler_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
