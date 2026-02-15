@@ -43,6 +43,7 @@ def kb_vpn() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
+    b.button(text="🌍 Сменить локацию", callback_data="vpn:loc")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
