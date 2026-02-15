@@ -248,8 +248,17 @@ class RegionVpnService:
         removed = len(ref.clients) != before
 
         if removed:
+            # Also remove any routing policy rules for this user (single-device enforcement).
+            try:
+                inbound_tag = self._get_region_inbound_tag(ref.inbound)
+                rules = self._ensure_routing_rules_list(cfg)
+                for email in email_variants:
+                    self._remove_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email)
+            except Exception:
+                pass
+
             await self._write_xray_config(cfg)
-            await self._run("sudo systemctl restart xray")
+            await self._restart_xray()
 
         return removed
 
@@ -269,6 +278,165 @@ class RegionVpnService:
                     "flow": str(c.get("flow") or ""),
                 })
         return out
+
+    async def tail_access_log(self, *, path: str, lines: int = 200) -> list[str]:
+        """Read last N lines from Xray access log via SSH."""
+        cmd = f"tail -n {int(lines)} {path}"
+        try:
+            stdout, _ = await self._run_ssh(cmd)
+        except Exception:
+            # Access log might be missing; return empty.
+            return []
+        text = (stdout or "").strip()
+        if not text:
+            return []
+        return text.splitlines()
+
+    # ------------------------------
+    # Single-device enforcement
+    # ------------------------------
+
+    def _ensure_region_inbound_tag(self, inbound: dict) -> None:
+        # Use a stable inboundTag so routing rules can target only VPN-Region traffic.
+        if not inbound.get("tag"):
+            inbound["tag"] = "regionvpn"
+        elif inbound.get("tag") != "regionvpn":
+            # Do NOT override a custom tag set by user; instead keep it and use it.
+            # But we still need a tag for our rules: store it for later.
+            pass
+
+    def _get_region_inbound_tag(self, inbound: dict) -> str:
+        tag = (inbound.get("tag") or "").strip()
+        return tag or "regionvpn"
+
+    def _ensure_outbound_tag(self, cfg: dict, *, tag: str, protocol: str) -> None:
+        outbounds = cfg.get("outbounds")
+        if not isinstance(outbounds, list):
+            outbounds = []
+            cfg["outbounds"] = outbounds
+        for ob in outbounds:
+            if isinstance(ob, dict) and ob.get("tag") == tag:
+                return
+        outbounds.append({"protocol": protocol, "tag": tag})
+
+    def _ensure_routing_rules_list(self, cfg: dict) -> list[dict]:
+        routing = cfg.get("routing")
+        if not isinstance(routing, dict):
+            routing = {}
+            cfg["routing"] = routing
+        rules = routing.get("rules")
+        if not isinstance(rules, list):
+            rules = []
+            routing["rules"] = rules
+        return rules  # type: ignore[return-value]
+
+    def _email_for_tg(self, tg_id: int) -> str:
+        return f"tg:{int(tg_id)}"
+
+    def _is_regionvpn_rule_for_user(self, rule: dict, *, inbound_tag: str, email: str) -> bool:
+        if not isinstance(rule, dict):
+            return False
+        if rule.get("type") != "field":
+            return False
+        it = rule.get("inboundTag")
+        if isinstance(it, list) and inbound_tag in it:
+            pass
+        else:
+            return False
+        user = rule.get("user")
+        if not (isinstance(user, list) and email in user):
+            return False
+        # Only touch rules that route to direct/blocked and optionally have source.
+        ot = rule.get("outboundTag")
+        if ot not in ("direct", "blocked"):
+            return False
+        return True
+
+    def _remove_regionvpn_rules_for_user(self, rules: list[dict], *, inbound_tag: str, email: str) -> None:
+        kept: list[dict] = []
+        for r in rules:
+            if self._is_regionvpn_rule_for_user(r, inbound_tag=inbound_tag, email=email):
+                continue
+            kept.append(r)
+        rules[:] = kept
+
+    def _upsert_regionvpn_rules_for_user(
+        self,
+        rules: list[dict],
+        *,
+        inbound_tag: str,
+        email: str,
+        active_ip: str | None,
+    ) -> None:
+        """Upsert 2 routing rules:
+
+        1) Allow traffic for (user=email AND source=active_ip) -> direct
+        2) Everything else for that user -> blocked (blackhole)
+
+        IMPORTANT: We intentionally do NOT block connection handshake itself. The client can connect,
+        but if it's not the active IP, all its outbound traffic is blackholed. This allows us to
+        detect a new device via access.log and then switch "active_ip" quickly.
+        """
+        self._remove_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email)
+
+        if active_ip:
+            allow_rule = {
+                "type": "field",
+                "inboundTag": [inbound_tag],
+                "user": [email],
+                "source": [f"{active_ip}/32"],
+                "outboundTag": "direct",
+            }
+            rules.insert(0, allow_rule)
+
+            deny_rule = {
+                "type": "field",
+                "inboundTag": [inbound_tag],
+                "user": [email],
+                "outboundTag": "blocked",
+            }
+            rules.insert(1, deny_rule)
+        else:
+            # No active IP yet -> do not restrict (first connection will be discovered in logs).
+            return
+
+    async def apply_active_ip_map(self, active_ip_by_tg: dict[int, str | None]) -> None:
+        """Apply/refresh routing rules for multiple users in a single config update + restart."""
+        if not active_ip_by_tg:
+            return
+
+        cfg = await self._read_xray_config()
+        inbound = self._find_vless_inbound(cfg)
+        if not inbound:
+            raise RuntimeError("VLESS inbound not found in Xray config")
+        self._ensure_region_inbound_tag(inbound)
+        inbound_tag = self._get_region_inbound_tag(inbound)
+
+        # Make sure required outbounds exist
+        self._ensure_outbound_tag(cfg, tag="direct", protocol="freedom")
+        self._ensure_outbound_tag(cfg, tag="blocked", protocol="blackhole")
+
+        rules = self._ensure_routing_rules_list(cfg)
+
+        for tg_id, ip in active_ip_by_tg.items():
+            email = self._email_for_tg(int(tg_id))
+            self._upsert_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email, active_ip=ip)
+
+        await self._write_xray_config(cfg)
+        await self._restart_xray()
+
+    async def clear_user_policy(self, tg_id: int) -> None:
+        """Remove routing rules for the given user (no restriction)."""
+        cfg = await self._read_xray_config()
+        inbound = self._find_vless_inbound(cfg)
+        if not inbound:
+            return
+        inbound_tag = self._get_region_inbound_tag(inbound)
+        rules = self._ensure_routing_rules_list(cfg)
+        email = self._email_for_tg(int(tg_id))
+        self._remove_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email)
+        await self._write_xray_config(cfg)
+        await self._restart_xray()
 
     async def get_user_traffic_bytes(self, tg_id: int) -> Optional[Tuple[int, int]]:
         """Best-effort traffic stats (up, down).
