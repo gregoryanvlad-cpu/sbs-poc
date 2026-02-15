@@ -88,6 +88,18 @@ class Settings:
     player_whitelist_domains: tuple[str, ...] = ("youtube.com", "youtu.be")
     player_rate_limit_per_minute: int = 15
 
+    # --- VPN-Region (VLESS+Reality via Xray) ---
+    # NOTE: VLESS/Reality link parameters are read directly from env in regionvpn.service.
+    # Here we keep only SSH + Xray control parameters used by the bot.
+    region_ssh_host: str = ""
+    region_ssh_port: int = 22
+    region_ssh_user: str = "root"
+    region_ssh_password: str | None = None
+    region_xray_config_path: str = "/usr/local/etc/xray/config.json"
+    region_xray_api_port: int = 10085
+    region_max_clients: int = 40
+    region_quota_gb: int = 0  # 0 = no quota enforcement
+
 
 def _load_settings() -> Settings:
     # Bot1 uses BOT_TOKEN, Bot2 can use PLAYER_BOT_TOKEN.
@@ -154,17 +166,17 @@ def _load_settings() -> Settings:
             if d.strip()
         ),
         player_rate_limit_per_minute=int(os.getenv("PLAYER_RATE_LIMIT_PER_MINUTE", "15")),
+
+        # VPN-Region (VLESS+Reality)
+        region_ssh_host=os.getenv("REGION_SSH_HOST", "").strip(),
+        region_ssh_port=int(os.getenv("REGION_SSH_PORT", "22")),
+        region_ssh_user=os.getenv("REGION_SSH_USER", "root").strip(),
+        region_ssh_password=(os.getenv("REGION_SSH_PASSWORD") or "").strip() or None,
+        region_xray_config_path=os.getenv("REGION_XRAY_CONFIG_PATH", "/usr/local/etc/xray/config.json").strip(),
+        region_xray_api_port=int(os.getenv("REGION_XRAY_API_PORT", "10085")),
+        region_max_clients=int(os.getenv("REGION_MAX_CLIENTS", "40")),
+        region_quota_gb=int(os.getenv("REGION_QUOTA_GB", "0")),
     )
 
 
 settings = _load_settings()
-
-    # --- VPN-Region (VLESS+Reality) ---
-    region_ssh_host: str = os.environ.get("REGION_SSH_HOST", "")
-    region_ssh_port: int = int(os.environ.get("REGION_SSH_PORT", "22"))
-    region_ssh_user: str = os.environ.get("REGION_SSH_USER", "root")
-    region_ssh_password: str | None = os.environ.get("REGION_SSH_PASSWORD")
-    region_xray_config_path: str = os.environ.get("REGION_XRAY_CONFIG_PATH", "/usr/local/etc/xray/config.json")
-    region_xray_api_port: int = int(os.environ.get("REGION_XRAY_API_PORT", "10085"))
-    region_max_clients: int = int(os.environ.get("REGION_MAX_CLIENTS", "40"))
-    region_quota_gb: int = int(os.environ.get("REGION_QUOTA_GB", "0"))  # 0 = no quota enforcement
