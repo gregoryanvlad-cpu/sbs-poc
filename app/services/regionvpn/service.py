@@ -251,28 +251,38 @@ class RegionVpnService:
         cfg = await self._read_xray_config()
         ref = self._find_vless_inbound(cfg)
 
-        before = len(ref.clients)
+        before_clients = len(ref.clients)
         ref.clients[:] = [
             c
             for c in ref.clients
             if not (isinstance(c, dict) and str(c.get("email") or "") in email_variants)
         ]
-        removed = len(ref.clients) != before
+        removed = len(ref.clients) != before_clients
 
-        if removed:
-            # Also remove any routing policy rules for this user (single-device enforcement).
-            try:
-                inbound_tag = self._get_region_inbound_tag(ref.inbound)
-                rules = self._ensure_routing_rules_list(cfg)
-                for email in email_variants:
-                    self._remove_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email)
-            except Exception:
-                pass
+        # Also remove any routing policy rules for this user (single-device enforcement).
+        rules_removed = False
+        try:
+            inbound_tag = self._get_region_inbound_tag(ref.inbound)
+            rules = self._ensure_routing_rules_list(cfg)
+            before_rules = len(rules)
+            for email in email_variants:
+                self._remove_regionvpn_rules_for_user(rules, inbound_tag=inbound_tag, email=email)
+            rules_removed = len(rules) != before_rules
+        except Exception:
+            pass
 
+        if removed or rules_removed:
             await self._write_xray_config(cfg)
             await self._restart_xray()
 
+        # Best-effort: clear traffic shaping for this tg_id.
+        try:
+            await self.tc_clear_limit_for_ip(tg_id=tg_id)
+        except Exception:
+            pass
+
         return removed
+
 
     async def list_clients(self) -> list[dict]:
         """Return a best-effort list of configured VLESS clients.
@@ -481,11 +491,10 @@ class RegionVpnService:
         # Delete any previous rules for this class, then add fresh rules for this IP.
         # We delete by classid first (ignore errors) and then add filters.
         cmd = (
+            f"sudo tc filter del dev {dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc filter del dev ifb0 parent 2: protocol ip prio {cls} 2>/dev/null || true; "
             f"sudo tc class del dev {dev} classid 1:{cls} 2>/dev/null || true; "
             f"sudo tc class del dev ifb0 classid 2:{cls} 2>/dev/null || true; "
-            # best-effort: remove existing filters that reference this class (by flowid)
-            f"sudo tc filter show dev {dev} parent 1: | awk '/flowid 1:{cls}/{{print $0}}' >/dev/null 2>&1 || true; "
-            # add classes
             f"sudo tc class add dev {dev} parent 1:1 classid 1:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
             f"sudo tc filter add dev {dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls} 2>/dev/null || true; "
             f"sudo tc class add dev ifb0 parent 2:1 classid 2:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
@@ -500,6 +509,8 @@ class RegionVpnService:
         dev = self._tc_dev
         cls = self._tc_class_for_tg(int(tg_id))
         cmd = (
+            f"sudo tc filter del dev {dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc filter del dev ifb0 parent 2: protocol ip prio {cls} 2>/dev/null || true; "
             f"sudo tc class del dev {dev} classid 1:{cls} 2>/dev/null || true; "
             f"sudo tc class del dev ifb0 classid 2:{cls} 2>/dev/null || true"
         )
