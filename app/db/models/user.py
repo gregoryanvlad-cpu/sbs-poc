@@ -13,6 +13,11 @@ class User(Base):
 
     tg_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
+    # Telegram profile snapshot (best-effort; can be NULL).
+    tg_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     flow_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     flow_data: Mapped[str | None] = mapped_column(Text, nullable=True)
 
