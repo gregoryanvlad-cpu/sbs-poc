@@ -909,6 +909,22 @@ async def on_buy(cb: CallbackQuery) -> None:
         sub.status = "active"
         await session.commit()
 
+        # RegionVPN: if the user already had a config earlier, re-enable it
+        # (do NOT rotate UUID) so the same link starts working again.
+        if settings.regionvpn_enabled:
+            try:
+                rsvc = _region_service()
+                await rsvc.set_client_enabled(tg_id, True)
+
+                row = await session.scalar(
+                    select(RegionVpnSession).where(RegionVpnSession.tg_id == tg_id).limit(1)
+                )
+                if row and row.active_ip:
+                    await rsvc.apply_active_ip_map({tg_id: row.active_ip})
+            except Exception:
+                # Payment should succeed even if RegionVPN server is temporarily unavailable.
+                pass
+
     await cb.answer("Оплата успешна")
 
     kb = InlineKeyboardMarkup(
