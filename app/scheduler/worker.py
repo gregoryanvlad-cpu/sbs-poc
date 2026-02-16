@@ -7,16 +7,18 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select, text, func
+from sqlalchemy import select, text, func, delete
 
 from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
 from app.db.models import Payment, Subscription, VpnPeer
+from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
 from app.repo import list_expired_subscriptions, set_subscription_expired
 from app.services.yandex.service import yandex_service
 from app.services.referrals.service import referral_service
+from app.services.regionvpn.service import RegionVpnService
 
 log = logging.getLogger(__name__)
 
@@ -234,6 +236,7 @@ async def run_scheduler() -> None:
 
                 try:
                     await _job_expire_subscriptions(bot)
+                    await _job_prune_regionvpn_clients()
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
                     await _job_user_subscription_notifications(bot)
@@ -262,10 +265,12 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         if not expired:
             return
 
+        expired_ids: list[int] = []
         for sub in expired:
             tg_id = sub.tg_id
             await set_subscription_expired(session, tg_id)
             await deactivate_peers(session, tg_id, reason="subscription_expired")
+            expired_ids.append(tg_id)
 
             # Manual Yandex process: owner will remove user from the family.
             try:
@@ -277,6 +282,72 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
                 )
             except Exception:
                 pass
+
+        await session.commit()
+
+    # Disable RegionVPN clients (keep UUIDs, just block traffic) so user can renew
+    # within 24h and keep the same config.
+    if settings.regionvpn_enabled and expired_ids:
+        svc = RegionVpnService(
+            ssh_host=settings.regionvpn_ssh_host,
+            ssh_user=settings.regionvpn_ssh_user,
+            ssh_key_path=settings.regionvpn_ssh_key_path,
+            xray_config_path=settings.regionvpn_xray_config_path,
+            xray_restart_command=settings.regionvpn_xray_restart_command,
+            vless_tag=settings.regionvpn_vless_tag,
+            vless_port=settings.regionvpn_vless_port,
+            vless_sni=settings.regionvpn_vless_sni,
+            vless_pbk=settings.regionvpn_vless_pbk,
+            vless_sid=settings.regionvpn_vless_sid,
+            vless_flow=settings.regionvpn_vless_flow,
+        )
+        await svc.apply_enabled_map({tg_id: False for tg_id in expired_ids})
+
+
+async def _job_prune_regionvpn_clients() -> None:
+    """After 24 hours of inactivity (expired subscription), remove the client from Xray.
+
+    This keeps the same config usable for 24h after expiration (while blocked),
+    but eventually frees up the server state.
+    """
+
+    if not settings.regionvpn_enabled:
+        return
+
+    cutoff = _utcnow() - timedelta(days=1)
+
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(Subscription.tg_id)
+            .where(Subscription.is_active.is_(False))
+            .where(Subscription.end_at < cutoff)
+        )
+        tg_ids = list(rows.scalars().all())
+        if not tg_ids:
+            return
+
+        svc = RegionVpnService(
+            ssh_host=settings.regionvpn_ssh_host,
+            ssh_user=settings.regionvpn_ssh_user,
+            ssh_key_path=settings.regionvpn_ssh_key_path,
+            xray_config_path=settings.regionvpn_xray_config_path,
+            xray_restart_command=settings.regionvpn_xray_restart_command,
+            vless_tag=settings.regionvpn_vless_tag,
+            vless_port=settings.regionvpn_vless_port,
+            vless_sni=settings.regionvpn_vless_sni,
+            vless_pbk=settings.regionvpn_vless_pbk,
+            vless_sid=settings.regionvpn_vless_sid,
+            vless_flow=settings.regionvpn_vless_flow,
+        )
+
+        # Revoke from server config (idempotent). Also drop local session tracking.
+        for tg_id in tg_ids:
+            try:
+                await svc.revoke_client(tg_id)
+            except Exception:
+                pass
+
+            await session.execute(delete(RegionVpnSession).where(RegionVpnSession.tg_id == tg_id))
 
         await session.commit()
 
