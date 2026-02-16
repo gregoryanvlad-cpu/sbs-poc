@@ -168,6 +168,13 @@ class RegionVpnService:
                 return _InboundRef(inbound=ib, clients=clients)
         raise RuntimeError("xray_vless_inbound_not_found")
 
+    @staticmethod
+    def _client_exists(clients: list[dict], *, email: str) -> bool:
+        for c in clients:
+            if isinstance(c, dict) and c.get("email") == email:
+                return True
+        return False
+
     def build_vless_url(self, client_uuid: str) -> str:
         host = (os.environ.get("REGION_VLESS_HOST") or self.ssh_host).strip()
         port = (os.environ.get("REGION_VLESS_PORT") or "443").strip()
@@ -294,6 +301,134 @@ class RegionVpnService:
             pass
 
         return removed
+
+
+    async def set_client_enabled(self, tg_id: int, enabled: bool) -> bool:
+        """Enable/disable a client **without** changing its UUID.
+
+        We do this by editing Xray routing rules for the user (email `tg:<id>`):
+        - enabled=True  -> remove any "blocked" rule for the user (no traffic rules will
+          be enforced here; the session guard may later add allow/deny rules based on IP)
+        - enabled=False -> remove user-specific allow/deny rules and add a rule that
+          sends everything to the `blocked` outbound (blackhole).
+
+        Returns True if config changed.
+        """
+
+        email = f"tg:{tg_id}"
+        cfg = await self._get_config()
+
+        inbound_tag = self._get_region_inbound_tag(cfg)
+        inbound = self._get_inbound_by_tag(cfg, inbound_tag)
+        if not inbound:
+            return False
+
+        # If client doesn't exist - nothing to toggle.
+        if not self._client_exists(inbound, email=email):
+            return False
+
+        changed = False
+        routing = cfg.setdefault("routing", {})
+        rules: list[dict] = routing.setdefault("rules", [])
+
+        # remove any previous rules for this user (allow/deny/block)
+        before = len(rules)
+        rules[:] = [
+            r
+            for r in rules
+            if not (
+                r.get("type") == "field"
+                and email in (r.get("user") or [])
+                and inbound_tag in (r.get("inboundTag") or [])
+                and r.get("outboundTag") in {"regionvpn", "blocked"}
+            )
+        ]
+        if len(rules) != before:
+            changed = True
+
+        # ensure base outbounds exist for block rule
+        self._ensure_regionvpn_outbounds(cfg)
+
+        if not enabled:
+            block_rule = {
+                "type": "field",
+                "inboundTag": [inbound_tag],
+                "user": [email],
+                "outboundTag": "blocked",
+            }
+            # put at the top to take precedence
+            rules.insert(0, block_rule)
+            changed = True
+
+        if changed:
+            await self._write_config(cfg)
+            await self._restart_xray()
+
+        return changed
+
+
+    async def disable_client(self, tg_id: int) -> bool:
+        return await self.set_client_enabled(tg_id=tg_id, enabled=False)
+
+
+    async def enable_client(self, tg_id: int) -> bool:
+        return await self.set_client_enabled(tg_id=tg_id, enabled=True)
+
+
+    async def apply_enabled_map(self, enabled_map: dict[int, bool]) -> bool:
+        """Batch enable/disable changes in a single Xray restart."""
+
+        if not enabled_map:
+            return False
+
+        cfg = await self._get_config()
+        inbound_tag = self._get_region_inbound_tag(cfg)
+        inbound = self._get_inbound_by_tag(cfg, inbound_tag)
+        if not inbound:
+            return False
+
+        self._ensure_regionvpn_outbounds(cfg)
+
+        routing = cfg.setdefault("routing", {})
+        rules: list[dict] = routing.setdefault("rules", [])
+
+        changed = False
+        for tg_id, enabled in enabled_map.items():
+            email = f"tg:{tg_id}"
+            if not self._client_exists(inbound, email=email):
+                continue
+
+            before = len(rules)
+            rules[:] = [
+                r
+                for r in rules
+                if not (
+                    r.get("type") == "field"
+                    and email in (r.get("user") or [])
+                    and inbound_tag in (r.get("inboundTag") or [])
+                    and r.get("outboundTag") in {"regionvpn", "blocked"}
+                )
+            ]
+            if len(rules) != before:
+                changed = True
+
+            if not enabled:
+                rules.insert(
+                    0,
+                    {
+                        "type": "field",
+                        "inboundTag": [inbound_tag],
+                        "user": [email],
+                        "outboundTag": "blocked",
+                    },
+                )
+                changed = True
+
+        if changed:
+            await self._write_config(cfg)
+            await self._restart_xray()
+
+        return changed
 
 
     async def list_clients(self) -> list[dict]:
