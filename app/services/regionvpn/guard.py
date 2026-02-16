@@ -14,10 +14,13 @@ from app.services.regionvpn.service import RegionVpnService
 
 log = logging.getLogger(__name__)
 
+# Xray access.log examples (reality/vless):
+# 2026/02/15 22:03:06.330641 from 62.76.93.29:1155 accepted tcp:1.1.1.1:443 email: tg:896907140
+# NOTE: Some builds may append extra fields after email, so we avoid anchoring to end-of-line.
 _ACCESS_RE = re.compile(
     r"^(?P<dt>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)"
-    r".*?\sfrom\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3}):\d+\s+accepted\s+"
-    r".*?email:\s*(?P<email>\S+)\s*$"
+    r".*?\bfrom\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3}):\d+\s+accepted\b"
+    r".*?\bemail:\s*(?P<email>\S+)"
 )
 
 
