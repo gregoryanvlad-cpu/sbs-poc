@@ -311,7 +311,8 @@ async def _job_prune_regionvpn_clients() -> None:
     but eventually frees up the server state.
     """
 
-    if not settings.regionvpn_enabled:
+    # Backwards compatible safety: older configs may not have the flag.
+    if not getattr(settings, "regionvpn_enabled", True):
         return
 
     cutoff = _utcnow() - timedelta(days=1)
