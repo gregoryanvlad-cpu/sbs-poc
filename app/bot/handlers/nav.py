@@ -1338,11 +1338,10 @@ async def on_vpn_location_menu(cb: CallbackQuery) -> None:
         label = await _vpn_server_label(srv)
         lines.append(f"{flag} <b>{name}</b> — {label}")
 
-        if _server_is_ready(srv):
-            kb_rows.append([InlineKeyboardButton(text=f"{flag} {name}", callback_data=f"vpn:loc:sel:{code}")])
-        else:
-            # Not clickable yet
-            kb_rows.append([InlineKeyboardButton(text=f"{flag} {name} (подключается)", callback_data="noop")])
+        # Make all locations clickable: for not-ready locations we show an alert
+        # and suggest choosing Netherlands.
+        btn_text = f"{flag} {name}" if _server_is_ready(srv) else f"{flag} {name} (недоступно)"
+        kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"vpn:loc:sel:{code}")])
 
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:vpn")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
@@ -1473,7 +1472,28 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
     servers = _load_vpn_servers()
     srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
     if not srv or not _server_is_ready(srv):
-        await cb.answer("Сервер пока недоступен", show_alert=True)
+        await cb.answer(
+            "Эта локация пока недоступна. Сейчас доступна только 🇳🇱 Нидерланды.",
+            show_alert=True,
+        )
+
+        # Offer Netherlands directly.
+        nl = next((s for s in servers if str(s.get("code")).upper() == "NL"), None)
+        text = (
+            "❌ <b>Локация пока недоступна</b>\n\n"
+            "Сейчас доступна: 🇳🇱 <b>Нидерланды</b>\n\n"
+            "Нажмите кнопку ниже, чтобы получить конфиг."
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🇳🇱 Нидерланды", callback_data="vpn:loc:sel:NL")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:vpn")],
+            ]
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
         return
 
     warn = (
@@ -1782,65 +1802,16 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:bundle")
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
+    # After pressing "Получить конфиг" we immediately ask for a location.
+    # выдача конфига всё равно запрещена без активной подписки.
     tg_id = cb.from_user.id
-
-    # ✅ FIX: запрет выдачи VPN без активной подписки
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
             await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
             return
 
-        try:
-            peer = await vpn_service.ensure_peer(session, tg_id)
-            await session.commit()
-        except Exception:
-            await cb.answer(
-                "⚠️ VPN сервер временно недоступен.\n"
-                "Попробуй ещё раз через минуту.",
-                show_alert=True,
-            )
-            return
-
-    conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
-
-    qr_img = qrcode.make(conf_text)
-    buf = io.BytesIO()
-    qr_img.save(buf, format="PNG")
-    buf.seek(0)
-
-    conf_file = BufferedInputFile(
-        conf_text.encode(),
-        # Keep the same active config content, but use a unique filename on each выдача
-        # (helps iOS/Android caches and matches expected behaviour).
-        filename=_next_vpn_bundle_filename(tg_id),
-    )
-    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
-
-    msg_conf = await cb.message.answer_document(
-        document=conf_file,
-        caption=f"WireGuard конфиг. Будет удалён через {settings.auto_delete_seconds} сек.",
-    )
-    msg_qr = await cb.message.answer_photo(
-        photo=qr_file,
-        caption="QR для WireGuard",
-    )
-
-    await _safe_cb_answer(cb)
-
-    async def _cleanup():
-        await asyncio.sleep(settings.auto_delete_seconds)
-        for m in (msg_conf, msg_qr):
-            try:
-                await m.delete()
-            except Exception:
-                pass
-        try:
-            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(), parse_mode="HTML")
-        except Exception:
-            pass
-
-    asyncio.create_task(_cleanup())
+    await on_vpn_location_menu(cb)
 
 
 # --- FAQ: About / Offer ---
