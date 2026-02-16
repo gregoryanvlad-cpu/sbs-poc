@@ -276,6 +276,7 @@ async def on_region_reset_do(cb: CallbackQuery) -> None:
             row = await s.get(RegionVpnSession, tg_id)
             if row:
                 await s.delete(row)
+            await s.commit()
     except Exception:
         pass
 
