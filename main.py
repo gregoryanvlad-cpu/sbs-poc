@@ -63,7 +63,7 @@ async def main() -> None:
         bot, dp = run_bot()
         # VPN-Region single-device guard (runs only when REGIONVPN is enabled)
         try:
-            if getattr(settings, "regionvpn_enabled", False) and getattr(settings, "region_session_guard_enabled", True):
+            if getattr(settings, "region_ssh_host", "") and getattr(settings, "region_session_guard_enabled", True):
                 region_task = asyncio.create_task(region_session_guard_loop(bot), name="region_session_guard")
         except Exception:
             region_task = None
