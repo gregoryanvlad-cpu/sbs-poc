@@ -26,7 +26,14 @@ async def cmd_start(message: Message) -> None:
         payload = None
 
     async with session_scope() as session:
-        await ensure_user(session, tg_id)
+        u = message.from_user
+        await ensure_user(
+            session,
+            tg_id,
+            username=u.username,
+            first_name=u.first_name,
+            last_name=u.last_name,
+        )
 
         if payload and payload.startswith("ref_"):
             code = payload.split("ref_", 1)[1].strip()
