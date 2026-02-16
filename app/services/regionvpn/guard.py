@@ -109,6 +109,8 @@ async def region_session_guard_loop(bot: Bot) -> None:
                         if old_ip:
                             notify.append((tg_id, old_ip, ip))
 
+                await s.commit()
+
             if switches:
                 # Apply all routing changes in one restart
                 await svc.apply_active_ip_map({tg_id: ip for tg_id, ip in switches.items()})
