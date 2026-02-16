@@ -315,7 +315,7 @@ class RegionVpnService:
 
     async def tail_access_log(self, *, path: str, lines: int = 200) -> list[str]:
         """Read last N lines from Xray access log via SSH."""
-        cmd = f"tail -n {int(lines)} {path}"
+        cmd = f"sudo -n tail -n {int(lines)} {path} || tail -n {int(lines)} {path}"
         try:
             text = (await self._run_output(cmd, check=False) or "").strip()
         except Exception:
