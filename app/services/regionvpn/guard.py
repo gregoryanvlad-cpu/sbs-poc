@@ -10,6 +10,7 @@ from aiogram import Bot
 from app.core.config import settings
 from app.db.session import session_scope
 from app.db.models.region_vpn_session import RegionVpnSession
+from app.db.models.subscription import Subscription
 from app.services.regionvpn.service import RegionVpnService
 
 log = logging.getLogger(__name__)
@@ -93,9 +94,24 @@ async def region_session_guard_loop(bot: Bot) -> None:
                 last_dt = max((dt for dt, _ in latest.values()), default=last_dt)
 
             switches: dict[int, str] = {}
+            enabled_map: dict[int, bool] = {}
             notify: list[tuple[int, str, str]] = []  # (tg_id, old_ip, new_ip)
 
             async with session_scope() as s:
+                # Subscriptions that are currently active
+                now = datetime.utcnow()
+                tg_ids = list(latest.keys())
+                active_ids: set[int] = set()
+                if tg_ids:
+                    res = await s.execute(
+                        select(Subscription.tg_id).where(
+                            Subscription.tg_id.in_(tg_ids),
+                            Subscription.is_active.is_(True),
+                            Subscription.end_at > now,
+                        )
+                    )
+                    active_ids = set(res.scalars().all())
+
                 for tg_id, (dt, ip) in latest.items():
                     row = await s.get(RegionVpnSession, tg_id)
                     if not row:
@@ -104,6 +120,13 @@ async def region_session_guard_loop(bot: Bot) -> None:
 
                     old_ip = (row.active_ip or "").strip() or None
                     row.last_seen_at = dt
+
+                    # If subscription is not active, do not allow switching/activation.
+                    if tg_id not in active_ids:
+                        enabled_map[tg_id] = False
+                        continue
+
+                    enabled_map[tg_id] = True
 
                     if old_ip != ip:
                         row.active_ip = ip
@@ -114,8 +137,12 @@ async def region_session_guard_loop(bot: Bot) -> None:
 
                 await s.commit()
 
+            if enabled_map:
+                # Make sure expired users are blocked and active users are unblocked
+                await svc.apply_enabled_map(enabled_map)
+
             if switches:
-                # Apply all routing changes in one restart
+                # Apply all routing changes in one restart (only for active subs)
                 await svc.apply_active_ip_map({tg_id: ip for tg_id, ip in switches.items()})
 
                 # Optional per-user bandwidth limit (tc/ifb) on the VPN-Region server.
