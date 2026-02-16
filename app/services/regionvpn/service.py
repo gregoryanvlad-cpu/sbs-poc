@@ -67,7 +67,19 @@ class RegionVpnService:
                 log.warning("[regionvpn] Failed to load REGION_SSH_PRIVATE_KEY_B64")
 
         # tc/ifb rate limit parameters (optional)
-        self._tc_enabled = os.getenv("REGION_TC_ENABLED", "").strip().lower() in ("1", "true", "yes", "y", "on")
+        # IMPORTANT:
+        # The project-level Settings default REGION_TC_ENABLED to True.
+        # Earlier versions of this service treated a missing env as "disabled",
+        # which caused "tc" limits to never apply unless the env var was explicitly
+        # set. Here we make the default consistent with Settings:
+        # - REGION_TC_ENABLED is missing/empty  -> enabled
+        # - REGION_TC_ENABLED is set to falsy   -> disabled
+        # - REGION_TC_ENABLED is set to truthy  -> enabled
+        _tc_env = os.getenv("REGION_TC_ENABLED")
+        if _tc_env is None or not _tc_env.strip():
+            self._tc_enabled = True
+        else:
+            self._tc_enabled = _tc_env.strip().lower() in ("1", "true", "yes", "y", "on")
         try:
             self._tc_rate_mbit = int(os.getenv("REGION_TC_RATE_MBIT", "25").strip() or "25")
         except Exception:
