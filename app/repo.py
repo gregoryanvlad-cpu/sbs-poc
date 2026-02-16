@@ -84,7 +84,14 @@ async def get_content_request_by_token(session: AsyncSession, token: str) -> Con
     return res.scalar_one_or_none()
 
 
-async def ensure_user(session: AsyncSession, tg_id: int) -> User:
+async def ensure_user(
+    session: AsyncSession,
+    tg_id: int,
+    *,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+) -> User:
     """
     Ensures User row exists and also ensures an empty Subscription row exists.
 
@@ -94,9 +101,29 @@ async def ensure_user(session: AsyncSession, tg_id: int) -> User:
     """
     user = await session.get(User, tg_id)
     if not user:
-        user = User(tg_id=tg_id)
+        user = User(
+            tg_id=tg_id,
+            tg_username=(username or None),
+            first_name=(first_name or None),
+            last_name=(last_name or None),
+        )
         session.add(user)
         await session.flush()  # ✅ user must exist before subscription
+    else:
+        # Best-effort: keep Telegram profile snapshot somewhat fresh.
+        changed = False
+        if username is not None and user.tg_username != username:
+            user.tg_username = username
+            changed = True
+        if first_name is not None and user.first_name != first_name:
+            user.first_name = first_name
+            changed = True
+        if last_name is not None and user.last_name != last_name:
+            user.last_name = last_name
+            changed = True
+        if changed:
+            user.updated_at = utcnow()
+            await session.flush()
 
     sub = await session.get(Subscription, tg_id)
     if not sub:
