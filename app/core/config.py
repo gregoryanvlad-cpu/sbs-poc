@@ -91,6 +91,9 @@ class Settings:
     # --- VPN-Region (VLESS+Reality via Xray) ---
     # NOTE: VLESS/Reality link parameters are read directly from env in regionvpn.service.
     # Here we keep only SSH + Xray control parameters used by the bot.
+    # Global feature toggle. Some components (e.g. scheduler) expect this attribute.
+    # If env REGIONVPN_ENABLED is not set, the feature is considered enabled.
+    regionvpn_enabled: bool = True
     region_ssh_host: str = ""
     region_ssh_port: int = 22
     region_ssh_user: str = "root"
@@ -190,6 +193,7 @@ def _load_settings() -> Settings:
         region_session_guard_period_seconds=int(os.getenv("REGION_SESSION_GUARD_PERIOD_SECONDS", "5")),
 
         # Optional per-user rate limiting (tc/ifb) for VPN-Region
+        regionvpn_enabled=_env_bool("REGIONVPN_ENABLED", True),
         region_tc_enabled=_env_bool("REGION_TC_ENABLED", True),
         region_tc_dev=os.getenv("REGION_TC_DEV", "eth0").strip() or "eth0",
         region_tc_rate_mbit=int(os.getenv("REGION_TC_RATE_MBIT", "25")),
