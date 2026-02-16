@@ -65,6 +65,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _kb_admin_users(page: int, pages: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    if page > 1:
+        b.button(text="⬅️", callback_data=f"admin:users:page:{page-1}")
+    if page < pages:
+        b.button(text="➡️", callback_data=f"admin:users:page:{page+1}")
+    b.adjust(2)
+    b.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu"))
+    return b.as_markup()
+
+
 def _parse_ru_date_to_utc_end_of_day(s: str) -> Optional[datetime]:
     """
     Parse "9 февраля 2026" -> 2026-02-09 23:59:59 UTC
@@ -247,6 +258,93 @@ async def admin_menu(cb: CallbackQuery) -> None:
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             await cb.message.answer(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+        else:
+            raise
+
+
+# ==========================
+# ADMIN: USERS LIST
+# ==========================
+
+
+async def _render_users_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    per_page = 25
+    page = max(1, int(page))
+
+    async with session_scope() as session:
+        total = await session.scalar(select(func.count()).select_from(User))
+        total = int(total or 0)
+
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, pages)
+
+        q = (
+            select(User)
+            .order_by(User.created_at.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+        )
+        users = (await session.execute(q)).scalars().all()
+
+    lines: list[str] = []
+    for u in users:
+        username = f"@{u.tg_username}" if u.tg_username else "—"
+        name_parts = [p for p in [u.first_name, u.last_name] if p]
+        name = " ".join(name_parts) if name_parts else "—"
+        lines.append(f"• <code>{u.tg_id}</code> | {username} | {name}")
+
+    body = "\n".join(lines) if lines else "(пока нет пользователей)"
+    text = (
+        "👤 <b>Все зарегистрированные пользователи</b>\n\n"
+        f"Всего: <b>{total}</b> | Страница: <b>{page}/{pages}</b>\n\n"
+        f"{body}"
+    )
+    return text, _kb_admin_users(page, pages)
+
+
+@router.callback_query(lambda c: c.data == "admin:users")
+async def admin_users(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    text, kb = await _render_users_page(1)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:users:page:"))
+async def admin_users_page(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    try:
+        page = int((cb.data or "").split(":")[-1])
+    except Exception:
+        page = 1
+
+    text, kb = await _render_users_page(page)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
         else:
             raise
 
