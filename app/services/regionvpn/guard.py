@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 from aiogram import Bot
 
+from sqlalchemy import select
+
 from app.core.config import settings
 from app.db.session import session_scope
 from app.db.models.region_vpn_session import RegionVpnSession
