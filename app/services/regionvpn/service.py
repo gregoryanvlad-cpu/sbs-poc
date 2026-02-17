@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -185,8 +186,33 @@ class RegionVpnService:
         flow = (os.environ.get("REGION_VLESS_FLOW") or "xtls-rprx-vision").strip()
         name = (os.environ.get("REGION_VLESS_NAME") or "VPN Region").strip()
 
+        # Optional anti-DPI extras (Reality PQ signature + path obfuscation)
+        mldsa65_verify = (
+            os.environ.get("REALITY_MLDSA65_VERIFY")
+            or os.environ.get("MLDSA65_VERIFY")
+            or os.environ.get("REGION_MLDSA65_VERIFY")
+            or ""
+        ).strip()
+        spider_x_base = (
+            os.environ.get("SPIDER_X")
+            or os.environ.get("SPIDERX")
+            or os.environ.get("REALITY_SPIDER_X")
+            or ""
+        ).strip()
+
         # Minimal URL encoding for fragment.
-        frag = name.replace(" ", "%20")
+        frag = self._url_escape(name)
+
+        # Stable per-user "random" (so the link doesn't change every time you request it)
+        rand5 = hashlib.sha256(client_uuid.encode("utf-8")).hexdigest()[:5]
+        spider_x = ""
+        if spider_x_base:
+            if "{rand}" in spider_x_base:
+                spider_x = spider_x_base.replace("{rand}", rand5)
+            elif spider_x_base.endswith("="):
+                spider_x = spider_x_base + rand5
+            else:
+                spider_x = spider_x_base
 
         params = {
             "encryption": "none",
@@ -200,9 +226,32 @@ class RegionVpnService:
             params["pbk"] = pbk
         if sid:
             params["sid"] = sid
+        if mldsa65_verify:
+            # IMPORTANT: exact key name expected by clients.
+            params["mldsa65Verify"] = mldsa65_verify
+        if spider_x:
+            params["spiderX"] = spider_x
 
-        query = "&".join([f"{k}={v}" for k, v in params.items() if v is not None and v != ""])  # noqa: E501
+        query = "&".join(
+            [
+                f"{k}={self._url_escape(v)}"
+                for k, v in params.items()
+                if v is not None and v != ""
+            ]
+        )
         return f"vless://{client_uuid}@{host}:{port}?{query}#{frag}"
+
+    @staticmethod
+    def _url_escape(s: str) -> str:
+        # A tiny safe encoder (avoids adding new deps). Enough for our params.
+        return (
+            str(s)
+            .replace("%", "%25")
+            .replace(" ", "%20")
+            .replace("#", "%23")
+            .replace("?", "%3F")
+            .replace("&", "%26")
+        )
 
     async def active_clients_count(self) -> int:
         cfg = await self._read_xray_config()
