@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -218,6 +219,20 @@ class RegionVpnService:
         flow = (os.environ.get("REGION_VLESS_FLOW") or "").strip()
         name = (os.environ.get("REGION_VLESS_NAME") or "VPN Region").strip()
 
+        # Optional anti-DPI extras (Reality PQ signature + path obfuscation)
+        mldsa65_verify = (
+            os.environ.get("REALITY_MLDSA65_VERIFY")
+            or os.environ.get("MLDSA65_VERIFY")
+            or os.environ.get("REGION_MLDSA65_VERIFY")
+            or ""
+        ).strip()
+        spider_x_base = (
+            os.environ.get("SPIDER_X")
+            or os.environ.get("SPIDERX")
+            or os.environ.get("REALITY_SPIDER_X")
+            or ""
+        ).strip()
+
         # Build query string.
         q = {
             "encryption": "none",
@@ -234,6 +249,18 @@ class RegionVpnService:
             q["pbk"] = pbk
         if sid:
             q["sid"] = sid
+
+        # Stable per-user "random" (so the link doesn't change every time you request it)
+        rand5 = hashlib.sha256(client_uuid.encode("utf-8")).hexdigest()[:5]
+        if mldsa65_verify:
+            q["mldsa65Verify"] = mldsa65_verify
+        if spider_x_base:
+            if "{rand}" in spider_x_base:
+                q["spiderX"] = spider_x_base.replace("{rand}", rand5)
+            elif spider_x_base.endswith("="):
+                q["spiderX"] = spider_x_base + rand5
+            else:
+                q["spiderX"] = spider_x_base
 
         # Stable order for readability.
         parts = [f"{k}={self._url_escape(v)}" for k, v in q.items() if v is not None and v != ""]
