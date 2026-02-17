@@ -112,6 +112,13 @@ async def on_nav_region(cb: CallbackQuery) -> None:
 async def on_region_get(cb: CallbackQuery) -> None:
     tg_id = int(cb.from_user.id)
 
+    # Answer callback early so Telegram doesn't show an endless spinner
+    # if something takes time or fails later.
+    try:
+        await cb.answer("Генерирую конфиг…")
+    except Exception:
+        pass
+
     # Subscription required (same gating as VPN)
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
@@ -151,12 +158,24 @@ async def on_region_get(cb: CallbackQuery) -> None:
             return
         raise
 
-    # QR
-    qr_img = qrcode.make(vless_url)
-    buf = io.BytesIO()
-    qr_img.save(buf, format="PNG")
-    buf.seek(0)
-    qr_file = BufferedInputFile(buf.getvalue(), filename="vpn-region.png")
+    # QR (may fail if the link is too long: QR versions are limited)
+    qr_file: BufferedInputFile | None = None
+    try:
+        qr = qrcode.QRCode(
+            error_correction=getattr(qrcode.constants, "ERROR_CORRECT_L", 1),
+            box_size=10,
+            border=3,
+        )
+        qr.add_data(vless_url)
+        qr.make(fit=True)
+        img = qr.make_image()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        qr_file = BufferedInputFile(buf.getvalue(), filename="vpn-region.png")
+    except Exception:
+        # Link may be too long for QR; we'll still send it as text/file.
+        qr_file = None
 
     # Button that copies link to clipboard in 1 tap (supported in newer Telegram clients).
     copy_btn: InlineKeyboardButton | None = None
@@ -200,29 +219,63 @@ async def on_region_get(cb: CallbackQuery) -> None:
             "2) Откройте <b>Happ Plus</b> → «<b>+</b>» → <b>Из буфера</b>."
         )
 
-    # Show full link in a code block so it is easy to copy manually as well.
-    link_block = f"<code>{html_escape(vless_url)}</code>"
+    # Telegram message limit is 4096 chars. With mldsa65Verify the link can be very long,
+    # so we fall back to sending it as a file.
+    url_as_file: BufferedInputFile | None = None
+    show_inline_link = len(vless_url) <= 3500
+    if not show_inline_link:
+        url_as_file = BufferedInputFile(vless_url.encode("utf-8"), filename="vpn-region-vless.txt")
+
+    # Show full link inline only when it fits.
+    link_block = (
+        f"<code>{html_escape(vless_url)}</code>"
+        if show_inline_link
+        else "<i>Ссылка слишком длинная для сообщения — отправил её файлом ниже.</i>"
+    )
+
+    qr_hint = (
+        "📷 <b>Через QR</b>: сохраните QR (долгий тап → «Сохранить») и импортируйте в Happ из галереи."
+        if qr_file is not None
+        else "📷 <b>QR</b>: ссылка слишком длинная для QR-кода, поэтому QR не отправлен. Используйте импорт из буфера."
+    )
 
     link_text = f"""✅ <b>VPN-Region конфиг готов</b>
 
 📌 <b>Как добавить в Happ Plus</b>
 {howto}
 
-📷 <b>Через QR</b>: сохраните QR (долгий тап → «Сохранить») и импортируйте в Happ из галереи.
+{qr_hint}
 
 🔗 <b>Ссылка для импорта</b>:
 {link_block}
 
-⏳ Ссылка и QR удалятся через <b>{settings.auto_delete_seconds} сек.</b>
+⏳ Сообщения удалятся через <b>{settings.auto_delete_seconds} сек.</b>
 """
 
-    msg_link = await cb.message.answer(link_text, reply_markup=kb_link, parse_mode="HTML", disable_web_page_preview=True)
-    msg_qr = await cb.message.answer_photo(photo=qr_file, caption="📷 QR для импорта (VPN-Region).")
+    msg_link = await cb.message.answer(
+        link_text,
+        reply_markup=kb_link,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
-    # If we couldn't add a 1-tap copy button, also send the raw URL as plain text
-    # (some clients treat it as selectable/clickable).
+    msg_qr_id: int | None = None
+    if qr_file is not None:
+        msg_qr = await cb.message.answer_photo(photo=qr_file, caption="📷 QR для импорта (VPN-Region).")
+        msg_qr_id = msg_qr.message_id
+
+    msg_file_id: int | None = None
+    if url_as_file is not None:
+        msg_file = await cb.message.answer_document(
+            document=url_as_file,
+            caption="📎 VLESS-ссылка для импорта (VPN-Region).",
+        )
+        msg_file_id = msg_file.message_id
+
+    # If we couldn't add a 1-tap copy button and the URL fits a Telegram message,
+    # also send the raw URL as plain text (some clients treat it as selectable/clickable).
     msg_plain: int | None = None
-    if copy_btn is None:
+    if copy_btn is None and show_inline_link:
         msg_plain_obj = await cb.message.answer(vless_url, disable_web_page_preview=True)
         msg_plain = msg_plain_obj.message_id
 
@@ -234,11 +287,14 @@ async def on_region_get(cb: CallbackQuery) -> None:
             pass
 
     asyncio.create_task(_del_later(msg_link.message_id))
-    asyncio.create_task(_del_later(msg_qr.message_id))
+    if msg_qr_id is not None:
+        asyncio.create_task(_del_later(msg_qr_id))
+    if msg_file_id is not None:
+        asyncio.create_task(_del_later(msg_file_id))
     if msg_plain is not None:
         asyncio.create_task(_del_later(msg_plain))
 
-    await _safe_cb_answer(cb)
+    # callback already answered at the beginning (best-effort)
 
 
 @router.callback_query(lambda c: c.data == "region:reset")
