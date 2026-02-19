@@ -34,7 +34,7 @@ class Settings:
     owner_tg_id: int
 
     # business defaults
-    price_rub: int = 299
+    price_rub: int = 199
     period_months: int = 1
     period_days: int = 30  # legacy compatibility (payments.period_days is NOT NULL)
 
