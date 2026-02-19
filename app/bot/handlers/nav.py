@@ -202,7 +202,6 @@ async def on_region_get(cb: CallbackQuery) -> None:
             )
         ]
     )
-    kb_rows.append([InlineKeyboardButton(text="🌐 VPN-Region", callback_data="nav:region")])
     kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
     kb_link = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
@@ -819,7 +818,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         try:
             await cb.message.edit_text(
                 f"💳 Оплата\n\nТариф: {price_rub} ₽ / {settings.period_months} мес.",
-                reply_markup=kb_pay(),
+                reply_markup=kb_pay(price_rub=price_rub),
             )
         except Exception:
             pass
