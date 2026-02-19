@@ -7,8 +7,6 @@ def kb_main() -> InlineKeyboardMarkup:
     b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
     b.button(text="🟡 Yandex Plus", callback_data="nav:yandex")
     b.button(text="🌍 VPN", callback_data="nav:vpn")
-    b.button(text="🌐 VPN-Region", callback_data="nav:region")
-    b.button(text="🎬 Кинотека", callback_data="nav:kinoteka")
     b.button(text="💳 Оплата", callback_data="nav:pay")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
@@ -32,9 +30,9 @@ def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_pay() -> InlineKeyboardMarkup:
+def kb_pay(*, price_rub: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Оплатить 299 ₽", callback_data="pay:buy:1m")
+    b.button(text=f"✅ Оплатить {int(price_rub)} ₽", callback_data="pay:buy:1m")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
