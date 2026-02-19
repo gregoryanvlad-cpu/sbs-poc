@@ -6,9 +6,6 @@ from app.bot.keyboards import kb_main
 from app.db.session import session_scope
 from app.repo import ensure_user
 from app.services.referrals.service import referral_service
-from app.services.vpn.service import vpn_service
-
-import asyncio
 
 router = Router()
 
@@ -47,35 +44,20 @@ async def cmd_start(message: Message) -> None:
         await referral_service.ensure_ref_code(session, tg_id)
         await session.commit()
 
-    # Greeting (как на скрине: код-блок с кнопкой "копировать")
+    # Greeting (обычный текст, без рамки/код-блока)
     text = (
         "Добро пожаловать 👋\n"
         "Этот бот — твой центр управления:\n\n"
-        "<pre>"
-        "┌──────────────────────────────┐\n"
-        "│ • Безопасный VPN             │\n"
-        "│ • Yandex Plus                │\n"
-        "│ • Всего 199 ₽ в месяц        │\n"
-        "└──────────────────────────────┘"
-        "</pre>\n"
+        "<i>Безопасный VPN</i>\n"
+        "<i>Yandex Plus</i>\n"
+        "<i>Всего 199 ₽ в месяц</i>\n\n"
         "По вопросам сотрудничества: @sbsmanager_bot"
     )
 
     await message.answer(text, reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
 
-    # Best-effort VPN status for the main menu screen
-    line = "🌍 VPN: статус недоступен"
-    try:
-        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
-        if st.get("ok"):
-            cpu = st.get("cpu_load_percent")
-            if cpu is not None:
-                line = f"🌍 Нагрузка на VPN сейчас составляет: <b>{cpu:.0f}%</b>"
-    except Exception:
-        pass
-
     await message.answer(
-        "🏠 <b>Главное меню</b>\n" + line,
+        "🏠 <b>Главное меню</b>",
         reply_markup=kb_main(),
         parse_mode="HTML",
     )
