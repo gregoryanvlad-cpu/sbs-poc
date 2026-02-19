@@ -20,6 +20,38 @@ def make_async_db_url(url: str) -> str:
     raise RuntimeError("Unsupported DATABASE_URL format")
 
 
+def _parse_int_list_env(name: str) -> tuple[int, ...]:
+    """Parse comma/space separated list of integer IDs from env.
+
+    Examples:
+      ADMIN_IDS="123,456" -> (123, 456)
+      ADMIN_IDS="123 456" -> (123, 456)
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return tuple()
+    parts: list[str] = []
+    for chunk in raw.replace(";", ",").replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # allow spaces inside chunks
+        parts.extend([p for p in chunk.split() if p.strip()])
+    out: list[int] = []
+    for p in parts:
+        if p.isdigit():
+            out.append(int(p))
+    # keep stable order but unique
+    seen: set[int] = set()
+    uniq: list[int] = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return tuple(uniq)
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
@@ -32,6 +64,8 @@ class Settings:
 
     # owner (admin access)
     owner_tg_id: int
+    # additional admins (comma/space separated ADMIN_IDS)
+    admin_tg_ids: tuple[int, ...] = tuple()
 
     # business defaults
     price_rub: int = 199
@@ -128,6 +162,9 @@ def _load_settings() -> Settings:
         raise RuntimeError("OWNER_TG_ID is missing or invalid (must be digits)")
     owner_tg_id = int(owner_raw)
 
+    # Optional: additional admins, managed from Railway env variables.
+    admin_ids = _parse_int_list_env("ADMIN_IDS")
+
     return Settings(
         bot_token=bot_token,
         bot_username=(os.getenv("BOT_USERNAME") or "").strip() or None,
@@ -136,6 +173,7 @@ def _load_settings() -> Settings:
         scheduler_enabled=_env_bool("SCHEDULER_ENABLED", True),
         auto_delete_seconds=int(os.getenv("AUTO_DELETE_SECONDS", "60")),
         owner_tg_id=owner_tg_id,
+        admin_tg_ids=admin_ids,
 
         # Payments
         payment_provider=os.getenv("PAYMENT_PROVIDER", "mock").strip().lower(),
