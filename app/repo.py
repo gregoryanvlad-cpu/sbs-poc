@@ -163,7 +163,7 @@ async def extend_subscription(
     *,
     months: int,
     days_legacy: int,
-    amount_rub: int = 299,
+    amount_rub: int = 199,
     provider: str = "mock",
     status: str = "success",
     provider_payment_id: str | None = None,
