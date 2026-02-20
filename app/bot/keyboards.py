@@ -38,9 +38,11 @@ def kb_pay(*, price_rub: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_vpn() -> InlineKeyboardMarkup:
+def kb_vpn(*, show_my_config: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция", callback_data="vpn:guide")
+    if show_my_config:
+        b.button(text="📌 Мой конфиг", callback_data="vpn:my")
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
     b.button(text="🌍 Сменить локацию", callback_data="vpn:loc")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
