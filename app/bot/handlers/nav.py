@@ -826,8 +826,23 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "vpn":
+        # Show "Мой конфиг" only for users who have ever received a WG config
+        # and only when subscription is active.
+        show_my = False
         try:
-            await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn())
+            async with session_scope() as session:
+                sub = await get_subscription(session, cb.from_user.id)
+                if _is_sub_active(sub.end_at):
+                    from app.db.models.vpn_peer import VpnPeer
+
+                    q = select(VpnPeer.id).where(VpnPeer.tg_id == cb.from_user.id).limit(1)
+                    res = await session.execute(q)
+                    show_my = res.first() is not None
+        except Exception:
+            show_my = False
+
+        try:
+            await cb.message.edit_text("🌍 VPN", reply_markup=kb_vpn(show_my_config=show_my))
         except Exception:
             pass
         await _safe_cb_answer(cb)
@@ -1344,6 +1359,132 @@ async def on_vpn_guide(cb: CallbackQuery) -> None:
     )
     await cb.message.edit_text(text, reply_markup=kb_vpn_guide_platforms(), parse_mode="HTML")
     await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "vpn:my")
+async def on_vpn_my_config(cb: CallbackQuery) -> None:
+    """Re-send user's WireGuard config if they have received it before.
+
+    The message (config + QR) is auto-deleted after settings.auto_delete_seconds.
+    """
+
+    tg_id = cb.from_user.id
+    chat_id = cb.message.chat.id
+
+    # Answer early to avoid Telegram timeout spinner.
+    try:
+        await cb.answer("Отправляю…")
+    except Exception:
+        pass
+
+    # Require active subscription.
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            return
+
+        from app.db.models.vpn_peer import VpnPeer
+
+        q = (
+            select(VpnPeer)
+            .where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
+            .order_by(VpnPeer.id.desc())
+            .limit(1)
+        )
+        res = await session.execute(q)
+        active = res.scalar_one_or_none()
+
+        if not active:
+            # User paid but hasn't got a config (or all peers are inactive).
+            q2 = select(VpnPeer.id).where(VpnPeer.tg_id == tg_id).limit(1)
+            res2 = await session.execute(q2)
+            has_any = res2.first() is not None
+
+            if has_any:
+                text = (
+                    "ℹ️ <b>Активный VPN-конфиг не найден</b>\n\n"
+                    "Чтобы получить новый конфиг, нажмите «📦 Отправить конфиг + QR» и выберите сервер."
+                )
+            else:
+                text = (
+                    "ℹ️ <b>У вас ещё нет конфига</b>\n\n"
+                    "Чтобы посмотреть/установить свой конфиг, сначала получите его: "
+                    "нажмите «📦 Отправить конфиг + QR» и выберите сервер."
+                )
+
+            try:
+                await cb.message.answer(text, reply_markup=kb_vpn(show_my_config=False), parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        # Determine user's current location for the active peer (best-effort).
+        code = (active.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+        servers = _load_vpn_servers()
+        srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
+
+        # Recreate config deterministically from stored peer keys.
+        if srv and _server_is_ready(srv):
+            peer = await vpn_service.ensure_peer_for_server(
+                session,
+                tg_id,
+                server_code=code,
+                host=str(srv["host"]),
+                port=int(srv.get("port") or 22),
+                user=str(srv["user"]),
+                password=srv.get("password"),
+                interface=str(srv.get("interface") or "wg0"),
+            )
+            await session.commit()
+            conf_text = vpn_service.build_wg_conf(
+                peer,
+                user_label=str(tg_id),
+                server_public_key=str(srv.get("server_public_key")),
+                endpoint=str(srv.get("endpoint")),
+                dns=str(srv.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+            )
+            loc_title = f"{_vpn_flag(code)} <b>{srv.get('name') or code}</b>"
+        else:
+            # Legacy single-server mode.
+            peer = await vpn_service.ensure_peer(session, tg_id)
+            await session.commit()
+            conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+            loc_title = "<b>ваша локация</b>"
+
+    # Build QR + files.
+    qr_img = qrcode.make(conf_text)
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+
+    conf_file = BufferedInputFile(conf_text.encode(), filename=_next_vpn_bundle_filename(tg_id))
+    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+
+    msg_conf = await cb.bot.send_document(
+        chat_id=chat_id,
+        document=conf_file,
+        caption=(
+            f"📌 <b>Ваш VPN-конфиг</b> ({loc_title})\n\n"
+            f"Конфиг будет удалён через <b>{settings.auto_delete_seconds} сек.</b>"
+        ),
+        parse_mode="HTML",
+    )
+    msg_qr = await cb.bot.send_photo(
+        chat_id=chat_id,
+        photo=qr_file,
+        caption=f"QR для WireGuard (удалится через {settings.auto_delete_seconds} сек.)",
+    )
+
+    async def _cleanup_msgs() -> None:
+        await asyncio.sleep(settings.auto_delete_seconds)
+        for m in (msg_conf, msg_qr):
+            try:
+                await cb.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
+            except Exception:
+                pass
+
+    asyncio.create_task(_cleanup_msgs())
 
 
 # --- VPN location selection / migration ---
