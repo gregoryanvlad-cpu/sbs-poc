@@ -116,6 +116,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="⏳ Холды (рефералка)", callback_data="admin:ref:holds")
     b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
     b.button(text="💲 Цена подписки", callback_data="admin:price")
+    b.button(text="🎁 Подарить подписку", callback_data="admin:sub:gift")
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
 
     # Legacy / test
