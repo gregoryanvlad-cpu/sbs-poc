@@ -13,6 +13,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import func, select
 
+from dateutil.relativedelta import relativedelta
+
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
@@ -22,7 +24,7 @@ from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import get_price_rub, set_app_setting_int
+from app.repo import get_price_rub, set_app_setting_int, get_subscription, extend_subscription
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
 from app.services.regionvpn import RegionVpnService
@@ -206,6 +208,11 @@ class AdminReferralOwnerFSM(StatesGroup):
 
 class AdminPriceFSM(StatesGroup):
     waiting_price = State()
+
+
+class AdminGiftSubFSM(StatesGroup):
+    waiting_target = State()
+    waiting_months = State()
 
 
 # ==========================
@@ -418,6 +425,145 @@ async def admin_price_set(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Цена подписки обновлена: <b>{new_price} ₽</b>",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+
+
+# ==========================
+# ADMIN: GIFT SUBSCRIPTION
+# ==========================
+
+
+@router.callback_query(lambda c: c.data == "admin:sub:gift")
+async def admin_sub_gift_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.clear()
+    await state.set_state(AdminGiftSubFSM.waiting_target)
+
+    text = (
+        "🎁 <b>Подарок: подписка</b>\n\n"
+        "Отправьте Telegram ID пользователя (например <code>123456789</code>) "
+        "или @username.\n\n"
+        "⬅️ Для отмены нажмите «Назад»."
+    )
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+    await cb.answer()
+
+
+@router.message(AdminGiftSubFSM.waiting_target)
+async def admin_sub_gift_target(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Укажите Telegram ID или @username.", reply_markup=_kb_admin_back())
+        return
+
+    tg_id = await _resolve_tg_id(message.bot, raw)
+    if not tg_id:
+        await message.answer(
+            "❌ Не удалось определить пользователя.\n\n"
+            "Принимаю <code>123456789</code> или @username (если пользователь уже писал боту).",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+        return
+
+    await state.update_data(gift_tg_id=int(tg_id))
+    await state.set_state(AdminGiftSubFSM.waiting_months)
+
+    await message.answer(
+        "⏳ На сколько месяцев подарить подписку?\n\n"
+        "Введите число месяцев, например: <code>1</code> или <code>3</code>.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminGiftSubFSM.waiting_months)
+async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    raw = re.sub(r"[^0-9]", "", (message.text or "").strip())
+    if not raw:
+        await message.answer("❌ Введите число месяцев, например: 1", reply_markup=_kb_admin_back())
+        return
+
+    try:
+        months = int(raw)
+    except Exception:
+        await message.answer("❌ Введите число месяцев, например: 1", reply_markup=_kb_admin_back())
+        return
+
+    if months <= 0 or months > 120:
+        await message.answer("❌ Укажите от 1 до 120 месяцев.", reply_markup=_kb_admin_back())
+        return
+
+    data = await state.get_data()
+    target_tg_id = int(data.get("gift_tg_id") or 0)
+    if not target_tg_id:
+        await state.clear()
+        await message.answer("⚠️ Не найден получатель. Начните заново.", reply_markup=kb_admin_menu())
+        return
+
+    from app.db.models.subscription import Subscription
+
+    now = _utcnow()
+    async with session_scope() as session:
+        sub = await session.get(Subscription, target_tg_id)
+        if not sub:
+            sub = await get_subscription(session, target_tg_id)
+
+        base = sub.end_at if sub.end_at and sub.end_at > now else now
+        new_end = base + relativedelta(months=months)
+
+        # Mark as paid via a "gift" provider (amount 0) and extend.
+        await extend_subscription(
+            session,
+            target_tg_id,
+            months=months,
+            days_legacy=months * 30,
+            amount_rub=0,
+            provider="gift",
+            status="success",
+            provider_payment_id=f"gift:{message.from_user.id}:{target_tg_id}:{int(now.timestamp())}",
+        )
+
+        sub.end_at = new_end
+        sub.is_active = True
+        sub.status = "active"
+        await session.commit()
+
+    await state.clear()
+
+    # Notify user (best-effort)
+    notify_text = (
+        "🎁 <b>Подарок!</b>\n\n"
+        "Администратор подарил вам подписку на наш сервис, приятного пользования!"
+    )
+    try:
+        await message.bot.send_message(target_tg_id, notify_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    await message.answer(
+        "✅ Подписка подарена.\n\n"
+        f"Пользователь: <code>{target_tg_id}</code>\n"
+        f"Срок: <b>{months}</b> мес.\n"
+        f"Новая дата окончания: <b>{new_end.date().isoformat()}</b>",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
