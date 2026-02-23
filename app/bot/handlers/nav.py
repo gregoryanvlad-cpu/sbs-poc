@@ -443,37 +443,27 @@ def _load_vpn_servers() -> list[dict]:
 
 
 
-def _today_key() -> str:
-    """Return current date key used for per-day counters (UTC)."""
-    return datetime.now(timezone.utc).date().isoformat()
+async def _next_vpn_bundle_filename_global(session) -> str:
+    """Generate a global sequential filename for every issued WG config.
 
-
-def _next_vpn_bundle_filename(tg_id: int) -> str:
-    """Generate a unique filename for today's *downloads*.
-
-    NOTE: The peer/config itself must stay the same until user presses
-    "Сбросить VPN". We only change the filename so clients that cache by name
-    (esp. iOS) can re-import.
-
-    Format: SBS_<tg_id>_<N>.conf where N starts from 1 each day.
+    Required format: sbsVPN<N>.conf where N is the total number of configs
+    ever issued by the bot (across all users).
     """
-    today = _today_key()
-    prev = VPN_BUNDLE_COUNTER.get(tg_id)
-    if not prev or prev[0] != today:
-        n = 1
-    else:
-        n = prev[1] + 1
-    VPN_BUNDLE_COUNTER[tg_id] = (today, n)
-    return f"SBS_{tg_id}_{n}.conf"
+    from app.repo import get_app_setting_int, set_app_setting_int
+
+    n = await get_app_setting_int(session, 'vpn_conf_serial', default=0)
+    n = int(n) + 1
+    await set_app_setting_int(session, 'vpn_conf_serial', n)
+    # Keep exactly the requested casing
+    return f'sbsVPN{n}.conf'
 
 
 def _reset_vpn_bundle_counter(tg_id: int) -> None:
-    """Reset per-day bundle filename counter for the user.
+    """Legacy no-op (we use a global counter for filenames now).
 
-    Called on VPN reset and on full user reset.
+    Keeping the function to avoid breaking call sites.
     """
-    # Start numbering from 1 after reset (on next выдача).
-    VPN_BUNDLE_COUNTER.pop(tg_id, None)
+    return
 
 
 
@@ -1452,13 +1442,17 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
             conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
             loc_title = "<b>ваша локация</b>"
 
+
+        filename = await _next_vpn_bundle_filename_global(session)
+        await session.commit()
+
     # Build QR + files.
     qr_img = qrcode.make(conf_text)
     buf = io.BytesIO()
     qr_img.save(buf, format="PNG")
     buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode(), filename=_next_vpn_bundle_filename(tg_id))
+    conf_file = BufferedInputFile(conf_text.encode(), filename=filename)
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
     msg_conf = await cb.bot.send_document(
@@ -1524,7 +1518,7 @@ async def _vpn_server_label(srv: dict) -> str:
 async def on_vpn_location_menu(cb: CallbackQuery) -> None:
     servers = _load_vpn_servers()
 
-    lines = ["🌍 <b>Выбор локации VPN</b>", "", "Выберите сервер. Мы не показываем занятость мест; статус — общий."]
+    lines = ["🌍 <b>Выбор локации VPN</b>", "", "Выберите сервер."]
 
     kb_rows: list[list[InlineKeyboardButton]] = []
     for srv in servers:
@@ -1691,13 +1685,20 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
         except Exception:
             pass
         return
+    # Show the migration warning only if user already has an active peer
+    from app.repo import get_active_peer
+    async with session_scope() as session:
+        active_peer = await get_active_peer(session, tg_id)
 
-    warn = (
-        "⚠️ <b>Внимание</b>\n\n"
-        "После того как вы подключитесь к новой локации, <b>старый VPN-конфиг будет отключён</b>.\n"
-        "Чтобы не потерять интернет в момент переключения, рекомендуется <b>выключить VPN</b> перед сменой и включить уже с новым конфигом.\n\n"
-        f"Переключить на {_vpn_flag(code)} <b>{srv['name']}</b>?"
-    )
+    if active_peer and (active_peer.server_code or os.environ.get('VPN_CODE', 'NL')).upper() != code:
+        warn = (
+            "⚠️ <b>Внимание</b>\n\n"
+            "После того как вы подключитесь к новой локации, <b>старый VPN-конфиг будет отключён</b>.\n"
+            "Чтобы не потерять интернет в момент переключения, рекомендуется <b>выключить VPN</b> перед сменой и включить уже с новым конфигом.\n\n"
+            f"Переключить на {_vpn_flag(code)} <b>{srv['name']}</b>?"
+        )
+    else:
+        warn = f"Получить VPN-конфиг для {_vpn_flag(code)} <b>{srv['name']}</b>?"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1764,6 +1765,9 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
                 interface=str(srv.get("interface") or "wg0"),
             )
             await session.commit()
+
+            filename = await _next_vpn_bundle_filename_global(session)
+            await session.commit()
         except Exception:
             await cb.answer("⚠️ Сервер временно недоступен", show_alert=True)
             return
@@ -1781,16 +1785,20 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     qr_img.save(buf, format="PNG")
     buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode(), filename=_next_vpn_bundle_filename(tg_id))
+    conf_file = BufferedInputFile(conf_text.encode(), filename=filename)
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
     msg_conf = await cb.message.answer_document(
         document=conf_file,
         caption=(
             f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
-            "⚠️ После подключения к новой локации <b>старый конфиг будет отключён</b>.\n"
-            "Рекомендуем на время переключения выключить VPN, затем включить с новым конфигом.\n\n"
-            f"Конфиг будет удалён через <b>{settings.auto_delete_seconds} сек.</b>"
+            + (
+                "⚠️ После подключения к новой локации <b>старый конфиг будет отключён</b>.\n"
+                "Рекомендуем на время переключения выключить VPN, затем включить с новым конфигом.\n\n"
+                if old
+                else "\n"
+            )
+            + f"Конфиг будет удалён через <b>{settings.auto_delete_seconds} сек.</b>"
         ),
         parse_mode="HTML",
     )
