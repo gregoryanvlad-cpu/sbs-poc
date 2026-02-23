@@ -656,37 +656,54 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         act_s = "—" if act is None else str(act)
         tot_s = "—" if tot is None else str(tot)
         text = (
-            "📊 <b>Статус VPN</b>\n\n"
-            f"CPU: <b>{cpu_s}</b>\n"
-            f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>\n\n"
+            "📊 <b>Статус VPN</b>
+
+"
+            f"CPU: <b>{cpu_s}</b>
+"
+            f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>
+
+"
             "Окно активности: последние ~3 минуты."
         )
-
-        # Seats (capacity) by server/location
-        try:
-            cap = int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40)
-        except Exception:
-            cap = 40
-        try:
-            used_map = await _vpn_seats_by_server()
-            servers = _load_vpn_servers_admin()
-            lines = []
-            for s in servers:
-                code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
-                name = str(s.get("name") or code)
-                used = int(used_map.get(code, 0))
-                left = max(0, cap - used)
-                lines.append(f"{code} ({name}): <b>{used}</b>/{cap} | осталось: <b>{left}</b>")
-            if lines:
-                text += "\n\n👥 <b>Места по локациям</b>\n" + "\n".join(lines)
-        except Exception:
-            pass
     else:
         text = (
-            "📊 <b>Статус VPN</b>\n\n"
-            "⚠️ Статус сейчас недоступен (SSH/сервер не отвечает).\n"
+            "📊 <b>Статус VPN</b>
+
+"
+            "⚠️ Статус сейчас недоступен (SSH/сервер не отвечает).
+"
             "Попробуй позже."
         )
+
+    # Seats (capacity) by server/location: считаем по БД, поэтому показываем даже если SSH недоступен.
+    try:
+        cap = int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40)
+    except Exception:
+        cap = 40
+
+    try:
+        used_map = await _vpn_seats_by_server()
+        servers = _load_vpn_servers_admin()
+        lines: list[str] = []
+        for s in servers:
+            code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+            name = str(s.get("name") or code)
+            used = int(used_map.get(code, 0))
+            free = max(0, cap - used)
+            lines.append(f"{code} ({name}): <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
+        if lines:
+            text += "
+
+👥 <b>Места по локациям</b>
+" + "
+".join(lines)
+    except Exception:
+        # Не скрываем блок полностью — админ должен понимать, что расчёт сломался.
+        text += "
+
+👥 <b>Места по локациям</b>
+⚠️ Не удалось рассчитать свободные места."
 
     try:
         await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
@@ -696,6 +713,8 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         else:
             raise
 
+
+@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
