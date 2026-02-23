@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import os
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -30,6 +32,71 @@ from app.services.vpn.service import vpn_service
 from app.services.regionvpn import RegionVpnService
 
 
+
+
+def _load_vpn_servers_admin() -> list[dict]:
+    """Load VPN servers from the same env format as the user menu.
+
+    Uses VPN_SERVERS_JSON (list of server dicts). Falls back to single-server
+    env vars if JSON is not provided.
+    """
+    raw = os.environ.get('VPN_SERVERS_JSON') or os.environ.get('VPN_SERVERS')
+    out: list[dict] = []
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and 'servers' in data:
+                data = data['servers']
+            if isinstance(data, list):
+                for s in data:
+                    if isinstance(s, dict):
+                        out.append(s)
+        except Exception:
+            out = []
+    if out:
+        return out
+    # fallback: single-server
+    code = (os.environ.get('VPN_CODE') or 'NL').upper()
+    return [{
+        'code': code,
+        'name': os.environ.get('VPN_NAME') or code,
+        'host': os.environ.get('VPN_SSH_HOST'),
+        'port': int(os.environ.get('VPN_SSH_PORT') or 22),
+        'user': os.environ.get('VPN_SSH_USER'),
+        'password': os.environ.get('VPN_SSH_PASSWORD'),
+        'interface': os.environ.get('VPN_INTERFACE') or 'wg0',
+        'server_public_key': os.environ.get('VPN_SERVER_PUBLIC_KEY') or os.environ.get('VPN_SERVER_PUBLIC'),
+        'endpoint': os.environ.get('VPN_ENDPOINT'),
+        'dns': os.environ.get('VPN_DNS') or '1.1.1.1',
+    }]
+
+
+async def _vpn_seats_by_server() -> dict[str, int]:
+    """Return used seats per server_code among ACTIVE subscriptions.
+
+    We count distinct tg_id with an active WireGuard peer (is_active=True)
+    AND an active subscription (end_at > now, is_active=True).
+    """
+    from app.db.models import VpnPeer, Subscription
+    now = datetime.now(timezone.utc)
+    async with session_scope() as session:
+        q = (
+            select(
+                func.coalesce(VpnPeer.server_code, os.environ.get('VPN_CODE', 'NL')).label('code'),
+                func.count(func.distinct(VpnPeer.tg_id)).label('cnt'),
+            )
+            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
+            .where(
+                VpnPeer.is_active == True,  # noqa: E712
+                Subscription.is_active == True,  # noqa: E712
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .group_by(func.coalesce(VpnPeer.server_code, os.environ.get('VPN_CODE', 'NL')))
+        )
+        res = await session.execute(q)
+        rows = res.all()
+    return {str(code).upper(): int(cnt) for code, cnt in rows}
 def _region_service() -> RegionVpnService:
     return RegionVpnService(
         ssh_host=settings.region_ssh_host,
@@ -594,6 +661,26 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>\n\n"
             "Окно активности: последние ~3 минуты."
         )
+
+        # Seats (capacity) by server/location
+        try:
+            cap = int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40)
+        except Exception:
+            cap = 40
+        try:
+            used_map = await _vpn_seats_by_server()
+            servers = _load_vpn_servers_admin()
+            lines = []
+            for s in servers:
+                code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+                name = str(s.get("name") or code)
+                used = int(used_map.get(code, 0))
+                left = max(0, cap - used)
+                lines.append(f"{code} ({name}): <b>{used}</b>/{cap} | осталось: <b>{left}</b>")
+            if lines:
+                text += "\n\n👥 <b>Места по локациям</b>\n" + "\n".join(lines)
+        except Exception:
+            pass
     else:
         text = (
             "📊 <b>Статус VPN</b>\n\n"
