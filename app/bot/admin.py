@@ -661,23 +661,15 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         act_s = "—" if act is None else str(act)
         tot_s = "—" if tot is None else str(tot)
         text = (
-            "📊 <b>Статус VPN</b>
-
-"
-            f"CPU: <b>{cpu_s}</b>
-"
-            f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>
-
-"
+            "📊 <b>Статус VPN</b>\n\n"
+            f"CPU: <b>{cpu_s}</b>\n"
+            f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>\n\n"
             "Окно активности: последние ~3 минуты."
         )
     else:
         text = (
-            "📊 <b>Статус VPN</b>
-
-"
-            "⚠️ Статус сейчас недоступен (SSH/сервер не отвечает).
-"
+            "📊 <b>Статус VPN</b>\n\n"
+            "⚠️ Статус сейчас недоступен (SSH/сервер не отвечает).\n"
             "Попробуй позже."
         )
 
@@ -690,25 +682,17 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
     try:
         used_map = await _vpn_seats_by_server()
         servers = _load_vpn_servers_admin()
-        lines: list[str] = []
+        seat_lines: list[str] = []
         for s in servers:
             code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
             name = str(s.get("name") or code)
             used = int(used_map.get(code, 0))
             free = max(0, cap - used)
-            lines.append(f"{code} ({name}): <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
-        if lines:
-            text += "
-
-👥 <b>Места по локациям</b>
-" + "
-".join(lines)
+            seat_lines.append(f"{code} ({name}): <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
+        if seat_lines:
+            text += "\n\n👥 <b>Места по локациям</b>\n" + "\n".join(seat_lines)
     except Exception:
-        # Не скрываем блок полностью — админ должен понимать, что расчёт сломался.
-        text += "
-
-👥 <b>Места по локациям</b>
-⚠️ Не удалось рассчитать свободные места."
+        text += "\n\n👥 <b>Места по локациям</b>\n⚠️ Не удалось рассчитать свободные места."
 
     try:
         await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
@@ -717,7 +701,6 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
         else:
             raise
-
 
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 
