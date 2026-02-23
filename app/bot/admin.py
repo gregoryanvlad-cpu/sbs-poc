@@ -13,7 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, literal
 
 from dateutil.relativedelta import relativedelta
 
@@ -79,10 +79,15 @@ async def _vpn_seats_by_server() -> dict[str, int]:
     """
     from app.db.models import VpnPeer, Subscription
     now = datetime.now(timezone.utc)
+    # Use a single SQLAlchemy literal instance to avoid generating different
+    # bind params for the same constant in SELECT vs GROUP BY.
+    # Otherwise Postgres may throw: "column vpn_peers.server_code must appear in the GROUP BY..."
+    default_code = (os.environ.get('VPN_CODE') or 'NL').upper()
+    default_code_lit = literal(default_code)
     async with session_scope() as session:
         q = (
             select(
-                func.coalesce(VpnPeer.server_code, os.environ.get('VPN_CODE', 'NL')).label('code'),
+                func.coalesce(VpnPeer.server_code, default_code_lit).label('code'),
                 func.count(func.distinct(VpnPeer.tg_id)).label('cnt'),
             )
             .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
@@ -92,7 +97,7 @@ async def _vpn_seats_by_server() -> dict[str, int]:
                 Subscription.end_at.is_not(None),
                 Subscription.end_at > now,
             )
-            .group_by(func.coalesce(VpnPeer.server_code, os.environ.get('VPN_CODE', 'NL')))
+            .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
         )
         res = await session.execute(q)
         rows = res.all()
