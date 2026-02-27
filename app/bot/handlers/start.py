@@ -4,7 +4,7 @@ from aiogram.types import Message, ReplyKeyboardRemove
 
 from app.bot.keyboards import kb_main
 from app.db.session import session_scope
-from app.repo import ensure_user
+from app.repo import ensure_user, is_trial_available
 from app.services.referrals.service import referral_service
 
 router = Router()
@@ -22,6 +22,7 @@ async def cmd_start(message: Message) -> None:
     except Exception:
         payload = None
 
+    show_trial = False
     async with session_scope() as session:
         u = message.from_user
         await ensure_user(
@@ -42,6 +43,7 @@ async def cmd_start(message: Message) -> None:
                 )
 
         await referral_service.ensure_ref_code(session, tg_id)
+        show_trial = await is_trial_available(session, tg_id)
         await session.commit()
 
     # Greeting (обычный текст, без рамки/код-блока)
@@ -58,6 +60,6 @@ async def cmd_start(message: Message) -> None:
 
     await message.answer(
         "🏠 <b>Главное меню</b>",
-        reply_markup=kb_main(),
+        reply_markup=kb_main(show_trial=show_trial),
         parse_mode="HTML",
     )
