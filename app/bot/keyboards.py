@@ -120,6 +120,8 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="💲 Цена подписки", callback_data="admin:price")
     b.button(text="🎁 Подарить подписку", callback_data="admin:sub:gift")
     b.button(text="📣 Рассылка всем", callback_data="admin:broadcast:all")
+    b.button(text="🟢 Рассылка с подпиской", callback_data="admin:broadcast:paid")
+    b.button(text="⚪️ Рассылка без подписки", callback_data="admin:broadcast:unpaid")
     b.button(text="✉️ Сообщение пользователю", callback_data="admin:broadcast:one")
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
 
