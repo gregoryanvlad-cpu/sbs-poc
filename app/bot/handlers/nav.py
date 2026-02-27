@@ -46,7 +46,7 @@ from app.core.config import settings
 from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial
+from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int
 
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
@@ -482,6 +482,48 @@ async def _safe_cb_answer(cb: CallbackQuery) -> None:
         await cb.answer()
     except Exception:
         pass
+
+
+def _vpn_config_ttl_seconds() -> int:
+    """VPN config messages should live for 3 minutes regardless of global auto-delete."""
+    return 180
+
+
+def _kb_vpn_missed_config() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏱ Я не успел получить конфиг", callback_data="vpn:my")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+            [InlineKeyboardButton(text="🛠 Поддержка", callback_data="nav:support")],
+        ]
+    )
+
+
+async def _schedule_vpn_cleanup_and_followup(bot, *, chat_id: int, messages: list) -> None:
+    """Delete VPN config messages after 3 minutes and then show a quick recovery keyboard."""
+    await asyncio.sleep(_vpn_config_ttl_seconds())
+    deleted_any = False
+    for m in messages:
+        if not m:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=m.message_id)
+            deleted_any = True
+        except Exception:
+            pass
+
+    if deleted_any:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⏱ Сообщения с конфигом были автоматически удалены.\n\n"
+                    "Если не успели сохранить конфиг, нажмите кнопку ниже — бот отправит его повторно."
+                ),
+                reply_markup=_kb_vpn_missed_config(),
+            )
+        except Exception:
+            pass
 
 
 def _load_wg_instructions() -> dict:
@@ -1442,7 +1484,7 @@ async def on_vpn_guide(cb: CallbackQuery) -> None:
         "📖 <b>Инструкция по подключению WireGuard</b>\n\n"
         "1) Нажмите «📦 Отправить конфиг + QR»\n"
         "2) Импортируйте конфигурацию (.conf) в приложение WireGuard\n"
-        f"3) Конфиг будет удалён автоматически через <b>{settings.auto_delete_seconds} сек.</b>\n\n"
+        f"3) Конфиг будет удалён автоматически через <b>{_vpn_config_ttl_seconds()} сек.</b>\n\n"
         "Выберите устройство, чтобы открыть инструкцию:"
     )
     await cb.message.edit_text(text, reply_markup=kb_vpn_guide_platforms(), parse_mode="HTML")
@@ -1558,25 +1600,17 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
         document=conf_file,
         caption=(
             f"📌 <b>Ваш VPN-конфиг</b> ({loc_title})\n\n"
-            f"Конфиг будет удалён через <b>{settings.auto_delete_seconds} сек.</b>"
+            f"Конфиг будет удалён через <b>{_vpn_config_ttl_seconds()} сек.</b>"
         ),
         parse_mode="HTML",
     )
     msg_qr = await cb.bot.send_photo(
         chat_id=chat_id,
         photo=qr_file,
-        caption=f"QR для WireGuard (удалится через {settings.auto_delete_seconds} сек.)",
+        caption=f"QR для WireGuard (удалится через {_vpn_config_ttl_seconds()} сек.)",
     )
 
-    async def _cleanup_msgs() -> None:
-        await asyncio.sleep(settings.auto_delete_seconds)
-        for m in (msg_conf, msg_qr):
-            try:
-                await cb.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
-            except Exception:
-                pass
-
-    asyncio.create_task(_cleanup_msgs())
+    asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=chat_id, messages=[msg_conf, msg_qr]))
 
 
 # --- VPN location selection / migration ---
@@ -1923,24 +1957,16 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
                 if old
                 else "\n"
             )
-            + f"Конфиг будет удалён через <b>{settings.auto_delete_seconds} сек.</b>"
+            + f"Конфиг будет удалён через <b>{_vpn_config_ttl_seconds()} сек.</b>"
         ),
         parse_mode="HTML",
     )
     msg_qr = await cb.message.answer_photo(
         photo=qr_file,
-        caption=f"QR для WireGuard (удалится через {settings.auto_delete_seconds} сек.)",
+        caption=f"QR для WireGuard (удалится через {_vpn_config_ttl_seconds()} сек.)",
     )
 
-    async def _cleanup_msgs() -> None:
-        await asyncio.sleep(settings.auto_delete_seconds)
-        for m in (msg_conf, msg_qr):
-            try:
-                await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=m.message_id)
-            except Exception:
-                pass
-
-    asyncio.create_task(_cleanup_msgs())
+    asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=cb.message.chat.id, messages=[msg_conf, msg_qr]))
 
     await cb.answer("Конфиг отправлен")
 
@@ -2044,8 +2070,9 @@ async def on_vpn_howto(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "vpn:reset:confirm")
 async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
     # ✅ FIX: запрет экрана reset_confirm без активной подписки
+    tg_id = cb.from_user.id
     async with session_scope() as session:
-        sub = await get_subscription(session, cb.from_user.id)
+        sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
             await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
@@ -2084,6 +2111,8 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
                 await session.commit()
 
             conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+            filename = await _next_vpn_bundle_filename_global(session)
+            await session.commit()
 
             qr_img = qrcode.make(conf_text)
             buf = io.BytesIO()
@@ -2092,30 +2121,22 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
 
             conf_file = BufferedInputFile(
                 conf_text.encode(),
-                filename=f"SBS_{tg_id}.conf",
+                filename=filename,
             )
             qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
             msg_conf = await cb.bot.send_document(
                 chat_id=chat_id,
                 document=conf_file,
-                caption=f"WireGuard конфиг (после сброса). Будет удалён через {settings.auto_delete_seconds} сек.",
+                caption=f"WireGuard конфиг (после сброса). Будет удалён через {_vpn_config_ttl_seconds()} сек.",
             )
             msg_qr = await cb.bot.send_photo(
                 chat_id=chat_id,
                 photo=qr_file,
-                caption="QR для WireGuard (после сброса)",
+                caption=f"QR для WireGuard (после сброса, удалится через {_vpn_config_ttl_seconds()} сек.)",
             )
 
-            async def _cleanup():
-                await asyncio.sleep(settings.auto_delete_seconds)
-                for m in (msg_conf, msg_qr):
-                    try:
-                        await cb.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
-                    except Exception:
-                        pass
-
-            asyncio.create_task(_cleanup())
+            asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=chat_id, messages=[msg_conf, msg_qr]))
 
         except Exception:
             try:
@@ -2159,6 +2180,8 @@ async def on_trial_start(cb: CallbackQuery) -> None:
         sub.is_active = True
         sub.status = "active"
         await set_trial_used(session, tg_id)
+        await set_app_setting_int(session, f"trial_end_ts:{tg_id}", int(new_end.timestamp()))
+        await set_app_setting_int(session, f"trial_reengagement_stage:{tg_id}", 0)
         await session.commit()
 
     text = (
