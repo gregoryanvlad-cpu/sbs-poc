@@ -46,12 +46,21 @@ from app.core.config import settings
 from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used
+from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial
 
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 
 router = Router()
+
+
+async def _subscription_required_alert_text(session, tg_id: int) -> str:
+    """Choose the correct access-denied text for users without an active subscription."""
+    if await is_trial_available(session, tg_id):
+        return "Сначала активируйте пробный период: кнопка «🎁 Пробный период 5 дней» в главном меню."
+    if await has_used_trial(session, tg_id):
+        return "Ваш пробный период закончился. Чтобы продолжить пользоваться сервисом, оплатите подписку."
+    return "Для доступа необходимо оплатить подписку!"
 
 # --- VPN-Region (VLESS + Reality) ---
 
@@ -1460,7 +1469,7 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
         from app.db.models.vpn_peer import VpnPeer
@@ -1745,7 +1754,7 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
     servers = _load_vpn_servers()
@@ -1831,7 +1840,7 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
     servers = _load_vpn_servers()
@@ -2038,7 +2047,7 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, cb.from_user.id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
     await cb.message.edit_text(
@@ -2058,7 +2067,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
     await cb.answer("Сбрасываю…")
@@ -2172,13 +2181,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            if await is_trial_available(session, tg_id):
-                await cb.answer(
-                    "Сначала активируйте пробный период: кнопка «🎁 Пробный период 5 дней» в главном меню.",
-                    show_alert=True,
-                )
-            else:
-                await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
     await on_vpn_location_menu(cb)
