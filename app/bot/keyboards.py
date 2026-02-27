@@ -2,11 +2,13 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-def kb_main() -> InlineKeyboardMarkup:
+def kb_main(*, show_trial: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
     b.button(text="🟡 Yandex Plus", callback_data="nav:yandex")
     b.button(text="🌍 VPN", callback_data="nav:vpn")
+    if show_trial:
+        b.button(text="🎁 Пробный период 5 дней", callback_data="trial:start")
     b.button(text="💳 Оплата", callback_data="nav:pay")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
@@ -117,6 +119,8 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
     b.button(text="💲 Цена подписки", callback_data="admin:price")
     b.button(text="🎁 Подарить подписку", callback_data="admin:sub:gift")
+    b.button(text="📣 Рассылка всем", callback_data="admin:broadcast:all")
+    b.button(text="✉️ Сообщение пользователю", callback_data="admin:broadcast:one")
     b.button(text="💰 Накрутить реф-баланс (TEST)", callback_data="admin:ref:mint")
 
     # Legacy / test
