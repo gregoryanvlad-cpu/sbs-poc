@@ -20,7 +20,7 @@ from dateutil.relativedelta import relativedelta
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
-from app.db.models import ReferralEarning, User
+from app.db.models import ReferralEarning, Subscription, User
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
@@ -184,6 +184,15 @@ def _fmt_plus_end_at(dt: datetime | None) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.date().isoformat()
+
+
+def _fmt_sub_end_at(dt: datetime | None, *, active: bool) -> str:
+    if not dt:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    suffix = "" if active else " (не активна)"
+    return f"{dt.date().isoformat()}{suffix}"
 
 
 async def _resolve_tg_id(bot, raw: str) -> int | None:
@@ -355,6 +364,7 @@ async def admin_menu(cb: CallbackQuery) -> None:
 async def _render_users_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
     per_page = 25
     page = max(1, int(page))
+    now = _utcnow()
 
     async with session_scope() as session:
         total = await session.scalar(select(func.count()).select_from(User))
@@ -364,21 +374,30 @@ async def _render_users_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
         page = min(page, pages)
 
         q = (
-            select(User)
+            select(User, Subscription)
+            .outerjoin(Subscription, Subscription.tg_id == User.tg_id)
             .order_by(User.created_at.desc())
             .offset((page - 1) * per_page)
             .limit(per_page)
         )
-        users = (await session.execute(q)).scalars().all()
+        rows = (await session.execute(q)).all()
 
     lines: list[str] = []
-    for u in users:
+    for u, sub in rows:
         username = f"@{u.tg_username}" if u.tg_username else "—"
         name_parts = [p for p in [u.first_name, u.last_name] if p]
         name = " ".join(name_parts) if name_parts else "—"
-        lines.append(f"• <code>{u.tg_id}</code> | {username} | {name}")
+        end_at = None
+        if sub and sub.end_at:
+            end_at = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
+        is_active = bool(sub and sub.is_active and end_at and end_at > now)
+        status = "активна" if is_active else "не активна"
+        lines.append(
+            f"• <code>{u.tg_id}</code> | {username} | {name}\n"
+            f"  Подписка: <b>{status}</b> | до: <b>{_fmt_sub_end_at(end_at, active=is_active)}</b>"
+        )
 
-    body = "\n".join(lines) if lines else "(пока нет пользователей)"
+    body = "\n\n".join(lines) if lines else "(пока нет пользователей)"
     text = (
         "👤 <b>Все зарегистрированные пользователи</b>\n\n"
         f"Всего: <b>{total}</b> | Страница: <b>{page}/{pages}</b>\n\n"
@@ -665,6 +684,44 @@ async def admin_broadcast_all_start(cb: CallbackQuery, state: FSMContext) -> Non
     )
 
 
+@router.callback_query(lambda c: c.data == "admin:broadcast:paid")
+async def admin_broadcast_paid_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.update_data(broadcast_mode="paid")
+    await state.set_state(AdminBroadcastFSM.waiting_text)
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+    await cb.message.answer(
+        "🟢 <b>Рассылка пользователям с активной подпиской</b>\n\nОтправьте следующим сообщением текст рассылки.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:broadcast:unpaid")
+async def admin_broadcast_unpaid_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.update_data(broadcast_mode="unpaid")
+    await state.set_state(AdminBroadcastFSM.waiting_text)
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+    await cb.message.answer(
+        "⚪️ <b>Рассылка пользователям без активной подписки</b>\n\nОтправьте следующим сообщением текст рассылки.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(lambda c: c.data == "admin:broadcast:one")
 async def admin_broadcast_one_start(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
@@ -741,8 +798,35 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
             await message.answer(f"⚠️ Не удалось отправить сообщение пользователю <code>{target}</code>.", reply_markup=kb_admin_menu(), parse_mode="HTML")
         return
 
+    now = _utcnow()
     async with session_scope() as session:
-        res = await session.execute(select(User.tg_id).order_by(User.created_at.asc()))
+        if mode == "paid":
+            res = await session.execute(
+                select(User.tg_id)
+                .join(Subscription, Subscription.tg_id == User.tg_id)
+                .where(
+                    Subscription.is_active == True,  # noqa: E712
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at > now,
+                )
+                .order_by(User.created_at.asc())
+            )
+        elif mode == "unpaid":
+            active_subq = (
+                select(Subscription.tg_id)
+                .where(
+                    Subscription.is_active == True,  # noqa: E712
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at > now,
+                )
+            )
+            res = await session.execute(
+                select(User.tg_id)
+                .where(User.tg_id.not_in(active_subq))
+                .order_by(User.created_at.asc())
+            )
+        else:
+            res = await session.execute(select(User.tg_id).order_by(User.created_at.asc()))
         targets = [int(x) for x in res.scalars().all()]
 
     for target in targets:
@@ -754,8 +838,14 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
         await asyncio.sleep(0.03)
 
     await state.clear()
+    mode_label = {
+        "all": "всем пользователям",
+        "paid": "пользователям с активной подпиской",
+        "unpaid": "пользователям без активной подписки",
+    }.get(mode, "пользователям")
     await message.answer(
         "✅ <b>Рассылка завершена</b>\n\n"
+        f"Сегмент: <b>{mode_label}</b>\n"
         f"Доставлено: <b>{sent}</b>\n"
         f"Ошибок: <b>{failed}</b>",
         reply_markup=kb_admin_menu(),
