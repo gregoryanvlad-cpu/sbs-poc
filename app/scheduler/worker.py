@@ -15,7 +15,7 @@ from app.db.session import session_scope
 from app.db.models import Payment, Subscription, VpnPeer
 from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
-from app.repo import list_expired_subscriptions, set_subscription_expired
+from app.repo import list_expired_subscriptions, set_subscription_expired, get_app_setting_int, set_app_setting_int
 from app.services.yandex.service import yandex_service
 from app.services.referrals.service import referral_service
 from app.services.regionvpn.service import RegionVpnService
@@ -240,6 +240,7 @@ async def run_scheduler() -> None:
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
                     await _job_user_subscription_notifications(bot)
+                    await _job_trial_reengagement_notifications(bot)
                     # Make pending referral earnings available when hold expires.
                     try:
                         released = await referral_service.release_pending(session)
@@ -510,6 +511,131 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
                     changed = True
                 except Exception:
                     pass
+
+        if changed:
+            await session.commit()
+
+
+TRIAL_REENGAGEMENT_DAY_MARKS = [1, 4, 8, 11, 15, 18, 22, 25, 32, 46, 60, 74, 95, 125, 155]
+
+
+def _trial_reengagement_text() -> str:
+    return (
+        "Вы уверены, что больше не хотите продлять подписку?\n\n"
+        "Люди получают подписку яндекс плюс и получает высокоскоростной впн, "
+        "работающий всегда стабильно.\n\n"
+        "Нажмите кнопку ниже чтобы перейти к оплате подписки."
+    )
+
+
+def _trial_reengagement_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Купить подписку", callback_data="nav:pay")],
+            [InlineKeyboardButton(text="Я уверен", callback_data="nav:home")],
+        ]
+    )
+
+
+async def _job_trial_reengagement_notifications(bot: Bot) -> None:
+    """Re-engagement drip for users whose 5-day trial expired and who never paid.
+
+    Schedule for 6 months after trial end (fixed checkpoints):
+    1st month — ~2 times/week, then gradually less often.
+    """
+    now = _utcnow()
+
+    async with session_scope() as session:
+        q = (
+            select(Subscription)
+            .where(
+                Subscription.end_at.is_not(None),
+                Subscription.end_at <= now,
+            )
+            .order_by(Subscription.tg_id.asc())
+            .limit(1000)
+        )
+        rows = (await session.execute(q)).scalars().all()
+        if not rows:
+            return
+
+        changed = False
+
+        for sub in rows:
+            tg_id = int(sub.tg_id)
+
+            # Only users who used trial and still have never made a paid purchase.
+            trial_used = bool(await get_app_setting_int(session, f"trial_used:{tg_id}", default=0))
+            if not trial_used:
+                continue
+
+            paid_q = (
+                select(Payment.id)
+                .where(
+                    Payment.tg_id == tg_id,
+                    Payment.status == "success",
+                    Payment.amount_rub.is_not(None),
+                    Payment.amount_rub > 0,
+                )
+                .limit(1)
+            )
+            has_paid = (await session.execute(paid_q)).first() is not None
+            if has_paid:
+                continue
+
+            if bool(sub.is_active) and sub.end_at and _ensure_tz(sub.end_at) > now:
+                continue
+
+            trial_end_ts = await get_app_setting_int(session, f"trial_end_ts:{tg_id}", default=0)
+            if trial_end_ts > 0:
+                trial_end_at = datetime.fromtimestamp(int(trial_end_ts), tz=timezone.utc)
+            else:
+                trial_pay_q = (
+                    select(Payment.paid_at)
+                    .where(
+                        Payment.tg_id == tg_id,
+                        Payment.status == "success",
+                        Payment.provider == "trial",
+                    )
+                    .order_by(Payment.id.desc())
+                    .limit(1)
+                )
+                trial_paid_at = (await session.execute(trial_pay_q)).scalar_one_or_none()
+                if trial_paid_at is None and sub.end_at is not None:
+                    trial_paid_at = _ensure_tz(sub.end_at) - timedelta(days=5)
+                if trial_paid_at is None:
+                    continue
+                trial_end_at = _ensure_tz(trial_paid_at) + timedelta(days=5)
+                await set_app_setting_int(session, f"trial_end_ts:{tg_id}", int(trial_end_at.timestamp()))
+                changed = True
+
+            if trial_end_at > now:
+                continue
+
+            days_since_end = max(0, int((now - trial_end_at).total_seconds() // 86400))
+            stage_key = f"trial_reengagement_stage:{tg_id}"
+            sent_stage = int(await get_app_setting_int(session, stage_key, default=0))
+
+            due_stage = sent_stage
+            for idx_mark, day_mark in enumerate(TRIAL_REENGAGEMENT_DAY_MARKS, start=1):
+                if days_since_end >= day_mark:
+                    due_stage = idx_mark
+                else:
+                    break
+
+            if due_stage <= sent_stage:
+                continue
+
+            try:
+                await bot.send_message(
+                    tg_id,
+                    _trial_reengagement_text(),
+                    reply_markup=_trial_reengagement_kb(),
+                )
+                await set_app_setting_int(session, stage_key, due_stage)
+                changed = True
+            except Exception:
+                pass
 
         if changed:
             await session.commit()
