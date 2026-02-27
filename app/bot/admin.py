@@ -287,6 +287,11 @@ class AdminGiftSubFSM(StatesGroup):
     waiting_months = State()
 
 
+class AdminBroadcastFSM(StatesGroup):
+    waiting_target = State()
+    waiting_text = State()
+
+
 # ==========================
 # ADMIN MENU
 # ==========================
@@ -641,6 +646,123 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.callback_query(lambda c: c.data == "admin:broadcast:all")
+async def admin_broadcast_all_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.update_data(broadcast_mode="all")
+    await state.set_state(AdminBroadcastFSM.waiting_text)
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+    await cb.message.answer(
+        "📣 <b>Рассылка всем пользователям</b>\n\nОтправьте следующий сообщением текст рассылки.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:broadcast:one")
+async def admin_broadcast_one_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.set_state(AdminBroadcastFSM.waiting_target)
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+    await cb.message.answer(
+        "✉️ <b>Сообщение пользователю</b>\n\nУкажите Telegram ID или @username.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminBroadcastFSM.waiting_target)
+async def admin_broadcast_one_target(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Укажите Telegram ID или @username.", reply_markup=_kb_admin_back())
+        return
+    tg_id = await _resolve_tg_id(message.bot, raw)
+    if not tg_id:
+        await message.answer(
+            "❌ Не удалось определить пользователя. Используйте <code>123456789</code> или @username.",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+        return
+    await state.update_data(broadcast_mode="one", broadcast_target=int(tg_id))
+    await state.set_state(AdminBroadcastFSM.waiting_text)
+    await message.answer(
+        f"✍️ Теперь отправьте текст сообщения для <code>{tg_id}</code>.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminBroadcastFSM.waiting_text)
+async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    payload = (message.text or "").strip()
+    if not payload:
+        await message.answer("❌ Текст рассылки не должен быть пустым.", reply_markup=_kb_admin_back())
+        return
+
+    data = await state.get_data()
+    mode = str(data.get("broadcast_mode") or "")
+
+    sent = 0
+    failed = 0
+
+    if mode == "one":
+        target = int(data.get("broadcast_target") or 0)
+        if not target:
+            await state.clear()
+            await message.answer("⚠️ Получатель не найден. Начните заново.", reply_markup=kb_admin_menu())
+            return
+        try:
+            await message.bot.send_message(target, payload, parse_mode=None, disable_web_page_preview=True)
+            sent = 1
+        except Exception:
+            failed = 1
+        await state.clear()
+        if sent:
+            await message.answer(f"✅ Сообщение отправлено пользователю <code>{target}</code>.", reply_markup=kb_admin_menu(), parse_mode="HTML")
+        else:
+            await message.answer(f"⚠️ Не удалось отправить сообщение пользователю <code>{target}</code>.", reply_markup=kb_admin_menu(), parse_mode="HTML")
+        return
+
+    async with session_scope() as session:
+        res = await session.execute(select(User.tg_id).order_by(User.created_at.asc()))
+        targets = [int(x) for x in res.scalars().all()]
+
+    for target in targets:
+        try:
+            await message.bot.send_message(target, payload, parse_mode=None, disable_web_page_preview=True)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.03)
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Рассылка завершена</b>\n\n"
+        f"Доставлено: <b>{sent}</b>\n"
+        f"Ошибок: <b>{failed}</b>",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(lambda c: c.data == "admin:vpn:status")
 async def admin_vpn_status(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
@@ -701,8 +823,6 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
         else:
             raise
-
-@router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
