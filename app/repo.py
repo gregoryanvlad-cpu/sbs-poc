@@ -49,6 +49,33 @@ async def get_price_rub(session: AsyncSession) -> int:
     return await get_app_setting_int(session, "price_rub", default=settings.price_rub)
 
 
+async def has_successful_payments(session: AsyncSession, tg_id: int) -> bool:
+    q = select(Payment.id).where(Payment.tg_id == tg_id, Payment.status == "success").limit(1)
+    res = await session.execute(q)
+    return res.first() is not None
+
+
+async def has_used_trial(session: AsyncSession, tg_id: int) -> bool:
+    key = f"trial_used:{int(tg_id)}"
+    return bool(await get_app_setting_int(session, key, default=0))
+
+
+async def set_trial_used(session: AsyncSession, tg_id: int) -> None:
+    key = f"trial_used:{int(tg_id)}"
+    await set_app_setting_int(session, key, 1)
+
+
+async def is_trial_available(session: AsyncSession, tg_id: int) -> bool:
+    if await has_used_trial(session, tg_id):
+        return False
+    if await has_successful_payments(session, tg_id):
+        return False
+    sub = await get_subscription(session, tg_id)
+    if bool(getattr(sub, "is_active", False)) and getattr(sub, "end_at", None) and sub.end_at > utcnow():
+        return False
+    return True
+
+
 async def create_content_request(
     session: AsyncSession,
     tg_id: int,
