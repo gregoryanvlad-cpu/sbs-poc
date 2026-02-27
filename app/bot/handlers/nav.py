@@ -6,7 +6,7 @@ import json
 import os
 from html import escape as html_escape
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import qrcode
 from aiogram import Router
@@ -25,7 +25,7 @@ try:
 except Exception:  # pragma: no cover
     CopyTextButton = None  # type: ignore
 from dateutil.relativedelta import relativedelta
-from sqlalchemy import select
+from sqlalchemy import select, func, literal
 
 from app.bot.auth import is_owner
 from app.bot.keyboards import (
@@ -46,7 +46,7 @@ from app.core.config import settings
 from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription, get_price_rub
+from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used
 
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
@@ -497,6 +497,94 @@ def _fmt_instruction_block(lines: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _wg_download_kb(platform: str) -> InlineKeyboardMarkup:
+    platform = (platform or "").lower()
+    links = {
+        "android": [("⬇️ Скачать WireGuard (Google Play)", "https://play.google.com/store/apps/details?id=com.wireguard.android")],
+        "windows": [("⬇️ Скачать WireGuard для Windows", "https://www.wireguard.com/install/")],
+        "macos": [("⬇️ Скачать WireGuard для macOS", "https://apps.apple.com/app/wireguard/id1451685025")],
+        "linux": [("⬇️ Официальная инструкция WireGuard", "https://www.wireguard.com/install/")],
+    }
+    rows: list[list[InlineKeyboardButton]] = []
+    for title, url in links.get(platform, []):
+        rows.append([InlineKeyboardButton(text=title, url=url)])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:guide")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _trial_visible_for_user(tg_id: int) -> bool:
+    async with session_scope() as session:
+        return await is_trial_available(session, tg_id)
+
+
+async def _vpn_seats_by_server_nav() -> dict[str, int]:
+    from app.db.models import VpnPeer, Subscription
+
+    now = utcnow()
+    default_code = (os.environ.get("VPN_CODE") or "NL").upper()
+    default_code_lit = literal(default_code)
+    async with session_scope() as session:
+        q = (
+            select(
+                func.coalesce(VpnPeer.server_code, default_code_lit).label("code"),
+                func.count(func.distinct(VpnPeer.tg_id)).label("cnt"),
+            )
+            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
+            .where(
+                VpnPeer.is_active == True,  # noqa: E712
+                Subscription.is_active == True,  # noqa: E712
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
+        )
+        res = await session.execute(q)
+        rows = res.all()
+    return {str(code).upper(): int(cnt) for code, cnt in rows}
+
+
+def _vpn_capacity_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40))
+    except Exception:
+        return 40
+
+
+async def _pick_available_vpn_server(*, preferred_code: str | None = None, current_tg_id: int | None = None) -> dict | None:
+    servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
+    if not servers:
+        return None
+
+    used = await _vpn_seats_by_server_nav()
+    cap = _vpn_capacity_limit()
+
+    current_code: str | None = None
+    if current_tg_id is not None:
+        from app.repo import get_active_peer
+        async with session_scope() as session:
+            active = await get_active_peer(session, int(current_tg_id))
+            if active:
+                current_code = (active.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+
+    def can_use(server: dict) -> bool:
+        code = str(server.get("code") or "").upper()
+        seats = int(used.get(code, 0))
+        if current_code == code:
+            return True
+        return seats < cap
+
+    if preferred_code:
+        preferred_code = preferred_code.upper()
+        for s in servers:
+            if str(s.get("code") or "").upper() == preferred_code and can_use(s):
+                return s
+
+    for s in servers:
+        if can_use(s):
+            return s
+    return None
+
+
 async def _build_home_text() -> str:
     """Main menu text with best-effort VPN status (supports optional multi-server display).
 
@@ -645,7 +733,8 @@ async def on_nav(cb: CallbackQuery) -> None:
         # Home text may wait on VPN status; callback already answered above.
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         try:
-            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(), parse_mode="HTML")
+            show_trial = await _trial_visible_for_user(cb.from_user.id)
+            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML")
         except Exception:
             pass
         return
@@ -1158,7 +1247,7 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
         return
 
     # Store pending payment
-    from sqlalchemy import select
+    from sqlalchemy import select, func, literal
     from app.db.models import Payment
 
     async with session_scope() as session:
@@ -1685,6 +1774,21 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
         except Exception:
             pass
         return
+    # If the selected location is full, silently redirect to another available server.
+    resolved_srv = await _pick_available_vpn_server(preferred_code=code, current_tg_id=tg_id)
+    if not resolved_srv:
+        await cb.answer("Сейчас все VPN-серверы заняты. Попробуйте чуть позже.", show_alert=True)
+        return
+    if str(resolved_srv.get("code") or "").upper() != code:
+        fallback_code = str(resolved_srv.get("code") or "").upper()
+        fallback_name = str(resolved_srv.get("name") or fallback_code)
+        await cb.answer(
+            f"На выбранной локации сейчас нет мест. Подготовим конфиг для {fallback_name}.",
+            show_alert=True,
+        )
+        code = fallback_code
+        srv = resolved_srv
+
     # Show the migration warning only if user already has an active peer
     from app.repo import get_active_peer
     async with session_scope() as session:
@@ -1731,10 +1835,18 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
             return
 
     servers = _load_vpn_servers()
-    srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
-    if not srv or not _server_is_ready(srv):
+    requested_srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
+    if not requested_srv or not _server_is_ready(requested_srv):
         await cb.answer("Сервер пока недоступен", show_alert=True)
         return
+
+    srv = await _pick_available_vpn_server(preferred_code=code, current_tg_id=tg_id)
+    if not srv:
+        await cb.answer("Сейчас все VPN-серверы заняты. Попробуйте чуть позже.", show_alert=True)
+        return
+    actual_code = str(srv.get("code") or code).upper()
+    auto_moved = actual_code != code
+    code = actual_code
 
     # Find currently active peers (could be more than one if previous migration was interrupted)
     from app.db.models import VpnPeer
@@ -1791,7 +1903,11 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     msg_conf = await cb.message.answer_document(
         document=conf_file,
         caption=(
-            f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
+            (
+                f"ℹ️ Выбранная локация была занята, поэтому выдан ближайший доступный сервер: {_vpn_flag(code)} <b>{srv['name']}</b>.\n\n"
+                if auto_moved else ""
+            )
+            + f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
             + (
                 "⚠️ После подключения к новой локации <b>старый конфиг будет отключён</b>.\n"
                 "Рекомендуем на время переключения выключить VPN, затем включить с новым конфигом.\n\n"
@@ -1912,7 +2028,7 @@ async def on_vpn_howto(cb: CallbackQuery) -> None:
         "Если что-то не подключается — попробуйте «♻️ Сбросить VPN» в меню VPN."
     )
 
-    await cb.message.edit_text(text, reply_markup=kb_vpn_guide_back(), parse_mode="HTML")
+    await cb.message.edit_text(text, reply_markup=_wg_download_kb(platform), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
 
@@ -2004,15 +2120,65 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
     asyncio.create_task(_do_reset_and_send())
 
 
+@router.callback_query(lambda c: c.data == "trial:start")
+async def on_trial_start(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    async with session_scope() as session:
+        if not await is_trial_available(session, tg_id):
+            sub = await get_subscription(session, tg_id)
+            if _is_sub_active(sub.end_at):
+                await cb.answer("У вас уже есть активная подписка — пробный период не нужен.", show_alert=True)
+            else:
+                await cb.answer("Пробный период уже был использован.", show_alert=True)
+            return
+
+        now = utcnow()
+        sub = await get_subscription(session, tg_id)
+        new_end = now + timedelta(days=5)
+        await extend_subscription(
+            session,
+            tg_id,
+            months=0,
+            days_legacy=5,
+            amount_rub=0,
+            provider="trial",
+            status="success",
+            provider_payment_id=f"trial:{tg_id}",
+        )
+        sub.start_at = sub.start_at or now
+        sub.end_at = new_end
+        sub.is_active = True
+        sub.status = "active"
+        await set_trial_used(session, tg_id)
+        await session.commit()
+
+    text = (
+        "🎁 <b>Пробный период активирован</b>\n\n"
+        "На 5 дней вам доступны все возможности сервиса.\n"
+        "Теперь откройте раздел VPN и нажмите «📦 Отправить конфиг + QR», чтобы получить конфиг и выбрать сервер."
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_main(show_trial=False), parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb_main(show_trial=False), parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
 @router.callback_query(lambda c: c.data == "vpn:bundle")
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
     # After pressing "Получить конфиг" we immediately ask for a location.
-    # выдача конфига всё равно запрещена без активной подписки.
+    # Выдача разрешена только с активной подпиской или активным пробным периодом.
     tg_id = cb.from_user.id
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
+            if await is_trial_available(session, tg_id):
+                await cb.answer(
+                    "Сначала активируйте пробный период: кнопка «🎁 Пробный период 5 дней» в главном меню.",
+                    show_alert=True,
+                )
+            else:
+                await cb.answer("Для доступа необходимо оплатить подписку!", show_alert=True)
             return
 
     await on_vpn_location_menu(cb)
