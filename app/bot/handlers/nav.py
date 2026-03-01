@@ -46,7 +46,7 @@ from app.core.config import settings
 from app.db.models import Payment, User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int
+from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int, get_app_setting_int
 
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
@@ -465,6 +465,20 @@ async def _next_vpn_bundle_filename_global(session) -> str:
     await set_app_setting_int(session, 'vpn_conf_serial', n)
     # Keep exactly the requested casing
     return f'sbsVPN{n}.conf'
+
+
+async def _get_or_assign_vpn_bundle_filename_for_peer(session, peer_id: int | None) -> str:
+    """Return a stable filename for the same peer, assigning a global serial once."""
+    if not peer_id:
+        return await _next_vpn_bundle_filename_global(session)
+    key = f"vpn_conf_peer_serial:{int(peer_id)}"
+    serial = await get_app_setting_int(session, key, default=0)
+    if int(serial or 0) <= 0:
+        serial = await get_app_setting_int(session, 'vpn_conf_serial', default=0)
+        serial = int(serial) + 1
+        await set_app_setting_int(session, 'vpn_conf_serial', serial)
+        await set_app_setting_int(session, key, int(serial))
+    return f"sbsVPN{int(serial)}.conf"
 
 
 def _reset_vpn_bundle_counter(tg_id: int) -> None:
@@ -1554,19 +1568,21 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
         servers = _load_vpn_servers()
         srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
 
-        # Recreate config deterministically from stored peer keys.
+        # Rebuild the exact same config from the stored peer row (no re-issue, no rotation).
+        peer = vpn_service._row_to_peer_dict(active)
         if srv and _server_is_ready(srv):
-            peer = await vpn_service.ensure_peer_for_server(
-                session,
-                tg_id,
-                server_code=code,
-                host=str(srv["host"]),
-                port=int(srv.get("port") or 22),
-                user=str(srv["user"]),
-                password=srv.get("password"),
-                interface=str(srv.get("interface") or "wg0"),
-            )
-            await session.commit()
+            try:
+                await vpn_service.ensure_rate_limit_for_server(
+                    tg_id=tg_id,
+                    ip=str(active.client_ip),
+                    host=str(srv["host"]),
+                    port=int(srv.get("port") or 22),
+                    user=str(srv["user"]),
+                    password=srv.get("password"),
+                    interface=str(srv.get("interface") or "wg0"),
+                )
+            except Exception:
+                pass
             conf_text = vpn_service.build_wg_conf(
                 peer,
                 user_label=str(tg_id),
@@ -1577,13 +1593,14 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
             loc_title = f"{_vpn_flag(code)} <b>{srv.get('name') or code}</b>"
         else:
             # Legacy single-server mode.
-            peer = await vpn_service.ensure_peer(session, tg_id)
-            await session.commit()
+            try:
+                await vpn_service.ensure_rate_limit(tg_id=tg_id, ip=str(active.client_ip))
+            except Exception:
+                pass
             conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
             loc_title = "<b>ваша локация</b>"
 
-
-        filename = await _next_vpn_bundle_filename_global(session)
+        filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, getattr(active, 'id', None))
         await session.commit()
 
     # Build QR + files.
@@ -1919,9 +1936,21 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
                 password=srv.get("password"),
                 interface=str(srv.get("interface") or "wg0"),
             )
+            try:
+                await vpn_service.ensure_rate_limit_for_server(
+                    tg_id=tg_id,
+                    ip=str(peer.get("client_ip") or ""),
+                    host=str(srv["host"]),
+                    port=int(srv.get("port") or 22),
+                    user=str(srv["user"]),
+                    password=srv.get("password"),
+                    interface=str(srv.get("interface") or "wg0"),
+                )
+            except Exception:
+                pass
             await session.commit()
 
-            filename = await _next_vpn_bundle_filename_global(session)
+            filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, peer.get("peer_id"))
             await session.commit()
         except Exception:
             await cb.answer("⚠️ Сервер временно недоступен", show_alert=True)
@@ -2108,11 +2137,14 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
         try:
             async with session_scope() as session:
                 peer = await vpn_service.rotate_peer(session, tg_id, reason="manual_reset")
+                try:
+                    await vpn_service.ensure_rate_limit(tg_id=tg_id, ip=str(peer.get("client_ip") or ""))
+                except Exception:
+                    pass
+                filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, peer.get("peer_id"))
                 await session.commit()
 
             conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
-            filename = await _next_vpn_bundle_filename_global(session)
-            await session.commit()
 
             qr_img = qrcode.make(conf_text)
             buf = io.BytesIO()
