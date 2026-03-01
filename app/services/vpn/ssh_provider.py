@@ -26,6 +26,15 @@ class WireGuardSSHProvider:
 
         self._key_obj = None
 
+        # Best-effort per-user bandwidth limit for WireGuard users.
+        # Enabled by default so paid users and trial users have identical conditions.
+        self._tc_enabled = str(os.environ.get("WG_TC_ENABLED", os.environ.get("VPN_TC_ENABLED", "1"))).strip().lower() not in {"0", "false", "no", "off"}
+        self._tc_dev = (os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or "eth0").strip() or "eth0"
+        try:
+            self._tc_rate_mbit = int((os.environ.get("WG_TC_RATE_MBIT") or os.environ.get("VPN_TC_RATE_MBIT") or "25").strip() or "25")
+        except Exception:
+            self._tc_rate_mbit = 25
+
         key_b64 = os.environ.get("WG_SSH_PRIVATE_KEY_B64")
         if key_b64:
             key_text = base64.b64decode(key_b64.encode()).decode()
@@ -86,10 +95,15 @@ class WireGuardSSHProvider:
                 await asyncio.sleep(0.5)
         raise last
 
-    async def add_peer(self, public_key: str, client_ip: str) -> None:
+    async def add_peer(self, public_key: str, client_ip: str, *, tg_id: int | None = None) -> None:
         await self._run(
             f"{WG_BIN} set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
         )
+        # Best-effort: keep all users on the same 25 Mbit plan.
+        try:
+            await self.tc_apply_limit_for_ip(ip=client_ip, tg_id=int(tg_id or 0))
+        except Exception:
+            log.exception("wg_tc_apply_limit_failed ip=%s tg_id=%s", client_ip, tg_id)
 
     async def remove_peer(self, public_key: str) -> None:
         try:
@@ -215,3 +229,49 @@ class WireGuardSSHProvider:
         if usage > 100:
             usage = 100.0
         return round(usage, 1)
+
+    def _tc_class_for_tg(self, tg_id: int) -> int:
+        base = 10
+        span = 65000 - base
+        return base + (int(tg_id) % span)
+
+    async def _tc_init(self) -> None:
+        if not self._tc_enabled:
+            return
+        dev = self._tc_dev
+        cmd = (
+            "sudo modprobe ifb || true; "
+            "sudo ip link add ifb0 type ifb 2>/dev/null || true; "
+            "sudo ip link set dev ifb0 up 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {dev} handle ffff: ingress 2>/dev/null || true; "
+            f"sudo tc filter add dev {dev} parent ffff: protocol ip u32 match u32 0 0 "
+            "action mirred egress redirect dev ifb0 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {dev} root handle 1: htb default 999 r2q 10 2>/dev/null || true; "
+            f"sudo tc class add dev {dev} parent 1: classid 1:1 htb rate 1gbit ceil 1gbit 2>/dev/null || true; "
+            "sudo tc qdisc add dev ifb0 root handle 2: htb default 999 r2q 10 2>/dev/null || true; "
+            "sudo tc class add dev ifb0 parent 2: classid 2:1 htb rate 1gbit ceil 1gbit 2>/dev/null || true"
+        )
+        await self._run(cmd)
+
+    async def tc_apply_limit_for_ip(self, *, ip: str, tg_id: int = 0) -> None:
+        if not self._tc_enabled:
+            return
+        ip = (ip or "").strip()
+        if not ip:
+            return
+        await self._tc_init()
+        dev = self._tc_dev
+        rate = max(1, int(self._tc_rate_mbit))
+        cls = self._tc_class_for_tg(int(tg_id))
+        cmd = (
+            f"sudo tc filter del dev {dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc filter del dev ifb0 parent 2: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc class del dev {dev} classid 1:{cls} 2>/dev/null || true; "
+            f"sudo tc class del dev ifb0 classid 2:{cls} 2>/dev/null || true; "
+            f"sudo tc class add dev {dev} parent 1:1 classid 1:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
+            f"sudo tc filter add dev {dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls} 2>/dev/null || true; "
+            "sudo ip link show ifb0 >/dev/null 2>&1 || true; "
+            f"sudo tc class add dev ifb0 parent 2:1 classid 2:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
+            f"sudo tc filter add dev ifb0 protocol ip parent 2: prio {cls} u32 match ip src {ip}/32 flowid 2:{cls} 2>/dev/null || true"
+        )
+        await self._run(cmd)
