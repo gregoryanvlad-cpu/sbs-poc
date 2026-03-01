@@ -105,6 +105,7 @@ class VPNService:
     def _row_to_peer_dict(self, row: VpnPeer) -> Dict[str, Any]:
         priv_plain = crypto.decrypt(row.client_private_key_enc)
         return {
+            "peer_id": row.id,
             "tg_id": row.tg_id,
             "client_ip": row.client_ip,
             "public_key": row.client_public_key,
@@ -131,7 +132,7 @@ class VPNService:
         last = await self._get_last_peer(session, tg_id)
         if last and not last.is_active:
             log.info("vpn_restore_peer tg_id=%s peer_id=%s", tg_id, last.id)
-            await self.provider.add_peer(last.client_public_key, last.client_ip)
+            await self.provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
             last.is_active = True
             last.revoked_at = None
             last.rotation_reason = None
@@ -142,7 +143,7 @@ class VPNService:
         client_priv, client_pub = gen_keys()
 
         log.info("vpn_create_peer tg_id=%s ip=%s", tg_id, client_ip)
-        await self.provider.add_peer(client_pub, client_ip)
+        await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
             tg_id=tg_id,
@@ -158,6 +159,7 @@ class VPNService:
         await session.flush()
 
         return {
+            "peer_id": row.id,
             "tg_id": tg_id,
             "client_ip": client_ip,
             "public_key": client_pub,
@@ -212,7 +214,7 @@ class VPNService:
         last = res.scalar_one_or_none()
         if last and not last.is_active:
             log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
-            await provider.add_peer(last.client_public_key, last.client_ip)
+            await provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
             last.is_active = True
             last.revoked_at = None
             last.rotation_reason = None
@@ -222,7 +224,7 @@ class VPNService:
         client_ip = self._alloc_ip(tg_id)
         client_priv, client_pub = gen_keys()
         log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
-        await provider.add_peer(client_pub, client_ip)
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
             tg_id=tg_id,
@@ -237,12 +239,31 @@ class VPNService:
         session.add(row)
         await session.flush()
         return {
+            "peer_id": row.id,
             "tg_id": tg_id,
             "client_ip": client_ip,
             "public_key": client_pub,
             "client_private_key_enc": row.client_private_key_enc,
             "client_private_key_plain": client_priv,
         }
+
+    async def ensure_rate_limit(self, *, tg_id: int, ip: str) -> None:
+        """Best-effort apply the standard WG per-user rate limit on the default server."""
+        await self.provider.tc_apply_limit_for_ip(ip=ip, tg_id=tg_id)
+
+    async def ensure_rate_limit_for_server(
+        self,
+        *,
+        tg_id: int,
+        ip: str,
+        host: str,
+        port: int,
+        user: str,
+        password: str | None,
+        interface: str,
+    ) -> None:
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        await provider.tc_apply_limit_for_ip(ip=ip, tg_id=tg_id)
 
     async def remove_peer_for_server(
         self,
@@ -296,7 +317,7 @@ class VPNService:
         client_priv, client_pub = gen_keys()
 
         log.info("vpn_rotate_create_peer tg_id=%s ip=%s", tg_id, client_ip)
-        await self.provider.add_peer(client_pub, client_ip)
+        await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
             tg_id=tg_id,
@@ -312,6 +333,7 @@ class VPNService:
         await session.flush()
 
         return {
+            "peer_id": row.id,
             "tg_id": tg_id,
             "client_ip": client_ip,
             "public_key": client_pub,
