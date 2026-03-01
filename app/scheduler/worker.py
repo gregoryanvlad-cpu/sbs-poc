@@ -240,6 +240,7 @@ async def run_scheduler() -> None:
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
                     await _job_user_subscription_notifications(bot)
+                    await _job_trial_expiring_notifications(bot)
                     await _job_trial_reengagement_notifications(bot)
                     # Make pending referral earnings available when hold expires.
                     try:
@@ -394,6 +395,117 @@ async def _job_rotate_yandex_invites(bot: Bot) -> None:
                 )
             except Exception:
                 pass
+
+
+def _trial_expiring_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Купить подписку", callback_data="nav:pay")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+async def _job_trial_expiring_notifications(bot: Bot) -> None:
+    """Warn active trial users 3/2/1 days before trial end at an evening local time.
+
+    We send once per milestone, only after 19:00 Europe/Amsterdam (when users are
+    more likely to be on their phones), and only to users who started a trial and
+    still have never made a paid purchase.
+    """
+    now = _utcnow()
+    now_local = now.astimezone(AMSTERDAM_TZ)
+
+    # Wait until evening local time to avoid noisy daytime pings.
+    if now_local.hour < 19:
+        return
+
+    async with session_scope() as session:
+        q = (
+            select(Subscription)
+            .where(
+                Subscription.is_active.is_(True),
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .order_by(Subscription.tg_id.asc())
+            .limit(1000)
+        )
+        rows = (await session.execute(q)).scalars().all()
+        if not rows:
+            return
+
+        changed = False
+
+        for sub in rows:
+            tg_id = int(sub.tg_id)
+
+            trial_used = bool(await get_app_setting_int(session, f"trial_used:{tg_id}", default=0))
+            if not trial_used:
+                continue
+
+            paid_q = (
+                select(Payment.id)
+                .where(
+                    Payment.tg_id == tg_id,
+                    Payment.status == "success",
+                    Payment.amount_rub.is_not(None),
+                    Payment.amount_rub > 0,
+                )
+                .limit(1)
+            )
+            has_paid = (await session.execute(paid_q)).first() is not None
+            if has_paid:
+                continue
+
+            trial_end_ts = await get_app_setting_int(session, f"trial_end_ts:{tg_id}", default=0)
+            if trial_end_ts > 0:
+                trial_end_at = datetime.fromtimestamp(int(trial_end_ts), tz=timezone.utc)
+            elif sub.end_at is not None:
+                trial_end_at = _ensure_tz(sub.end_at)
+            else:
+                continue
+
+            if trial_end_at <= now:
+                continue
+
+            days_left = _days_until(trial_end_at, now)
+            if days_left not in (3, 2, 1):
+                continue
+
+            sent_key = f"trial_warn_{days_left}d_sent:{tg_id}"
+            if bool(await get_app_setting_int(session, sent_key, default=0)):
+                continue
+
+            if days_left == 3:
+                text_msg = (
+                    "⏳ Ваш пробный период закончится через 3 дня.\n\n"
+                    "Чтобы не потерять доступ к VPN и Yandex Plus, можно заранее оформить полную подписку."
+                )
+            elif days_left == 2:
+                text_msg = (
+                    "⚠️ До окончания пробного периода осталось 2 дня.\n\n"
+                    "Сохраните доступ к VPN и Yandex Plus — продлите подписку заранее."
+                )
+            else:
+                text_msg = (
+                    "🚨 Завтра закончится ваш пробный период.\n\n"
+                    "Чтобы сервис продолжил работать без перерыва, оформите полную подписку уже сейчас."
+                )
+
+            try:
+                await bot.send_message(
+                    tg_id,
+                    text_msg,
+                    reply_markup=_trial_expiring_kb(),
+                )
+                await set_app_setting_int(session, sent_key, 1)
+                changed = True
+            except Exception:
+                pass
+
+        if changed:
+            await session.commit()
 
 
 async def _job_user_subscription_notifications(bot: Bot) -> None:
