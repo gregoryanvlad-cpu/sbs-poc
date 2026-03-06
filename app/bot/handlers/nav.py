@@ -1090,9 +1090,26 @@ async def on_nav(cb: CallbackQuery) -> None:
     await cb.answer("Неизвестный раздел")
 
 
-@router.callback_query(lambda c: c.data and (c.data.startswith("pay:buy") or c.data.startswith("pay:mock")))
+@router.callback_query(lambda c: c.data and (c.data.startswith("pay:buy") or c.data.startswith("pay:mock") or c.data.startswith("pay:promo:")))
 async def on_buy(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
+
+    # Promo flow: discounted first month (winback)
+    promo_amount: int | None = None
+    promo_code: str | None = None
+    promo_months: int | None = None
+    if cb.data and cb.data.startswith("pay:promo:"):
+        parts = (cb.data or "").split(":")
+        # pay:promo:<amount>
+        try:
+            promo_amount = int(parts[2])
+        except Exception:
+            promo_amount = None
+        if promo_amount in (69, 29):
+            promo_code = f"winback_{promo_amount}"
+            promo_months = 1
+        else:
+            promo_amount = None
 
     # legacy support: old buttons used pay:mock
     provider = settings.payment_provider
@@ -1100,25 +1117,36 @@ async def on_buy(cb: CallbackQuery) -> None:
         provider = "mock"
 
     if provider == "platega":
-        await _start_platega_payment(cb, tg_id=tg_id)
+        await _start_platega_payment(
+            cb,
+            tg_id=tg_id,
+            amount_override=promo_amount,
+            months_override=promo_months,
+            promo_code=promo_code,
+        )
         return
 
     async with session_scope() as session:
-        price_rub = await get_price_rub(session)
+        price_rub = promo_amount if promo_amount is not None else await get_price_rub(session)
         sub = await get_subscription(session, tg_id)
         now = utcnow()
         base = sub.end_at if sub.end_at and sub.end_at > now else now
-        new_end = base + relativedelta(months=settings.period_months)
+        add_months = promo_months if promo_months is not None else settings.period_months
+        new_end = base + relativedelta(months=add_months)
 
         await extend_subscription(
             session,
             tg_id,
-            months=settings.period_months,
-            days_legacy=settings.period_days,
+            months=add_months,
+            days_legacy=30 if promo_months is not None else settings.period_days,
             amount_rub=price_rub,
-            provider="mock",
+            provider=("mock_promo" if promo_months is not None else "mock"),
             status="success",
         )
+
+        # Consume winback promo once per user lifetime.
+        if promo_months is not None:
+            await set_app_setting_int(session, f"winback_promo_consumed:{tg_id}", 1)
 
         # Restore WG access if peers were disabled due to expiration (within 24h).
         await _restore_wg_peers_after_payment(session, tg_id)
@@ -1213,18 +1241,26 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                     sub = await get_subscription(session, tg_id)
                     now = utcnow()
                     base = sub.end_at if sub.end_at and sub.end_at > now else now
-                    new_end = base + relativedelta(months=settings.period_months)
+                    add_months = int(getattr(pay, "period_months", 1) or 1)
+                    new_end = base + relativedelta(months=add_months)
 
                     await extend_subscription(
                         session,
                         tg_id,
-                        months=settings.period_months,
-                        days_legacy=settings.period_days,
+                        months=add_months,
+                        days_legacy=int(getattr(pay, "period_days", 30) or 30),
                         amount_rub=int(pay.amount),
                         provider="platega",
                         status="success",
                         provider_payment_id=provider_tid,
                     )
+
+                    # Mark one-time winback promo as consumed if this payment was promo.
+                    try:
+                        if (pay.provider or "").startswith("platega_winback_"):
+                            await set_app_setting_int(session, f"winback_promo_consumed:{tg_id}", 1)
+                    except Exception:
+                        pass
 
                     await _restore_wg_peers_after_payment(session, tg_id)
 
@@ -1272,7 +1308,14 @@ def _ensure_pay_watch_task(bot, *, payment_db_id: int, tg_id: int) -> None:
 
     _PAY_WATCH_TASKS[payment_db_id] = asyncio.create_task(_runner())
 
-async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
+async def _start_platega_payment(
+    cb: CallbackQuery,
+    *,
+    tg_id: int,
+    amount_override: int | None = None,
+    months_override: int | None = None,
+    promo_code: str | None = None,
+) -> None:
     """Creates a Platega transaction and sends user the payment link + check button."""
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -1297,11 +1340,16 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
     client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
 
     async with session_scope() as session:
-        price_rub = await get_price_rub(session)
+        price_rub = amount_override if amount_override is not None else await get_price_rub(session)
+
+    pay_months = months_override if months_override is not None else settings.period_months
+    pay_days = 30 if months_override is not None else settings.period_days
 
     # We pack some useful info into payload for easier troubleshooting.
-    payload = f"tg_id={tg_id};period={settings.period_months}m"
-    description = f"Подписка SBS: {settings.period_months} мес (TG {tg_id})"
+    payload = f"tg_id={tg_id};period={pay_months}m"
+    if promo_code:
+        payload += f";promo={promo_code}"
+    description = f"Подписка SBS: {pay_months} мес (TG {tg_id})"
 
     try:
         res = await client.create_transaction(
@@ -1337,10 +1385,10 @@ async def _start_platega_payment(cb: CallbackQuery, *, tg_id: int) -> None:
             tg_id=tg_id,
             amount=price_rub,
             currency="RUB",
-            provider="platega",
+            provider=(f"platega_{promo_code}" if promo_code else "platega"),
             status="pending",
-            period_days=settings.period_days,
-            period_months=settings.period_months,
+            period_days=pay_days,
+            period_months=pay_months,
             provider_payment_id=res.transaction_id,
         )
         session.add(p)
@@ -1428,18 +1476,26 @@ async def on_pay_check(cb: CallbackQuery) -> None:
             sub = await get_subscription(session, cb.from_user.id)
             now = utcnow()
             base = sub.end_at if sub.end_at and sub.end_at > now else now
-            new_end = base + relativedelta(months=settings.period_months)
+            add_months = int(getattr(pay, "period_months", 1) or 1)
+            new_end = base + relativedelta(months=add_months)
 
             await extend_subscription(
                 session,
                 cb.from_user.id,
-                months=settings.period_months,
-                days_legacy=settings.period_days,
+                months=add_months,
+                days_legacy=int(getattr(pay, "period_days", 30) or 30),
                 amount_rub=int(pay.amount),
                 provider="platega",
                 status="success",
                 provider_payment_id=pay.provider_payment_id,
             )
+
+            # Mark one-time winback promo as consumed if this payment was promo.
+            try:
+                if (pay.provider or "").startswith("platega_winback_"):
+                    await set_app_setting_int(session, f"winback_promo_consumed:{cb.from_user.id}", 1)
+            except Exception:
+                pass
 
             await _restore_wg_peers_after_payment(session, cb.from_user.id)
 
