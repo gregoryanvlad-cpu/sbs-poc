@@ -1507,6 +1507,21 @@ async def on_pay_check(cb: CallbackQuery) -> None:
             sub.end_at = new_end
             sub.is_active = True
             sub.status = "active"
+
+            # If user has (or had) Yandex Plus membership, refresh invite link immediately
+            # after renewal so they don't keep an outdated link/family in the cabinet.
+            new_invite_link: str | None = None
+            try:
+                if settings.yandex_enabled:
+                    from app.services.yandex.service import yandex_service
+
+                    new_invite_link = await yandex_service.rotate_membership_for_user_if_needed(
+                        session, tg_id=cb.from_user.id
+                    )
+            except Exception:
+                # do not fail payment flow
+                new_invite_link = None
+
             await session.commit()
 
             await cb.answer("Оплата подтверждена")
@@ -1519,6 +1534,26 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                 reply_markup=kb,
                 parse_mode="HTML",
             )
+
+            # Notify about a refreshed Yandex Plus invite if it was re-issued.
+            if new_invite_link:
+                try:
+                    await cb.bot.send_message(
+                        cb.from_user.id,
+                        "🟡 <b>Yandex Plus</b>\n\n"
+                        "Мы обновили ваше приглашение в семейную подписку."
+                        "\nНажмите кнопку ниже, чтобы открыть приглашение:",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [InlineKeyboardButton(text="🔗 Открыть приглашение", url=new_invite_link)],
+                                [InlineKeyboardButton(text="🟡 Yandex Plus", callback_data="nav:yandex")],
+                                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                            ]
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
             return
 
         if status in ("FAILED", "CANCELLED", "EXPIRED", "REJECTED"):
