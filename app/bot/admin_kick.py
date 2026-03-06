@@ -41,7 +41,10 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
     # Use only the latest active (removed_at IS NULL) membership row per TG to avoid duplicates.
     async with session_scope() as session:
         latest_active_ids = (
-            select(func.max(YandexMembership.id).label("id"))
+            select(
+                YandexMembership.tg_id.label("tg_id"),
+                func.max(YandexMembership.id).label("id"),
+            )
             .where(YandexMembership.removed_at.is_(None))
             .group_by(YandexMembership.tg_id)
             .subquery()
@@ -49,7 +52,8 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
 
         base = (
             select(Subscription, YandexMembership)
-            .outerjoin(latest_active_ids, latest_active_ids.c.id.is_not(None))
+            .select_from(Subscription)
+            .outerjoin(latest_active_ids, latest_active_ids.c.tg_id == Subscription.tg_id)
             .outerjoin(YandexMembership, YandexMembership.id == latest_active_ids.c.id)
             .where(Subscription.end_at.is_not(None))
         )
