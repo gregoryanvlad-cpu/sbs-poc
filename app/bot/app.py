@@ -3,7 +3,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 from app.core.config import settings
-from app.bot.middlewares import CorrelationIdMiddleware
+from app.bot.middlewares import CorrelationIdMiddleware, ActivitySeenMiddleware
 
 from app.bot.handlers import start, nav, referrals, yandex, kinoteka
 from app.bot.admin import router as admin_router
@@ -20,6 +20,10 @@ def run_bot():
 
     dp.message.middleware(CorrelationIdMiddleware())
     dp.callback_query.middleware(CorrelationIdMiddleware())
+
+    # Best-effort: mark notifications as "seen" when user interacts.
+    dp.message.middleware(ActivitySeenMiddleware())
+    dp.callback_query.middleware(ActivitySeenMiddleware())
 
     dp.include_router(start.router)
     dp.include_router(nav.router)
