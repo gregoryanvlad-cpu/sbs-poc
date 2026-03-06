@@ -12,6 +12,7 @@ from sqlalchemy.orm import aliased
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
 from app.db.models.subscription import Subscription
+from app.db.models.vpn_peer import VpnPeer
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 
@@ -37,6 +38,41 @@ def _sub_start_dt(sub: Subscription) -> datetime | None:
     older versions referenced `created_at`, so we resolve robustly.
     """
     return getattr(sub, "created_at", None) or getattr(sub, "start_at", None)
+
+
+def _fmt_hours_left(target: datetime, now: datetime) -> str:
+    """Human-friendly delta string in hours/minutes."""
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    delta = target - now
+    total_sec = int(delta.total_seconds())
+    sign = 1
+    if total_sec < 0:
+        sign = -1
+        total_sec = -total_sec
+    hours = total_sec // 3600
+    mins = (total_sec % 3600) // 60
+    if sign > 0:
+        return f"через {hours} ч {mins} мин"
+    return f"просрочено на {hours} ч {mins} мин"
+
+
+def _renewal_text(*, sub_end_at: datetime | None, coverage_end_at: datetime | None, has_membership: bool) -> str:
+    """Return a truthful renewal text.
+
+    We consider 'Продлевалась' only when user has a membership row with
+    coverage_end_at and subscription end is AFTER that coverage end.
+    If user is not in Yandex family, the renewal concept is not applicable.
+    """
+    if not has_membership:
+        return "—"
+    if not sub_end_at or not coverage_end_at:
+        return "Не продлевалась"
+    se = sub_end_at if sub_end_at.tzinfo else sub_end_at.replace(tzinfo=timezone.utc)
+    ce = coverage_end_at if coverage_end_at.tzinfo else coverage_end_at.replace(tzinfo=timezone.utc)
+    return "Продлевалась" if se > ce else "Не продлевалась"
 
 
 @router.callback_query(lambda c: c.data == "admin:kick:report")
@@ -87,6 +123,20 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             )
         ).all()
 
+        # Preload VPN peer states in one query to avoid per-user DB chatter.
+        tg_ids: set[int] = {int(sub.tg_id) for sub, _m in (due_rows + soon_rows)}
+        peer_states: dict[int, dict[str, bool]] = {tid: {"any": False, "active": False} for tid in tg_ids}
+        if tg_ids:
+            peer_rows = await session.execute(
+                select(VpnPeer.tg_id, VpnPeer.is_active).where(VpnPeer.tg_id.in_(list(tg_ids)))
+            )
+            for tg_id, is_active in peer_rows.all():
+                tid = int(tg_id)
+                st = peer_states.setdefault(tid, {"any": False, "active": False})
+                st["any"] = True
+                if bool(is_active):
+                    st["active"] = True
+
     lines: list[str] = []
 
     if not due_rows:
@@ -104,12 +154,17 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             except Exception:
                 pass
 
-            # VPN status: if you later add an explicit flag on Subscription, show it.
-            vpn_state = "—"
-            try:
-                vpn_state = "Включен" if bool(getattr(sub, "vpn_enabled")) else "Отключен"
-            except Exception:
-                vpn_state = "—"
+            # VPN status (WireGuard):
+            # - No peers at all -> not activated
+            # - Peers exist but none active -> disabled
+            # - Any active peer -> enabled
+            st = peer_states.get(int(sub.tg_id), {"any": False, "active": False})
+            if not st["any"]:
+                vpn_state = "Не активирован"
+            elif st["active"]:
+                vpn_state = "Включен"
+            else:
+                vpn_state = "Отключен"
 
             fam = (
                 (getattr(m, "account_label", None) if m else None)
@@ -120,6 +175,16 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             membership_state = "В семье" if m else "❗️Не добавлен в семью"
 
             started_at = _sub_start_dt(sub)
+            end_at = sub.end_at if sub.end_at else None
+            hours_line = "—"
+            if end_at:
+                hours_line = _fmt_hours_left(end_at, now)
+
+            renewal = _renewal_text(
+                sub_end_at=sub.end_at,
+                coverage_end_at=getattr(m, "coverage_end_at", None) if m else None,
+                has_membership=bool(m),
+            )
 
             lines.append(
                 f"<b>#{i}</b>\n"
@@ -130,7 +195,8 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
                 f"Наименование семьи (label): <code>{fam}</code>\n"
                 f"Номер слота: <code>{slot}</code>\n"
                 f"VPN: <b>{vpn_state}</b>\n"
-                f"Подписка: <b>{'Продлевалась' if (sub.end_at and started_at and sub.end_at > started_at) else 'Не продлевалась'}</b>\n"
+                f"Исключить: <b>{hours_line}</b>\n"
+                f"Продление: <b>{renewal}</b>\n"
                 f"Пользователь с нами: <b>{days_with_us}</b>\n"
             )
 
@@ -140,14 +206,22 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             if not sub.end_at:
                 continue
             dt = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
-            days_left = max((dt - now).days, 0)
+            # Prefer hours/minutes for near-term expirations.
+            seconds_left = int((dt - now).total_seconds())
+            if seconds_left <= 0:
+                when = "сейчас"
+            elif seconds_left < 48 * 3600:
+                when = _fmt_hours_left(dt, now)
+            else:
+                days_left = max((dt - now).days, 0)
+                when = f"через {days_left} дн."
             fam = (
                 (getattr(m, "account_label", None) if m else None)
                 or (getattr(m, "family_label", None) if m else None)
                 or "—"
             )
             lines.append(
-                f"• <code>{sub.tg_id}</code> — до <code>{_fmt_dt_short(sub.end_at)}</code> (через {days_left} дн.) — семья: <code>{fam}</code>"
+                f"• <code>{sub.tg_id}</code> — до <code>{_fmt_dt_short(sub.end_at)}</code> ({when}) — семья: <code>{fam}</code>"
             )
 
     await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
