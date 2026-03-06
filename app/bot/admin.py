@@ -547,13 +547,46 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
 
     # last notifications
     msgs = list(
-        (await session.execute(
-            select(MessageAudit)
-            .where(MessageAudit.tg_id == tg_id)
-            .order_by(MessageAudit.sent_at.desc())
-            .limit(10)
-        )).scalars().all()
+        (
+            await session.execute(
+                select(MessageAudit)
+                .where(MessageAudit.tg_id == tg_id)
+                .order_by(MessageAudit.sent_at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
     )
+
+    # subscription-expiry related notifications (explicit, to answer "получал ли уведомления")
+    expiry_kinds = [
+        ("sub_warn_7d", "Подписка: -7 дней"),
+        ("sub_warn_3d", "Подписка: -3 дня"),
+        ("sub_warn_1d", "Подписка: -1 день"),
+        ("trial_warn_3d", "Триал: -3 дня"),
+        ("trial_warn_2d", "Триал: -2 дня"),
+        ("trial_warn_1d", "Триал: -1 день"),
+        ("trial_expired", "Триал: закончился"),
+        ("sub_expired", "Подписка: истекла"),
+    ]
+    kinds_only = [k for k, _ in expiry_kinds]
+    expiry_rows = list(
+        (
+            await session.execute(
+                select(MessageAudit)
+                .where(MessageAudit.tg_id == tg_id, MessageAudit.kind.in_(kinds_only))
+                .order_by(MessageAudit.sent_at.desc())
+                .limit(200)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    last_by_kind: dict[str, MessageAudit] = {}
+    for r in expiry_rows:
+        if r.kind not in last_by_kind:
+            last_by_kind[r.kind] = r
 
     lines = []
     lines.append("👤 <b>Карточка пользователя</b>")
@@ -584,6 +617,17 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
 
         lines.append("")
         lines.append("<i>👁 Статус «прочитано» — это best-effort: считается прочитанным, если пользователь взаимодействовал с ботом после отправки.</i>")
+
+    lines.append("")
+    lines.append("⏰ <b>Уведомления о продлении</b>")
+    for kind, title in expiry_kinds:
+        m = last_by_kind.get(kind)
+        if not m:
+            lines.append(f"• {title}: —")
+            continue
+        sent = _fmt_dt_short(m.sent_at)
+        seen = _fmt_dt_short(m.seen_at) if m.seen_at else "не подтверждено"
+        lines.append(f"• {title}: {sent} | 👁 {seen}")
 
     return "\n".join(lines)
 
