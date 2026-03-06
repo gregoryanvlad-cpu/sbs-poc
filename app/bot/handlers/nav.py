@@ -54,6 +54,18 @@ from app.services.referrals.service import referral_service
 router = Router()
 
 
+async def _restore_wg_peers_after_payment(session, tg_id: int) -> None:
+    """After a successful payment, re-enable WG peers disabled on expiration.
+
+    Best-effort: never breaks payment flow.
+    """
+    try:
+        await vpn_service.restore_expired_peers(session, tg_id, grace_hours=24)
+    except Exception:
+        # best-effort
+        pass
+
+
 async def _subscription_required_alert_text(session, tg_id: int) -> str:
     """Choose the correct access-denied text for users without an active subscription."""
     if await is_trial_available(session, tg_id):
@@ -1108,6 +1120,9 @@ async def on_buy(cb: CallbackQuery) -> None:
             status="success",
         )
 
+        # Restore WG access if peers were disabled due to expiration (within 24h).
+        await _restore_wg_peers_after_payment(session, tg_id)
+
         # process referral earnings (first payment activates referral)
         pay = await session.scalar(
             select(Payment)
@@ -1210,6 +1225,8 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                         status="success",
                         provider_payment_id=provider_tid,
                     )
+
+                    await _restore_wg_peers_after_payment(session, tg_id)
 
                     pay.status = "success"
                     await referral_service.on_successful_payment(session, pay)
@@ -1423,6 +1440,8 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                 status="success",
                 provider_payment_id=pay.provider_payment_id,
             )
+
+            await _restore_wg_peers_after_payment(session, cb.from_user.id)
 
             # referral earnings processing: use the newest successful payment row
             # (extend_subscription inserts a Payment row). We keep original pending row too.
