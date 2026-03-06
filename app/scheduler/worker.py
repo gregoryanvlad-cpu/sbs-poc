@@ -236,6 +236,7 @@ async def run_scheduler() -> None:
 
                 try:
                     await _job_expire_subscriptions(bot)
+                    await _job_prune_wg_peers()
                     await _job_prune_regionvpn_clients()
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
@@ -330,8 +331,9 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         for sub in expired:
             tg_id = sub.tg_id
 
-            # Physically revoke WireGuard access on the server.
-            # DB-only deactivation is NOT enough because peers remain in wg0.
+            # Disable WireGuard access on the server immediately, but do NOT
+            # permanently purge the peer yet. This allows re-enabling the same
+            # peer (same config) if the user pays within the grace window.
             peers: list[VpnPeer] = []
             try:
                 rows = await session.execute(select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True))
@@ -345,6 +347,7 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
                         code = (p.server_code or "").upper() or None
                         srv = servers_by_code.get(code) if code else None
                         if srv and srv.get("host") and srv.get("user"):
+                            # "Disable" = remove from live wg interface.
                             await vpn_svc.remove_peer_for_server(
                                 public_key=p.client_public_key,
                                 host=str(srv["host"]),
@@ -363,7 +366,9 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
                         )
 
             await set_subscription_expired(session, tg_id)
-            await deactivate_peers(session, tg_id, reason="subscription_expired")
+            # Mark peers as inactive with an "expired" reason so we can restore
+            # them on payment (within 24h) and later purge after 24h.
+            await deactivate_peers(session, tg_id, reason="expired")
             expired_ids.append(tg_id)
 
             # Manual Yandex process: owner will remove user from the family.
@@ -396,6 +401,52 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
             vless_flow=settings.regionvpn_vless_flow,
         )
         await svc.apply_enabled_map({tg_id: False for tg_id in expired_ids})
+
+
+async def _job_prune_wg_peers() -> None:
+    """After 24 hours of subscription expiration, mark WG peers as purged.
+
+    We disable peers immediately on expiration (remove from wg interface) so the
+    config stops working. If the user does NOT renew within 24 hours, we mark
+    those peers as "expired_purged" so they won't be automatically restored.
+    """
+
+    cutoff = _utcnow() - timedelta(days=1)
+
+    async with session_scope() as session:
+        # Find peers disabled due to expiration for > 24h.
+        q = (
+            select(VpnPeer)
+            .where(
+                VpnPeer.is_active.is_(False),
+                VpnPeer.rotation_reason == "expired",
+                VpnPeer.revoked_at.is_not(None),
+                VpnPeer.revoked_at < cutoff,
+            )
+            .limit(500)
+        )
+        peers = list((await session.execute(q)).scalars().all())
+        if not peers:
+            return
+
+        # Best-effort: try removing from server again (idempotent), then mark purged.
+        try:
+            from app.services.vpn.service import vpn_service
+        except Exception:
+            vpn_service = None
+
+        for p in peers:
+            try:
+                if vpn_service:
+                    try:
+                        await vpn_service.provider.remove_peer(p.client_public_key)
+                    except Exception:
+                        pass
+                p.rotation_reason = "expired_purged"
+            except Exception:
+                pass
+
+        await session.commit()
 
 
 async def _job_prune_regionvpn_clients() -> None:
