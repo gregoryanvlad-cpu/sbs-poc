@@ -475,6 +475,7 @@ def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:user:card:{tg_id}")],
+            [InlineKeyboardButton(text="📨 Напомнить об оплате", callback_data=f"admin:user:notify_expired:{tg_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
@@ -620,14 +621,22 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
 
     lines.append("")
     lines.append("⏰ <b>Уведомления о продлении</b>")
-    for kind, title in expiry_kinds:
-        m = last_by_kind.get(kind)
+    def _fmt_audit_line(m: MessageAudit | None, title: str) -> str:
         if not m:
-            lines.append(f"• {title}: —")
-            continue
+            return f"• {title}: —"
         sent = _fmt_dt_short(m.sent_at)
+        # If message_id is NULL -> send attempt failed.
+        if m.message_id is None:
+            reason = "ошибка отправки"
+            head = (m.text_preview or "").split("\n", 1)[0].strip()
+            if head.startswith("[SEND_FAILED:"):
+                reason = head
+            return f"• {title}: ❌ {sent} | {reason}"
         seen = _fmt_dt_short(m.seen_at) if m.seen_at else "не подтверждено"
-        lines.append(f"• {title}: {sent} | 👁 {seen}")
+        return f"• {title}: ✅ {sent} | 👁 {seen}"
+
+    for kind, title in expiry_kinds:
+        lines.append(_fmt_audit_line(last_by_kind.get(kind), title))
 
     return "\n".join(lines)
 
@@ -704,6 +713,69 @@ async def admin_user_card_refresh(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         text = await _render_user_card(session, cb.bot, tg_id)
     await cb.message.edit_text(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:notify_expired:"))
+async def admin_user_notify_expired(cb: CallbackQuery) -> None:
+    """Manual reminder to pay after subscription expired.
+
+    Telegram may block bot messages if user blocked the bot.
+    We log both success and failure via message_audit.
+    """
+
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await cb.answer()
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        return
+
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        now = _utcnow()
+        sub_end = None
+        sub_active = False
+        if sub and sub.end_at:
+            sub_end = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
+            sub_active = bool(sub.is_active) and sub_end > now
+
+    if sub_active:
+        try:
+            await cb.message.answer("✅ У пользователя подписка активна — напоминание не требуется.")
+        except Exception:
+            pass
+        return
+
+    text_to_user = (
+        "⛔️ Ваша подписка не активна.\n\n"
+        "Чтобы снова включить VPN и продолжить пользоваться сервисом, оплатите подписку."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить подписку", callback_data="nav:pay")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+    # best-effort: log attempt even if user blocked bot
+    try:
+        await audit_send_message(cb.bot, tg_id, text_to_user, kind="admin_sub_expired_manual", reply_markup=kb)
+    except Exception:
+        pass
+
+    # refresh the card in-place
+    async with session_scope() as session:
+        card = await _render_user_card(session, cb.bot, tg_id)
+    try:
+        await cb.message.edit_text(card, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+    except Exception:
+        try:
+            await cb.message.answer(card, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+        except Exception:
+            pass
 
 
 @router.message(AdminPriceFSM.waiting_price)
