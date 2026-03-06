@@ -262,26 +262,41 @@ async def admin_kick_mark_finish(message: Message, state: FSMContext) -> None:
     now = datetime.now(timezone.utc)
 
     async with session_scope() as session:
+        # Find the latest membership row (even if already removed) to provide a useful answer.
         m = await session.scalar(
             select(YandexMembership)
-            .where(
-                YandexMembership.tg_id == tg_id,
-                YandexMembership.removed_at.is_(None),
-            )
+            .where(YandexMembership.tg_id == tg_id)
             .order_by(YandexMembership.id.desc())
             .limit(1)
         )
         if not m:
             await state.clear()
             await message.answer(
-                "ℹ️ Не нашёл активного участника (removed_at пустой) для этого TG ID.",
+                "ℹ️ Для этого TG ID нет записей YandexMembership. Возможно пользователь не был добавлен в семью.",
+                reply_markup=kb_admin_menu(),
+            )
+            return
+
+        # If already marked removed, just show info.
+        if m.removed_at is not None:
+            removed_at = m.removed_at if m.removed_at.tzinfo else m.removed_at.replace(tzinfo=timezone.utc)
+            fam = getattr(m, "family_label", None) or getattr(m, "account_label", None)
+            slot = m.slot_index
+            await state.clear()
+            await message.answer(
+                "✅ Уже отмечен как исключённый ранее.\n\n"
+                f"TG: <code>{tg_id}</code>\n"
+                f"Семья: <code>{fam or '—'}</code>\n"
+                f"Слот: <code>{slot if slot is not None else '—'}</code>\n"
+                f"removed_at: <code>{removed_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>",
+                parse_mode="HTML",
                 reply_markup=kb_admin_menu(),
             )
             return
 
         m.removed_at = now
         m.status = "removed"
-        fam = m.family_label
+        fam = getattr(m, "family_label", None) or getattr(m, "account_label", None)
         slot = m.slot_index
         await session.commit()
 
