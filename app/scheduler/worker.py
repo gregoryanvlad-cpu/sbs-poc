@@ -243,6 +243,8 @@ async def run_scheduler() -> None:
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
                     await _job_user_subscription_notifications(bot)
+                    # VPN-only users (no YandexMembership) still need expiry reminders.
+                    await _job_subscription_end_at_notifications(bot)
                     await _job_trial_expiring_notifications(bot)
                     await _job_trial_reengagement_notifications(bot)
                     # Make pending referral earnings available when hold expires.
@@ -775,6 +777,127 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
                         ),
                     )
                     m.notified_1d_at = now
+                    changed = True
+                except Exception:
+                    pass
+
+        if changed:
+            await session.commit()
+
+
+async def _job_subscription_end_at_notifications(bot: Bot) -> None:
+    """Send 7/3/1 day reminders based on Subscription.end_at for VPN users.
+
+    Why:
+    - _job_user_subscription_notifications is tied to YandexMembership.coverage_end_at.
+    - VPN-only users may not have YandexMembership rows at all, so they would receive
+      no pre-expiry reminders.
+
+    Rules:
+    - Only for active subscriptions with end_at in the future.
+    - Skip users that have an active YandexMembership (they are handled by the
+      membership-based job).
+    - Send once per milestone per конкретную дату окончания (end_at), stored in
+      app_settings.
+    - Send after 19:00 Europe/Amsterdam to hit evening hours.
+    """
+
+    now = _utcnow()
+    now_local = now.astimezone(AMSTERDAM_TZ)
+    if now_local.hour < 19:
+        return
+
+    async with session_scope() as session:
+        subs = (
+            await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.is_active.is_(True),
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at > now,
+                )
+                .order_by(Subscription.end_at.asc())
+                .limit(2000)
+            )
+        ).scalars().all()
+        if not subs:
+            return
+
+        changed = False
+
+        for sub in subs:
+            tg_id = int(sub.tg_id)
+
+            # If user is in an active Yandex family, reminders are handled by
+            # _job_user_subscription_notifications to avoid duplicates.
+            try:
+                y_exists = (
+                    await session.execute(
+                        select(YandexMembership.id)
+                        .where(
+                            YandexMembership.tg_id == tg_id,
+                            YandexMembership.removed_at.is_(None),
+                            YandexMembership.coverage_end_at.is_not(None),
+                        )
+                        .limit(1)
+                    )
+                ).first()
+                if y_exists is not None:
+                    continue
+            except Exception:
+                # If YandexMembership table/query fails, still proceed with
+                # subscription-based reminders.
+                pass
+
+            end_at = _ensure_tz(sub.end_at)
+            days_left = _days_until(end_at, now)
+            if days_left not in (7, 3, 1):
+                continue
+
+            # Tie "sent" flags to a конкретной дате окончания подписки.
+            end_key = end_at.astimezone(AMSTERDAM_TZ).strftime("%Y-%m-%d")
+            sent_key = f"sub_end_warn_{days_left}d_sent:{tg_id}:{end_key}"
+            if bool(await get_app_setting_int(session, sent_key, default=0)):
+                continue
+
+            if days_left == 7:
+                text_msg = (
+                    "⏳ Через 7 дней закончится ваша подписка на VPN.\n\n"
+                    "Продлите подписку, чтобы продолжать пользоваться сервисом без перерыва."
+                )
+                kind = "sub_warn_7d"
+            elif days_left == 3:
+                text_msg = (
+                    "⚠️ Осталось 3 дня до окончания подписки на VPN.\n\n"
+                    "Продлите подписку заранее, чтобы не потерять доступ."
+                )
+                kind = "sub_warn_3d"
+            else:
+                text_msg = (
+                    "🚨 Завтра закончится ваша подписка на VPN.\n\n"
+                    "Продлите подписку сейчас, чтобы доступ не отключился."
+                )
+                kind = "sub_warn_1d"
+
+            try:
+                await audit_send_message(
+                    tg_id,
+                    text_msg,
+                    kind=kind,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
+                            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                        ]
+                    ),
+                )
+                await set_app_setting_int(session, sent_key, 1)
+                changed = True
+            except Exception:
+                # audit_send_message already logs SEND_FAILED. Still mark the
+                # attempt so we don't spam every loop.
+                try:
+                    await set_app_setting_int(session, sent_key, 1)
                     changed = True
                 except Exception:
                     pass
