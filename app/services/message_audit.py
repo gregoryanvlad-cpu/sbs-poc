@@ -25,6 +25,7 @@ async def audit_send_message(
     *,
     kind: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
 ) -> bool:
     """Send a message and store it to message_audit (best-effort).
 
@@ -43,7 +44,7 @@ async def audit_send_message(
     err_text = ""
 
     try:
-        msg = await bot.send_message(int(tg_id), text, reply_markup=reply_markup)
+        msg = await bot.send_message(int(tg_id), text, reply_markup=reply_markup, parse_mode=parse_mode)
         ok = True
     except TelegramForbiddenError as e:
         ok = False
