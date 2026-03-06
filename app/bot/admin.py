@@ -21,6 +21,7 @@ from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, Subscription, User
+from app.db.models import MessageAudit
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
@@ -30,6 +31,7 @@ from app.repo import get_price_rub, set_app_setting_int, get_subscription, exten
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
 from app.services.regionvpn import RegionVpnService
+from app.services.message_audit import audit_send_message
 
 
 
@@ -291,6 +293,10 @@ class AdminPriceFSM(StatesGroup):
     waiting_price = State()
 
 
+class AdminUserInspectFSM(StatesGroup):
+    waiting_user = State()
+
+
 class AdminGiftSubFSM(StatesGroup):
     waiting_target = State()
     waiting_months = State()
@@ -465,6 +471,123 @@ def _kb_admin_back() -> InlineKeyboardMarkup:
     )
 
 
+def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:user:card:{tg_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+        ]
+    )
+
+
+def _fmt_dt_short(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+async def _auto_disable_status(session, tg_id: int) -> str:
+    """Human-friendly status of WG auto-disable for a user."""
+    now = _utcnow()
+    sub = await get_subscription(session, tg_id)
+    sub_end = None
+    sub_active = False
+    if sub and sub.end_at:
+        sub_end = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
+        sub_active = bool(sub.is_active) and sub_end > now
+
+    # latest peer (even if inactive)
+    from app.db.models import VpnPeer
+    peer = (await session.execute(
+        select(VpnPeer)
+        .where(VpnPeer.tg_id == tg_id)
+        .order_by(VpnPeer.id.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if sub_active:
+        return "✅ Подписка активна — автоотключение не требуется"
+
+    if not peer:
+        return "— VPN не активирован (peer не создавался)"
+
+    reason = (peer.rotation_reason or "").strip().lower()
+    if reason == "expired_purged":
+        return "🗑️ Peer удалён (прошло > 24ч без оплаты)"
+    if reason == "expired":
+        until = None
+        if peer.revoked_at:
+            ra = peer.revoked_at if peer.revoked_at.tzinfo else peer.revoked_at.replace(tzinfo=timezone.utc)
+            until = ra + timedelta(hours=24)
+        if until and until > now:
+            return f"⛔️ Peer отключён (можно восстановить до {_fmt_dt_short(until)})"
+        return "⛔️ Peer отключён (ожидание оплаты истекло)"
+
+    if peer.is_active:
+        return "⚠️ Подписка не активна, но peer ещё активен (проверь scheduler/сервер)"
+    return "⛔️ Peer отключён"
+
+
+async def _render_user_card(session, bot, tg_id: int) -> str:
+    # User profile
+    u = (await session.execute(select(User).where(User.tg_id == tg_id))).scalar_one_or_none()
+    sub = await get_subscription(session, tg_id)
+    now = _utcnow()
+
+    username = f"@{u.tg_username}" if u and u.tg_username else "—"
+    name = " ".join([p for p in [getattr(u, 'first_name', None), getattr(u, 'last_name', None)] if p]) if u else "—"
+
+    sub_end = None
+    sub_active = False
+    if sub and sub.end_at:
+        sub_end = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
+        sub_active = bool(sub.is_active) and sub_end > now
+
+    # last notifications
+    msgs = list(
+        (await session.execute(
+            select(MessageAudit)
+            .where(MessageAudit.tg_id == tg_id)
+            .order_by(MessageAudit.sent_at.desc())
+            .limit(10)
+        )).scalars().all()
+    )
+
+    lines = []
+    lines.append("👤 <b>Карточка пользователя</b>")
+    lines.append(f"ID: <code>{tg_id}</code>")
+    lines.append(f"Профиль: {username} | {name}")
+    if sub_end:
+        lines.append(f"Подписка: <b>{'активна' if sub_active else 'не активна'}</b> | до: <b>{sub_end.date().isoformat()}</b>")
+    else:
+        lines.append("Подписка: —")
+
+    lines.append("")
+    lines.append("🔌 <b>WG автоотключение</b>")
+    lines.append(await _auto_disable_status(session, tg_id))
+
+    lines.append("")
+    lines.append("📩 <b>Последние уведомления</b>")
+    if not msgs:
+        lines.append("— пока нет записей")
+    else:
+        for m in msgs:
+            sent = _fmt_dt_short(m.sent_at)
+            seen = _fmt_dt_short(m.seen_at) if m.seen_at else "не подтверждено"
+            # concise preview
+            preview = (m.text_preview or "").replace("\n", " ").strip()
+            if len(preview) > 120:
+                preview = preview[:119] + "…"
+            lines.append(f"• <b>{m.kind}</b> | {sent} | 👁 {seen}\n  {preview}")
+
+        lines.append("")
+        lines.append("<i>👁 Статус «прочитано» — это best-effort: считается прочитанным, если пользователь взаимодействовал с ботом после отправки.</i>")
+
+    return "\n".join(lines)
+
+
 @router.callback_query(lambda c: c.data == "admin:price")
 async def admin_price(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
@@ -490,6 +613,53 @@ async def admin_price(cb: CallbackQuery, state: FSMContext) -> None:
         else:
             raise
     await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:user:inspect")
+async def admin_user_inspect_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    await state.set_state(AdminUserInspectFSM.waiting_user)
+    await cb.message.edit_text(
+        "🔎 <b>Карточка пользователя</b>\n\n"
+        "Отправьте <code>tg_id</code> (числом) или <code>@username</code>.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminUserInspectFSM.waiting_user)
+async def admin_user_inspect_input(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    tg_id = await _resolve_tg_id(message.bot, raw)
+    if not tg_id:
+        await message.answer("❌ Не удалось распознать пользователя. Укажите tg_id числом или @username.")
+        return
+
+    async with session_scope() as session:
+        text = await _render_user_card(session, message.bot, tg_id)
+
+    await state.clear()
+    await message.answer(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:card:"))
+async def admin_user_card_refresh(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        return
+    async with session_scope() as session:
+        text = await _render_user_card(session, cb.bot, tg_id)
+    await cb.message.edit_text(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
 
 
 @router.message(AdminPriceFSM.waiting_price)
@@ -659,7 +829,7 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
         "Администратор подарил вам подписку на наш сервис, приятного пользования!"
     )
     try:
-        await message.bot.send_message(target_tg_id, notify_text, parse_mode="HTML")
+        await audit_send_message(message.bot, target_tg_id, notify_text, kind="admin_gift", reply_markup=None)
     except Exception:
         pass
 
@@ -795,7 +965,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
             await message.answer("⚠️ Получатель не найден. Начните заново.", reply_markup=kb_admin_menu())
             return
         try:
-            await message.bot.send_message(target, payload, parse_mode=None, disable_web_page_preview=True)
+            await audit_send_message(message.bot, target, payload, kind="admin_broadcast_one", reply_markup=None)
             sent = 1
         except Exception:
             failed = 1
@@ -839,7 +1009,13 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
 
     for target in targets:
         try:
-            await message.bot.send_message(target, payload, parse_mode=None, disable_web_page_preview=True)
+            await audit_send_message(
+                message.bot,
+                target,
+                payload,
+                kind=f"admin_broadcast_{mode or 'all'}",
+                reply_markup=None,
+            )
             sent += 1
         except Exception:
             failed += 1
