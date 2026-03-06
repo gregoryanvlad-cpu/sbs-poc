@@ -19,6 +19,7 @@ from app.repo import list_expired_subscriptions, set_subscription_expired, get_a
 from app.services.yandex.service import yandex_service
 from app.services.referrals.service import referral_service
 from app.services.regionvpn.service import RegionVpnService
+from app.services.message_audit import audit_send_message
 
 log = logging.getLogger(__name__)
 
@@ -208,6 +209,7 @@ async def _send_admin_kick_report(bot: Bot, *, force: bool = False) -> None:
             await session.commit()
 
     try:
+        # Admin reports are not audited per-user.
         await bot.send_message(owner_id, text_report)
     except Exception:
         pass
@@ -373,11 +375,13 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
 
             # Manual Yandex process: owner will remove user from the family.
             try:
-                await bot.send_message(
+                await audit_send_message(
+                    bot,
                     tg_id,
                     "⛔️ Подписка истекла.\n"
                     "• Доступ к VPN отключён.\n"
                     "• Вы будете исключены из семейной подписки Yandex Plus, так как срок подписки истёк.",
+                    kind="sub_expired",
                 )
             except Exception:
                 pass
@@ -511,10 +515,11 @@ async def _job_rotate_yandex_invites(bot: Bot) -> None:
 
     for tg_id, invite_link in items:
         try:
-            await bot.send_message(
+            await audit_send_message(
                 tg_id,
                 "🔁 Пора перейти в новую семейную подписку Yandex Plus.\n\n"
                 "Откройте 🟡 Yandex Plus и нажмите «Открыть приглашение», или используйте ссылку ниже:",
+                kind="yandex_rotate",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text="🔗 Открыть приглашение", url=invite_link)],
@@ -526,9 +531,10 @@ async def _job_rotate_yandex_invites(bot: Bot) -> None:
         except Exception:
             # don't break loop
             try:
-                await bot.send_message(
+                await audit_send_message(
                     tg_id,
                     "🔁 Пора перейти в новую семейную подписку Yandex Plus.",
+                    kind="yandex_rotate",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
                             [InlineKeyboardButton(text="🟡 Yandex Plus", callback_data="nav:yandex")],
@@ -637,9 +643,11 @@ async def _job_trial_expiring_notifications(bot: Bot) -> None:
                 )
 
             try:
-                await bot.send_message(
+                await audit_send_message(
+                    bot,
                     tg_id,
                     text_msg,
+                    kind=f"trial_warn_{days_left}d",
                     reply_markup=_trial_expiring_kb(),
                 )
                 await set_app_setting_int(session, sent_key, 1)
@@ -693,10 +701,11 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
             if renewed:
                 if days_left == 1 and m.notified_1d_at is None:
                     try:
-                        await bot.send_message(
+                        await audit_send_message(
                             int(m.tg_id),
                             "ℹ️ Завтра вам будет выдано новое приглашение в семейную подписку Yandex Plus.\n\n"
                             "Это связано со сменой аккаунта. Никаких действий сейчас не требуется.",
+                            kind="yandex_invite_tomorrow",
                             reply_markup=InlineKeyboardMarkup(
                                 inline_keyboard=[
                                     [InlineKeyboardButton(text="🟡 Yandex Plus", callback_data="nav:yandex")],
@@ -713,10 +722,11 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
             # 🔴 Not renewed users: 7 / 3 / 1 days expiry warnings
             if days_left == 7 and m.notified_7d_at is None:
                 try:
-                    await bot.send_message(
+                    await audit_send_message(
                         int(m.tg_id),
                         "⏳ Через 7 дней закончится ваша подписка на сервис.\n\n"
                         "Продлите подписку, чтобы сохранить доступ к VPN и Yandex Plus.",
+                        kind="sub_warn_7d",
                         reply_markup=InlineKeyboardMarkup(
                             inline_keyboard=[
                                 [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
@@ -731,10 +741,11 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
 
             if days_left == 3 and m.notified_3d_at is None:
                 try:
-                    await bot.send_message(
+                    await audit_send_message(
                         int(m.tg_id),
                         "⚠️ Осталось 3 дня до окончания подписки.\n\n"
                         "Продлите подписку, чтобы не потерять доступ к VPN и Yandex Plus.",
+                        kind="sub_warn_3d",
                         reply_markup=InlineKeyboardMarkup(
                             inline_keyboard=[
                                 [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
@@ -749,12 +760,13 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
 
             if days_left == 1 and m.notified_1d_at is None:
                 try:
-                    await bot.send_message(
+                    await audit_send_message(
                         int(m.tg_id),
                         "🚨 Завтра ваша подписка закончится.\n\n"
                         "• VPN будет отключён.\n"
                         "• Доступ к Yandex Plus завершится.\n\n"
                         "Продлите подписку, чтобы сохранить доступ.",
+                        kind="sub_warn_1d",
                         reply_markup=InlineKeyboardMarkup(
                             inline_keyboard=[
                                 [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
@@ -882,9 +894,11 @@ async def _job_trial_reengagement_notifications(bot: Bot) -> None:
                 continue
 
             try:
-                await bot.send_message(
+                await audit_send_message(
+                    bot,
                     tg_id,
                     _trial_reengagement_text(),
+                    kind=f"trial_reengage_{due_stage}",
                     reply_markup=_trial_reengagement_kb(),
                 )
                 await set_app_setting_int(session, stage_key, due_stage)
