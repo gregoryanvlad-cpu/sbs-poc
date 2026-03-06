@@ -30,6 +30,15 @@ def _fmt_dt_short(dt: datetime | None) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _sub_start_dt(sub: Subscription) -> datetime | None:
+    """Return subscription start timestamp in a backwards-compatible way.
+
+    The current Subscription model uses `start_at` (not `created_at`). Some
+    older versions referenced `created_at`, so we resolve robustly.
+    """
+    return getattr(sub, "created_at", None) or getattr(sub, "start_at", None)
+
+
 @router.callback_query(lambda c: c.data == "admin:kick:report")
 async def admin_kick_report(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
@@ -88,8 +97,9 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
         for i, (sub, m) in enumerate(due_rows, start=1):
             days_with_us = "—"
             try:
-                if sub.created_at:
-                    created = sub.created_at if sub.created_at.tzinfo else sub.created_at.replace(tzinfo=timezone.utc)
+                started_at = _sub_start_dt(sub)
+                if started_at:
+                    created = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
                     days_with_us = f"{max((now - created).days, 0)} дн."
             except Exception:
                 pass
@@ -101,20 +111,26 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
             except Exception:
                 vpn_state = "—"
 
-            fam = (m.family_label if m else None) or "—"
+            fam = (
+                (getattr(m, "account_label", None) if m else None)
+                or (getattr(m, "family_label", None) if m else None)
+                or "—"
+            )
             slot = (m.slot_index if m else None) or "—"
             membership_state = "В семье" if m else "❗️Не добавлен в семью"
+
+            started_at = _sub_start_dt(sub)
 
             lines.append(
                 f"<b>#{i}</b>\n"
                 f"Пользователь ID TG: <code>{sub.tg_id}</code>\n"
-                f"Дата приобретения подписки на сервис: <code>{_fmt_dt_short(sub.created_at)}</code>\n"
+                f"Дата приобретения подписки на сервис: <code>{_fmt_dt_short(started_at)}</code>\n"
                 f"Дата окончания подписки на сервис: <code>{_fmt_dt_short(sub.end_at)}</code>\n"
                 f"Статус Яндекс семьи: <b>{membership_state}</b>\n"
                 f"Наименование семьи (label): <code>{fam}</code>\n"
                 f"Номер слота: <code>{slot}</code>\n"
                 f"VPN: <b>{vpn_state}</b>\n"
-                f"Подписка: <b>{'Продлевалась' if (sub.end_at and sub.created_at and sub.end_at > sub.created_at) else 'Не продлевалась'}</b>\n"
+                f"Подписка: <b>{'Продлевалась' if (sub.end_at and started_at and sub.end_at > started_at) else 'Не продлевалась'}</b>\n"
                 f"Пользователь с нами: <b>{days_with_us}</b>\n"
             )
 
@@ -125,7 +141,11 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
                 continue
             dt = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
             days_left = max((dt - now).days, 0)
-            fam = (m.family_label if m else None) or "—"
+            fam = (
+                (getattr(m, "account_label", None) if m else None)
+                or (getattr(m, "family_label", None) if m else None)
+                or "—"
+            )
             lines.append(
                 f"• <code>{sub.tg_id}</code> — до <code>{_fmt_dt_short(sub.end_at)}</code> (через {days_left} дн.) — семья: <code>{fam}</code>"
             )
