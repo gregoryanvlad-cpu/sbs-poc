@@ -7,6 +7,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from zoneinfo import ZoneInfo
+
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -117,6 +119,8 @@ def _region_service() -> RegionVpnService:
 
 router = Router()
 
+AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
+
 # ==========================
 # RU date parsing: "9 февраля 2026"
 # ==========================
@@ -169,6 +173,28 @@ def _parse_ru_date_to_utc_end_of_day(s: str) -> Optional[datetime]:
         return None
     try:
         return datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _parse_end_at_input_to_utc(s: str) -> datetime | None:
+    """Parse admin input into UTC datetime.
+
+    Supported formats:
+    - YYYY-MM-DD           -> end of day (23:59:59) Amsterdam time
+    - YYYY-MM-DD HH:MM     -> exact time Amsterdam time
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            dt_local = datetime.strptime(s, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, tzinfo=AMSTERDAM_TZ
+            )
+            return dt_local.astimezone(timezone.utc)
+        dt_local = datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=AMSTERDAM_TZ)
+        return dt_local.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -295,6 +321,10 @@ class AdminPriceFSM(StatesGroup):
 
 class AdminUserInspectFSM(StatesGroup):
     waiting_user = State()
+
+
+class AdminUserSetEndAtFSM(StatesGroup):
+    waiting_end_at = State()
 
 
 class AdminGiftSubFSM(StatesGroup):
@@ -476,6 +506,7 @@ def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:user:card:{tg_id}")],
             [InlineKeyboardButton(text="📨 Напомнить об оплате", callback_data=f"admin:user:notify_expired:{tg_id}")],
+            [InlineKeyboardButton(text="🗓 Изменить дату окончания", callback_data=f"admin:user:set_end_at:{tg_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
@@ -523,7 +554,13 @@ async def _auto_disable_status(session, tg_id: int) -> str:
             ra = peer.revoked_at if peer.revoked_at.tzinfo else peer.revoked_at.replace(tzinfo=timezone.utc)
             until = ra + timedelta(hours=24)
         if until and until > now:
-            return f"⛔️ Peer отключён (можно восстановить до {_fmt_dt_short(until)})"
+            left = until - now
+            hrs = int(left.total_seconds() // 3600)
+            mins = int((left.total_seconds() % 3600) // 60)
+            return (
+                f"⛔️ Peer отключён. Восстановление без смены конфига возможно до <b>{_fmt_dt_short(until)}</b> "
+                f"(осталось {hrs} ч {mins} мин)"
+            )
         return "⛔️ Peer отключён (ожидание оплаты истекло)"
 
     if peer.is_active:
@@ -594,7 +631,9 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
     lines.append(f"ID: <code>{tg_id}</code>")
     lines.append(f"Профиль: {username} | {name}")
     if sub_end:
-        lines.append(f"Подписка: <b>{'активна' if sub_active else 'не активна'}</b> | до: <b>{sub_end.date().isoformat()}</b>")
+        lines.append(
+            f"Подписка: <b>{'активна' if sub_active else 'не активна'}</b> | до: <b>{_fmt_dt_short(sub_end)}</b>"
+        )
     else:
         lines.append("Подписка: —")
 
@@ -776,6 +815,136 @@ async def admin_user_notify_expired(cb: CallbackQuery) -> None:
             await cb.message.answer(card, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
         except Exception:
             pass
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:set_end_at:"))
+async def admin_user_set_end_at_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        return
+
+    await state.clear()
+    await state.set_state(AdminUserSetEndAtFSM.waiting_end_at)
+    await state.update_data(tg_id=tg_id)
+
+    await cb.message.edit_text(
+        "🗓 <b>Изменить дату окончания подписки</b>\n\n"
+        "Отправьте дату/время в формате:\n"
+        "• <code>YYYY-MM-DD</code> (до 23:59)\n"
+        "• <code>YYYY-MM-DD HH:MM</code>\n\n"
+        "Время интерпретируется по <b>Europe/Amsterdam</b>.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminUserSetEndAtFSM.waiting_end_at)
+async def admin_user_set_end_at_finish(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    tg_id = int(data.get("tg_id") or 0)
+    end_at_utc = _parse_end_at_input_to_utc(message.text or "")
+    if not tg_id or not end_at_utc:
+        await message.answer(
+            "❌ Не понял дату. Пример: <code>2026-03-10 18:00</code> или <code>2026-03-10</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    now = _utcnow()
+    restored = 0
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not sub:
+            sub = Subscription(tg_id=tg_id, start_at=now, end_at=end_at_utc, is_active=True)
+            session.add(sub)
+        else:
+            sub.end_at = end_at_utc
+        sub.is_active = bool(end_at_utc > now)
+
+        if sub.is_active:
+            # If subscription is re-activated, restore WG peers disabled due to expiration within grace.
+            try:
+                restored = await vpn_service.restore_expired_peers(session, tg_id, grace_hours=24)
+            except Exception:
+                restored = 0
+
+        await session.commit()
+
+    await state.clear()
+
+    extra = ""
+    if restored:
+        extra = f"\n\n✅ Восстановлено WG peer(ов): <b>{restored}</b> (если были отключены по окончанию)"
+    await message.answer(
+        f"✅ Дата окончания обновлена.\nTG: <code>{tg_id}</code>\nНовая end_at (UTC): <code>{_fmt_dt_short(end_at_utc)}</code>{extra}",
+        reply_markup=_kb_user_card(tg_id),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:grace")
+async def admin_vpn_grace_list(cb: CallbackQuery) -> None:
+    """List users within the 24h grace window after subscription expiration."""
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+
+    now = _utcnow()
+    cutoff = now - timedelta(hours=24)
+    from app.db.models import VpnPeer
+
+    async with session_scope() as session:
+        q = (
+            select(VpnPeer)
+            .where(
+                VpnPeer.is_active.is_(False),
+                VpnPeer.rotation_reason == "expired",
+                VpnPeer.revoked_at.is_not(None),
+                VpnPeer.revoked_at >= cutoff,
+            )
+            .order_by(VpnPeer.revoked_at.desc())
+            .limit(500)
+        )
+        peers = list((await session.execute(q)).scalars().all())
+
+    if not peers:
+        await cb.message.edit_text(
+            "🕒 <b>WG grace (24ч)</b>\n\nСейчас нет пользователей в окне 24 часов после окончания подписки.",
+            reply_markup=kb_admin_menu(),
+            parse_mode="HTML",
+        )
+        return
+
+    by_tg: dict[int, VpnPeer] = {}
+    for p in peers:
+        tid = int(p.tg_id)
+        # keep the most recent revoked peer per user
+        if tid not in by_tg:
+            by_tg[tid] = p
+
+    lines = [
+        "🕒 <b>WG grace (24ч)</b>",
+        "",
+        "Пиры уже отключены, но их можно восстановить при оплате в течение 24 часов (без смены конфига):",
+        "",
+    ]
+    for tid, p in list(by_tg.items())[:80]:
+        ra = p.revoked_at if p.revoked_at.tzinfo else p.revoked_at.replace(tzinfo=timezone.utc)
+        until = ra + timedelta(hours=24)
+        left = until - now
+        hrs = int(left.total_seconds() // 3600)
+        mins = int((left.total_seconds() % 3600) // 60)
+        lines.append(f"• <code>{tid}</code> — до <b>{_fmt_dt_short(until)}</b> (осталось {hrs} ч {mins} мин)")
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
 
 
 @router.message(AdminPriceFSM.waiting_price)
