@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
+from sqlalchemy.orm import aliased
 
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
@@ -40,35 +41,42 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
     # Show expiring subscriptions even if the user isn't currently added to a Yandex family.
     # Use only the latest active (removed_at IS NULL) membership row per TG to avoid duplicates.
     async with session_scope() as session:
+        # Use an aliased membership table to avoid ORM join ambiguity on Postgres/SQLAlchemy.
+        YM = aliased(YandexMembership)
+
         latest_active_ids = (
             select(
-                YandexMembership.tg_id.label("tg_id"),
-                func.max(YandexMembership.id).label("id"),
+                YM.tg_id.label("tg_id"),
+                func.max(YM.id).label("id"),
             )
-            .where(YandexMembership.removed_at.is_(None))
-            .group_by(YandexMembership.tg_id)
+            .where(YM.removed_at.is_(None))
+            .group_by(YM.tg_id)
             .subquery()
         )
 
         base = (
-            select(Subscription, YandexMembership)
+            select(Subscription, YM)
             .select_from(Subscription)
             .outerjoin(latest_active_ids, latest_active_ids.c.tg_id == Subscription.tg_id)
-            .outerjoin(YandexMembership, YandexMembership.id == latest_active_ids.c.id)
+            .outerjoin(YM, YM.id == latest_active_ids.c.id)
             .where(Subscription.end_at.is_not(None))
         )
 
-        due_rows = (await session.execute(
-            base.where(Subscription.end_at <= now)
-            .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
-            .limit(200)
-        )).all()
+        due_rows = (
+            await session.execute(
+                base.where(Subscription.end_at <= now)
+                .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
+                .limit(200)
+            )
+        ).all()
 
-        soon_rows = (await session.execute(
-            base.where(Subscription.end_at > now)
-            .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
-            .limit(30)
-        )).all()
+        soon_rows = (
+            await session.execute(
+                base.where(Subscription.end_at > now)
+                .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
+                .limit(30)
+            )
+        ).all()
 
     lines: list[str] = []
 
