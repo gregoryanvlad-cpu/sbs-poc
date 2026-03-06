@@ -592,8 +592,8 @@ async def _job_trial_expiring_notifications(bot: Bot) -> None:
                 .where(
                     Payment.tg_id == tg_id,
                     Payment.status == "success",
-                    Payment.amount_rub.is_not(None),
-                    Payment.amount_rub > 0,
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
                 )
                 .limit(1)
             )
@@ -829,8 +829,8 @@ async def _job_trial_reengagement_notifications(bot: Bot) -> None:
                 .where(
                     Payment.tg_id == tg_id,
                     Payment.status == "success",
-                    Payment.amount_rub.is_not(None),
-                    Payment.amount_rub > 0,
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
                 )
                 .limit(1)
             )
