@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Update
+from aiogram.types import TelegramObject, Update, Message, CallbackQuery
+
+from sqlalchemy import update
+
+from app.db.session import session_scope
+from app.db.models.message_audit import MessageAudit
 
 log = logging.getLogger(__name__)
 
@@ -47,4 +53,42 @@ class RateLimitMiddleware(BaseMiddleware):
             if last and (now - last) < self.min_interval_sec:
                 return None
             self._last[key] = now
+        return await handler(event, data)
+
+
+class ActivitySeenMiddleware(BaseMiddleware):
+    """Marks outgoing notifications as "seen" when user interacts.
+
+    Telegram bots can't reliably know if a user *read* a message.
+    This is a best-effort approximation: when the user sends a message or
+    clicks any bot button, we mark their last un-seen notifications as seen.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        tg_id: int | None = None
+        if isinstance(event, Message) and event.from_user:
+            tg_id = int(event.from_user.id)
+        elif isinstance(event, CallbackQuery) and event.from_user:
+            tg_id = int(event.from_user.id)
+
+        if tg_id:
+            now = datetime.now(timezone.utc)
+            try:
+                async with session_scope() as session:
+                    await session.execute(
+                        update(MessageAudit)
+                        .where(MessageAudit.tg_id == tg_id)
+                        .where(MessageAudit.seen_at.is_(None))
+                        .where(MessageAudit.sent_at <= now)
+                        .values(seen_at=now)
+                    )
+                    await session.commit()
+            except Exception:
+                pass
+
         return await handler(event, data)
