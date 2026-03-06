@@ -105,7 +105,13 @@ class YandexService:
             .order_by(YandexMembership.id.desc())
             .limit(1)
         )
-        if existing and existing.invite_link:
+        # Reuse only if it is still "current" (not removed) and coverage is not expired.
+        if (
+            existing
+            and existing.invite_link
+            and getattr(existing, "removed_at", None) is None
+            and (existing.coverage_end_at is None or _ensure_tz(existing.coverage_end_at) > now)
+        ):
             return existing
 
         # subscription must be active
@@ -135,6 +141,75 @@ class YandexService:
         session.add(membership)
         await session.flush()
         return membership
+
+    async def rotate_membership_for_user_if_needed(self, session, *, tg_id: int) -> str | None:
+        """Ensure that after renewal user gets a fresh invite link if needed.
+
+        Returns new invite_link if rotated/issued, else None.
+        """
+        now = utcnow()
+
+        sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
+        if not sub or not sub.end_at or _ensure_tz(sub.end_at) <= now:
+            return None
+
+        membership = await session.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+        if not membership:
+            return None
+
+        removed_at = getattr(membership, "removed_at", None)
+        cov = membership.coverage_end_at
+        cov_tz = _ensure_tz(cov) if cov else None
+        sub_end = _ensure_tz(sub.end_at)
+
+        needs_issue = bool(removed_at is not None) or not bool(membership.invite_link)
+        if cov_tz and sub_end > cov_tz:
+            needs_issue = True
+
+        if not needs_issue:
+            return None
+
+        acc, slot = await _pick_slot_for_issue(session, now=now)
+        slot.status = "issued"
+        slot.issued_to_tg_id = tg_id
+        slot.issued_at = now
+
+        # If previous membership was removed (kicked), create a new membership row.
+        if removed_at is not None:
+            new_m = YandexMembership(
+                tg_id=tg_id,
+                yandex_account_id=acc.id,
+                invite_slot_id=slot.id,
+                account_label=acc.label,
+                slot_index=int(slot.slot_index),
+                yandex_login=(membership.yandex_login or "").strip().lstrip("@").lower(),
+                status="issued",
+                invite_link=slot.invite_link,
+                invite_issued_at=now,
+                coverage_end_at=sub_end,
+            )
+            session.add(new_m)
+            await session.flush()
+            return slot.invite_link
+
+        # Otherwise rotate in-place.
+        membership.yandex_account_id = acc.id
+        membership.invite_slot_id = slot.id
+        membership.account_label = acc.label
+        membership.slot_index = int(slot.slot_index)
+        membership.invite_link = slot.invite_link
+        membership.invite_issued_at = now
+        membership.coverage_end_at = sub_end
+        membership.status = "issued"
+        membership.updated_at = now
+
+        await session.flush()
+        return slot.invite_link
 
     async def rotate_due_memberships(self, session) -> List[Tuple[int, str]]:
         """Issue a new invite for users whose frozen coverage ended but subscription is still active.
