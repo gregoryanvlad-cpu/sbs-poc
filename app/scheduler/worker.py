@@ -828,6 +828,49 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
         for sub in subs:
             tg_id = int(sub.tg_id)
 
+
+            # Trial users get 3/2/1 day reminders via _job_trial_expiring_notifications.
+            # Skip them here to avoid sending 7/3/1 for a 5-day trial.
+            try:
+                trial_used = bool(await get_app_setting_int(session, f"trial_used:{tg_id}", default=0))
+            except Exception:
+                trial_used = False
+
+            if trial_used:
+                # If the user has any paid purchase, treat as non-trial for reminders.
+                has_paid = False
+                try:
+                    paid_q = (
+                        select(Payment.id)
+                        .where(
+                            Payment.tg_id == tg_id,
+                            Payment.status == "success",
+                            Payment.amount.is_not(None),
+                            Payment.amount > 0,
+                        )
+                        .limit(1)
+                    )
+                    has_paid = (await session.execute(paid_q)).first() is not None
+                except Exception:
+                    has_paid = False
+
+                if not has_paid:
+                    # Identify likely trial subscription by explicit trial_end_ts or short duration.
+                    try:
+                        trial_end_ts = await get_app_setting_int(session, f"trial_end_ts:{tg_id}", default=0)
+                    except Exception:
+                        trial_end_ts = 0
+
+                    is_short = False
+                    try:
+                        if sub.start_at and sub.end_at:
+                            is_short = (_ensure_tz(sub.end_at) - _ensure_tz(sub.start_at)) <= timedelta(days=6)
+                    except Exception:
+                        is_short = False
+
+                    if trial_end_ts > 0 or is_short:
+                        continue
+
             # If user is in an active Yandex family, reminders are handled by
             # _job_user_subscription_notifications to avoid duplicates.
             try:
