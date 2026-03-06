@@ -167,8 +167,19 @@ class YandexService:
         cov_tz = _ensure_tz(cov) if cov else None
         sub_end = _ensure_tz(sub.end_at)
 
+        # Product rule:
+        # If user renews WHILE their subscription is still active, we must NOT
+        # rotate the invite immediately. They should keep the same family/link
+        # until the current frozen coverage ends. Rotation will happen later via
+        # rotate_due_memberships() when coverage_end_at <= now.
+        #
+        # If user renews AFTER expiration (or was kicked), we should rotate now.
+
         needs_issue = bool(removed_at is not None) or not bool(membership.invite_link)
-        if cov_tz and sub_end > cov_tz:
+
+        # Rotate due to extension ONLY when the frozen coverage already ended.
+        # If coverage is still in the future, keep current link.
+        if cov_tz and sub_end > cov_tz and cov_tz <= now:
             needs_issue = True
 
         if not needs_issue:
