@@ -247,6 +247,7 @@ async def run_scheduler() -> None:
                     await _job_subscription_end_at_notifications(bot)
                     await _job_trial_expiring_notifications(bot)
                     await _job_trial_reengagement_notifications(bot)
+                    await _job_winback_discount_campaign(bot)
                     # Make pending referral earnings available when hold expires.
                     try:
                         released = await referral_service.release_pending(session)
@@ -261,6 +262,200 @@ async def run_scheduler() -> None:
             log.exception("scheduler_loop_error")
 
         await asyncio.sleep(SLEEP_SECONDS)
+
+
+def _winback_kb(*, amount_rub: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить со скидкой", callback_data=f"pay:promo:{amount_rub}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+async def _job_winback_discount_campaign(bot: Bot) -> None:
+    """One-time winback discount campaign.
+
+    Rules (per user, at most once in lifetime):
+    - If subscription expired and user didn't pay for 2 days -> offer 69₽ for the first month.
+    - If they don't accept within >3 days -> delete previous promo message and offer 29₽.
+    - If they still don't accept for ~1.5 weeks -> send final 24h reminder and delete previous promo.
+
+    We log send attempts via message_audit (including failures).
+    """
+
+    now = _utcnow()
+    now_local = now.astimezone(AMSTERDAM_TZ)
+    if now_local.hour < 19:
+        return
+
+    from app.services.message_audit import audit_send_message
+
+    async with session_scope() as session:
+        # eligible: subscription inactive and expired
+        subs = list(
+            (await session.execute(
+                select(Subscription)
+                .where(
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at <= now,
+                )
+                .order_by(Subscription.tg_id.asc())
+                .limit(2000)
+            )).scalars().all()
+        )
+        if not subs:
+            return
+
+        # current base price for strikethrough
+        try:
+            from app.repo import get_price_rub
+            base_price = int(await get_price_rub(session))
+        except Exception:
+            base_price = 199
+
+        changed = False
+
+        for sub in subs:
+            tg_id = int(sub.tg_id)
+
+            # Skip if subscription is currently active
+            if bool(getattr(sub, "is_active", False)) and sub.end_at and _ensure_tz(sub.end_at) > now:
+                continue
+
+            # Campaign only once per user lifetime.
+            consumed = int(await get_app_setting_int(session, f"winback_promo_consumed:{tg_id}", default=0))
+            if consumed:
+                continue
+
+            stage = int(await get_app_setting_int(session, f"winback_promo_stage:{tg_id}", default=0))
+            # stage: 0 none, 1=69 sent, 2=29 sent, 3=final sent
+
+            end_at = _ensure_tz(sub.end_at) if sub.end_at else None
+            if not end_at:
+                continue
+            days_since = int((now - end_at).total_seconds() // 86400)
+
+            # Stop if user already paid (any successful amount>0) after expiry.
+            # We treat any successful paid purchase as conversion and then mark consumed.
+            paid_q = (
+                select(Payment.id)
+                .where(
+                    Payment.tg_id == tg_id,
+                    Payment.status == "success",
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
+                    Payment.paid_at >= end_at,
+                )
+                .limit(1)
+            )
+            has_paid_after = (await session.execute(paid_q)).first() is not None
+            if has_paid_after:
+                await set_app_setting_int(session, f"winback_promo_consumed:{tg_id}", 1)
+                await set_app_setting_int(session, f"winback_promo_stage:{tg_id}", 99)
+                changed = True
+                continue
+
+            # Helper: delete previous promo message if we have its message_id stored.
+            async def _delete_prev(event_key: str) -> None:
+                try:
+                    from app.db.models.message_audit import MessageAudit
+
+                    mid = await session.scalar(
+                        select(MessageAudit.message_id)
+                        .where(
+                            MessageAudit.tg_id == tg_id,
+                            MessageAudit.event_key == event_key,
+                            MessageAudit.message_id.is_not(None),
+                        )
+                        .order_by(MessageAudit.id.desc())
+                        .limit(1)
+                    )
+                    if mid:
+                        try:
+                            await bot.delete_message(tg_id, int(mid))
+                        except Exception:
+                            pass
+                except Exception:
+                    return
+
+            # Stage 1: 69₽ offer after 2 days
+            if stage == 0 and days_since >= 2:
+                msg = (
+                    "🔥 <b>Только сегодня!</b>\n\n"
+                    f"Цена подписки для вас: <s>{base_price} ₽</s> → <b>69 ₽</b> (только первый месяц)\n\n"
+                    "Что вы получите:\n"
+                    "• Стабильный высокоскоростной VPN\n"
+                    "• Приглашение в семью Yandex Plus\n\n"
+                    "Нажмите кнопку ниже, чтобы перейти к оплате." 
+                )
+                await audit_send_message(
+                    bot,
+                    tg_id,
+                    msg,
+                    kind="winback_69",
+                    reply_markup=_winback_kb(amount_rub=69),
+                    parse_mode="HTML",
+                )
+                await set_app_setting_int(session, f"winback_promo_stage:{tg_id}", 1)
+                changed = True
+                continue
+
+            # Stage 2: 29₽ offer if >3 days passed since stage1 (i.e. expiry+5 days)
+            if stage == 1 and days_since >= 5:
+                await _delete_prev("winback_69")
+                msg = (
+                    "🔥 <b>Супер-скидка!</b>\n\n"
+                    f"Цена подписки для вас: <s>{base_price} ₽</s> → <s>69 ₽</s> → <b>29 ₽</b> (только первый месяц)\n\n"
+                    "Что вы получите:\n"
+                    "• Стабильный высокоскоростной VPN\n"
+                    "• Приглашение в семью Yandex Plus\n\n"
+                    "Нажмите кнопку ниже, чтобы перейти к оплате." 
+                )
+                await audit_send_message(
+                    bot,
+                    tg_id,
+                    msg,
+                    kind="winback_29",
+                    reply_markup=_winback_kb(amount_rub=29),
+                    parse_mode="HTML",
+                )
+                await set_app_setting_int(session, f"winback_promo_stage:{tg_id}", 2)
+                changed = True
+                continue
+
+            # Stage 3: final reminder ~1.5 weeks after they ignored (expiry+16 days)
+            if stage == 2 and days_since >= 16:
+                await _delete_prev("winback_29")
+                msg = (
+                    "⏳ <b>Последний шанс!</b>\n\n"
+                    "Через <b>24 часа</b> цена вернётся к обычной. "
+                    "Если вы хотите сохранить выгоду — оформите подписку сейчас.\n\n"
+                    f"Сейчас для вас: <s>{base_price} ₽</s> → <s>69 ₽</s> → <b>29 ₽</b> (первый месяц)\n\n"
+                    "Что вы получите:\n"
+                    "• Стабильный высокоскоростной VPN\n"
+                    "• Приглашение в семью Yandex Plus\n"
+                )
+                await audit_send_message(
+                    bot,
+                    tg_id,
+                    msg,
+                    kind="winback_final",
+                    reply_markup=_winback_kb(amount_rub=29),
+                    parse_mode="HTML",
+                )
+                await set_app_setting_int(session, f"winback_promo_stage:{tg_id}", 3)
+                changed = True
+                continue
+
+            # If stage 3 already sent -> mark consumed to prevent repeats in future cycles.
+            if stage == 3 and days_since >= 18:
+                await set_app_setting_int(session, f"winback_promo_consumed:{tg_id}", 1)
+                await set_app_setting_int(session, f"winback_promo_stage:{tg_id}", 99)
+                changed = True
+
+        if changed:
+            await session.commit()
 
 
 async def _job_expire_subscriptions(bot: Bot) -> None:
