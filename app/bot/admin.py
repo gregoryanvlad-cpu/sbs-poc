@@ -638,6 +638,14 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
             provider_payment_id=f"gift:{message.from_user.id}:{target_tg_id}:{int(now.timestamp())}",
         )
 
+        # Restore WG peers if the user was expired recently.
+        try:
+            from app.services.vpn.service import vpn_service
+
+            await vpn_service.restore_expired_peers(session, target_tg_id, grace_hours=24)
+        except Exception:
+            pass
+
         sub.end_at = new_end
         sub.is_active = True
         sub.status = "active"
