@@ -6,7 +6,7 @@ from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu
@@ -37,54 +37,86 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
 
     now = datetime.now(timezone.utc)
 
+    # Show expiring subscriptions even if the user isn't currently added to a Yandex family.
+    # Use only the latest active (removed_at IS NULL) membership row per TG to avoid duplicates.
     async with session_scope() as session:
-        q = (
-            select(YandexMembership, Subscription)
-            .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
-            .where(
-                YandexMembership.removed_at.is_(None),
-                Subscription.end_at.is_not(None),
-                Subscription.end_at <= now,
-            )
-            .order_by(Subscription.end_at.asc(), YandexMembership.id.asc())
+        latest_active_ids = (
+            select(func.max(YandexMembership.id).label("id"))
+            .where(YandexMembership.removed_at.is_(None))
+            .group_by(YandexMembership.tg_id)
+            .subquery()
+        )
+
+        base = (
+            select(Subscription, YandexMembership)
+            .outerjoin(latest_active_ids, latest_active_ids.c.id.is_not(None))
+            .outerjoin(YandexMembership, YandexMembership.id == latest_active_ids.c.id)
+            .where(Subscription.end_at.is_not(None))
+        )
+
+        due_rows = (await session.execute(
+            base.where(Subscription.end_at <= now)
+            .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
             .limit(200)
-        )
-        rows = (await session.execute(q)).all()
+        )).all()
 
-    if not rows:
-        await cb.message.edit_text("✅ Сегодня участников для исключения нет.", reply_markup=kb_admin_menu())
-        await cb.answer()
-        return
+        soon_rows = (await session.execute(
+            base.where(Subscription.end_at > now)
+            .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
+            .limit(30)
+        )).all()
 
-    lines: list[str] = ["🚨 <b>Сегодня пора исключить следующих участников из следующих семей:</b>\n"]
+    lines: list[str] = []
 
-    for i, (m, sub) in enumerate(rows, start=1):
-        days_with_us = "—"
-        try:
-            if sub.created_at:
-                created = sub.created_at if sub.created_at.tzinfo else sub.created_at.replace(tzinfo=timezone.utc)
-                days_with_us = f"{max((now - created).days, 0)} дн."
-        except Exception:
-            pass
+    if not due_rows:
+        lines.append("✅ <b>Сегодня участников для исключения нет.</b>")
+    else:
+        lines.append("🚨 <b>Сегодня пора исключить следующих участников:</b>\n")
 
-        # VPN status: if you later add an explicit flag on Subscription, show it.
-        vpn_state = "—"
-        try:
-            vpn_state = "Включен" if bool(getattr(sub, "vpn_enabled")) else "Отключен"
-        except Exception:
+        for i, (sub, m) in enumerate(due_rows, start=1):
+            days_with_us = "—"
+            try:
+                if sub.created_at:
+                    created = sub.created_at if sub.created_at.tzinfo else sub.created_at.replace(tzinfo=timezone.utc)
+                    days_with_us = f"{max((now - created).days, 0)} дн."
+            except Exception:
+                pass
+
+            # VPN status: if you later add an explicit flag on Subscription, show it.
             vpn_state = "—"
+            try:
+                vpn_state = "Включен" if bool(getattr(sub, "vpn_enabled")) else "Отключен"
+            except Exception:
+                vpn_state = "—"
 
-        lines.append(
-            f"<b>#{i}</b>\n"
-            f"Пользователь ID TG: <code>{m.tg_id}</code>\n"
-            f"Дата приобретения подписки на сервис: <code>{_fmt_dt_short(sub.created_at)}</code>\n"
-            f"Дата окончания подписки на сервис: <code>{_fmt_dt_short(sub.end_at)}</code>\n"
-            f"Наименование семьи (label): <code>{m.family_label or '—'}</code>\n"
-            f"Номер слота: <code>{m.slot_index or '—'}</code>\n"
-            f"VPN: <b>{vpn_state}</b>\n"
-            f"Подписка: <b>{'Продлевалась' if (sub.end_at and sub.created_at and sub.end_at > sub.created_at) else 'Не продлевалась'}</b>\n"
-            f"Пользователь с нами: <b>{days_with_us}</b>\n"
-        )
+            fam = (m.family_label if m else None) or "—"
+            slot = (m.slot_index if m else None) or "—"
+            membership_state = "В семье" if m else "❗️Не добавлен в семью"
+
+            lines.append(
+                f"<b>#{i}</b>\n"
+                f"Пользователь ID TG: <code>{sub.tg_id}</code>\n"
+                f"Дата приобретения подписки на сервис: <code>{_fmt_dt_short(sub.created_at)}</code>\n"
+                f"Дата окончания подписки на сервис: <code>{_fmt_dt_short(sub.end_at)}</code>\n"
+                f"Статус Яндекс семьи: <b>{membership_state}</b>\n"
+                f"Наименование семьи (label): <code>{fam}</code>\n"
+                f"Номер слота: <code>{slot}</code>\n"
+                f"VPN: <b>{vpn_state}</b>\n"
+                f"Подписка: <b>{'Продлевалась' if (sub.end_at and sub.created_at and sub.end_at > sub.created_at) else 'Не продлевалась'}</b>\n"
+                f"Пользователь с нами: <b>{days_with_us}</b>\n"
+            )
+
+    if soon_rows:
+        lines.append("\n📅 <b>Ближайшие к исключению (по дате окончания):</b>")
+        for sub, m in soon_rows[:20]:
+            if not sub.end_at:
+                continue
+            dt = sub.end_at if sub.end_at.tzinfo else sub.end_at.replace(tzinfo=timezone.utc)
+            days_left = max((dt - now).days, 0)
+            fam = (m.family_label if m else None) or "—"
+            lines.append(
+                f"• <code>{sub.tg_id}</code> — до <code>{_fmt_dt_short(sub.end_at)}</code> (через {days_left} дн.) — семья: <code>{fam}</code>"
+            )
 
     await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
     await cb.answer()
