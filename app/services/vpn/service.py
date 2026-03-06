@@ -4,6 +4,7 @@ import base64
 import ipaddress
 import logging
 import os
+from datetime import timedelta
 from typing import Any, Dict, Optional, Tuple
 
 from cryptography.hazmat.primitives import serialization
@@ -131,13 +132,26 @@ class VPNService:
 
         last = await self._get_last_peer(session, tg_id)
         if last and not last.is_active:
-            log.info("vpn_restore_peer tg_id=%s peer_id=%s", tg_id, last.id)
-            await self.provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
-            last.is_active = True
-            last.revoked_at = None
-            last.rotation_reason = None
-            await session.flush()
-            return self._row_to_peer_dict(last)
+            # Restore only if the peer is eligible. After a grace window we prefer
+            # issuing a new peer to avoid keeping stale records forever.
+            eligible = True
+            if (last.rotation_reason or "") == "expired_purged":
+                eligible = False
+            if (last.rotation_reason or "") in {"expired", "subscription_expired"}:
+                if last.revoked_at is None:
+                    eligible = False
+                else:
+                    cutoff = utcnow() - timedelta(hours=24)
+                    eligible = last.revoked_at >= cutoff
+
+            if eligible:
+                log.info("vpn_restore_peer tg_id=%s peer_id=%s", tg_id, last.id)
+                await self.provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
+                last.is_active = True
+                last.revoked_at = None
+                last.rotation_reason = None
+                await session.flush()
+                return self._row_to_peer_dict(last)
 
         client_ip = self._alloc_ip(tg_id)
         client_priv, client_pub = gen_keys()
@@ -213,13 +227,92 @@ class VPNService:
         res = await session.execute(q)
         last = res.scalar_one_or_none()
         if last and not last.is_active:
-            log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
-            await provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
-            last.is_active = True
-            last.revoked_at = None
-            last.rotation_reason = None
-            await session.flush()
-            return self._row_to_peer_dict(last)
+            eligible = True
+            if (last.rotation_reason or "") == "expired_purged":
+                eligible = False
+            if (last.rotation_reason or "") in {"expired", "subscription_expired"}:
+                if last.revoked_at is None:
+                    eligible = False
+                else:
+                    cutoff = utcnow() - timedelta(hours=24)
+                    eligible = last.revoked_at >= cutoff
+
+            if eligible:
+                log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
+                await provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
+                last.is_active = True
+                last.revoked_at = None
+                last.rotation_reason = None
+                await session.flush()
+                return self._row_to_peer_dict(last)
+
+    async def restore_expired_peers(self, session: AsyncSession, tg_id: int, *, grace_hours: int = 24) -> int:
+        """Re-enable peers disabled due to subscription expiration.
+
+        Called after a successful payment so the existing config starts working
+        again without requiring a new config.
+        """
+
+        cutoff = utcnow() - timedelta(hours=int(grace_hours))
+
+        q = (
+            select(VpnPeer)
+            .where(
+                VpnPeer.tg_id == tg_id,
+                VpnPeer.is_active == False,  # noqa: E712
+                VpnPeer.rotation_reason.in_(["expired", "subscription_expired"]),
+                VpnPeer.revoked_at.is_not(None),
+                VpnPeer.revoked_at >= cutoff,
+            )
+            .order_by(VpnPeer.id.asc())
+        )
+        rows = list((await session.execute(q)).scalars().all())
+        if not rows:
+            return 0
+
+        # Load multi-location servers mapping once (best-effort).
+        servers_by_code: dict[str, dict] = {}
+        try:
+            import json
+
+            servers_json = (os.environ.get("VPN_SERVERS_JSON") or os.environ.get("VPN_SERVERS") or "").strip()
+            servers: list[dict] = []
+            if servers_json:
+                v = json.loads(servers_json)
+                if isinstance(v, list):
+                    servers = [x for x in v if isinstance(x, dict)]
+            for s in servers:
+                code = str(s.get("code") or "").upper()
+                if code:
+                    servers_by_code[code] = s
+        except Exception:
+            servers_by_code = {}
+
+        restored = 0
+        for p in rows:
+            try:
+                code = (p.server_code or "").upper() or None
+                if code and code in servers_by_code:
+                    srv = servers_by_code[code]
+                    provider = self._provider_for(
+                        host=str(srv.get("host")),
+                        port=int(srv.get("port") or 22),
+                        user=str(srv.get("user")),
+                        password=srv.get("password"),
+                        interface=str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                    )
+                    await provider.add_peer(p.client_public_key, p.client_ip, tg_id=tg_id)
+                else:
+                    await self.provider.add_peer(p.client_public_key, p.client_ip, tg_id=tg_id)
+                p.is_active = True
+                p.revoked_at = None
+                p.rotation_reason = None
+                restored += 1
+            except Exception:
+                log.exception("vpn_restore_expired_peer_failed tg_id=%s peer_id=%s", tg_id, getattr(p, "id", None))
+
+        await session.flush()
+        return restored
 
         client_ip = self._alloc_ip(tg_id)
         client_priv, client_pub = gen_keys()
