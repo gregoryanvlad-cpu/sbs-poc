@@ -261,6 +261,65 @@ async def run_scheduler() -> None:
 async def _job_expire_subscriptions(bot: Bot) -> None:
     async with session_scope() as session:
         from app.repo import utcnow, deactivate_peers
+        from app.db.models.vpn_peer import VpnPeer
+        from app.services.vpn.service import VPNService
+
+        def _load_vpn_servers_for_scheduler() -> list[dict]:
+            """Load VPN servers from env without importing bot handlers.
+
+            This mirrors app/bot/handlers/nav.py::_load_vpn_servers so that
+            server_code mapping stays consistent.
+            """
+            import json
+            import os
+
+            servers_json = (os.environ.get("VPN_SERVERS_JSON") or "").strip()
+            servers: list[dict] = []
+            if servers_json:
+                try:
+                    v = json.loads(servers_json)
+                    if isinstance(v, list):
+                        servers = [x for x in v if isinstance(x, dict)]
+                except Exception:
+                    servers = []
+
+            if not servers:
+                pwd = os.environ.get("WG_SSH_PASSWORD")
+                if pwd is not None and pwd.strip() == "":
+                    pwd = None
+                servers = [
+                    {
+                        "code": os.environ.get("VPN_CODE", "NL"),
+                        "host": os.environ.get("WG_SSH_HOST"),
+                        "port": int(os.environ.get("WG_SSH_PORT", "22")),
+                        "user": os.environ.get("WG_SSH_USER"),
+                        "password": pwd,
+                        "interface": os.environ.get("VPN_INTERFACE", "wg0"),
+                    }
+                ]
+
+            out: list[dict] = []
+            for s in servers:
+                code = str(s.get("code") or "").upper() or "XX"
+                out.append(
+                    {
+                        "code": code,
+                        "host": s.get("host"),
+                        "port": int(s.get("port") or 22),
+                        "user": s.get("user"),
+                        "password": s.get("password"),
+                        "interface": str(s.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                    }
+                )
+            return out
+
+        servers_by_code = {s.get("code"): s for s in _load_vpn_servers_for_scheduler()}
+
+        # Best-effort: may fail if WG env vars are not configured.
+        try:
+            vpn_svc: VPNService | None = VPNService()
+        except Exception:
+            vpn_svc = None
 
         now = utcnow()
         expired = await list_expired_subscriptions(session, now)
@@ -270,6 +329,39 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         expired_ids: list[int] = []
         for sub in expired:
             tg_id = sub.tg_id
+
+            # Physically revoke WireGuard access on the server.
+            # DB-only deactivation is NOT enough because peers remain in wg0.
+            peers: list[VpnPeer] = []
+            try:
+                rows = await session.execute(select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True))
+                peers = list(rows.scalars().all())
+            except Exception:
+                peers = []
+
+            if vpn_svc and peers:
+                for p in peers:
+                    try:
+                        code = (p.server_code or "").upper() or None
+                        srv = servers_by_code.get(code) if code else None
+                        if srv and srv.get("host") and srv.get("user"):
+                            await vpn_svc.remove_peer_for_server(
+                                public_key=p.client_public_key,
+                                host=str(srv["host"]),
+                                port=int(srv.get("port") or 22),
+                                user=str(srv["user"]),
+                                password=srv.get("password"),
+                                interface=str(srv.get("interface") or "wg0"),
+                            )
+                        else:
+                            await vpn_svc.provider.remove_peer(p.client_public_key)
+                    except Exception:
+                        log.exception(
+                            "vpn_peer_remove_on_expire_failed tg_id=%s peer_id=%s",
+                            tg_id,
+                            getattr(p, "id", None),
+                        )
+
             await set_subscription_expired(session, tg_id)
             await deactivate_peers(session, tg_id, reason="subscription_expired")
             expired_ids.append(tg_id)
