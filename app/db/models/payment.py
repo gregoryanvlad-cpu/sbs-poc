@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, Integer, String, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from app.db.base import Base
 
@@ -14,6 +14,9 @@ class Payment(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Backwards compatibility: older code used `amount_rub`.
+    # Keep it as an ORM synonym so legacy queries don't crash.
+    amount_rub = synonym("amount")
     currency: Mapped[str] = mapped_column(String(8), server_default="RUB", nullable=False)
     provider: Mapped[str] = mapped_column(String(32), server_default="mock", nullable=False)
     status: Mapped[str] = mapped_column(String(16), server_default="success", nullable=False)
