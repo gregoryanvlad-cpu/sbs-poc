@@ -12,6 +12,7 @@ from sqlalchemy import update
 
 from app.db.session import session_scope
 from app.db.models.message_audit import MessageAudit
+from app.repo import get_app_setting_int, set_app_setting_int
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,24 @@ class ActivitySeenMiddleware(BaseMiddleware):
             now = datetime.now(timezone.utc)
             try:
                 async with session_scope() as session:
+                    # Track user activity counters (best-effort; stored in app_settings).
+                    try:
+                        ts_key = f"ua:last_interaction_ts:{tg_id}"
+                        await set_app_setting_int(session, ts_key, int(now.timestamp()))
+
+                        total_key = f"ua:actions_total:{tg_id}"
+                        total = int(await get_app_setting_int(session, total_key, default=0) or 0)
+                        await set_app_setting_int(session, total_key, total + 1)
+
+                        if isinstance(event, Message):
+                            k = f"ua:messages_in:{tg_id}"
+                        else:
+                            k = f"ua:clicks_in:{tg_id}"
+                        v = int(await get_app_setting_int(session, k, default=0) or 0)
+                        await set_app_setting_int(session, k, v + 1)
+                    except Exception:
+                        pass
+
                     await session.execute(
                         update(MessageAudit)
                         .where(MessageAudit.tg_id == tg_id)
