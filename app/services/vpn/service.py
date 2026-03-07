@@ -246,6 +246,35 @@ class VPNService:
                 await session.flush()
                 return self._row_to_peer_dict(last)
 
+        # No eligible peer to restore on this server — create a fresh peer.
+        client_ip = self._alloc_ip(tg_id)
+        client_priv, client_pub = gen_keys()
+
+        log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+
+        row = VpnPeer(
+            tg_id=tg_id,
+            client_public_key=client_pub,
+            client_private_key_enc=crypto.encrypt(client_priv),
+            client_ip=client_ip,
+            server_code=server_code,
+            is_active=True,
+            revoked_at=None,
+            rotation_reason=None,
+        )
+        session.add(row)
+        await session.flush()
+
+        return {
+            "peer_id": row.id,
+            "tg_id": tg_id,
+            "client_ip": client_ip,
+            "public_key": client_pub,
+            "client_private_key_enc": row.client_private_key_enc,
+            "client_private_key_plain": client_priv,
+        }
+
     async def restore_expired_peers(self, session: AsyncSession, tg_id: int, *, grace_hours: int = 24) -> int:
         """Re-enable peers disabled due to subscription expiration.
 
@@ -313,32 +342,6 @@ class VPNService:
 
         await session.flush()
         return restored
-
-        client_ip = self._alloc_ip(tg_id)
-        client_priv, client_pub = gen_keys()
-        log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
-        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
-
-        row = VpnPeer(
-            tg_id=tg_id,
-            client_public_key=client_pub,
-            client_private_key_enc=crypto.encrypt(client_priv),
-            client_ip=client_ip,
-            server_code=server_code,
-            is_active=True,
-            revoked_at=None,
-            rotation_reason=None,
-        )
-        session.add(row)
-        await session.flush()
-        return {
-            "peer_id": row.id,
-            "tg_id": tg_id,
-            "client_ip": client_ip,
-            "public_key": client_pub,
-            "client_private_key_enc": row.client_private_key_enc,
-            "client_private_key_plain": client_priv,
-        }
 
     async def ensure_rate_limit(self, *, tg_id: int, ip: str) -> None:
         """Best-effort apply the standard WG per-user rate limit on the default server."""
