@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 import qrcode
-from aiogram import Router
+from aiogram import Router, Bot
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -538,6 +538,44 @@ async def _schedule_vpn_cleanup_and_followup(bot, *, chat_id: int, messages: lis
         except Exception:
             pass
 
+
+def _vpn_lastmsg_key(tg_id: int, kind: str) -> str:
+    return f"vpn_lastmsg:{int(tg_id)}:{kind}"  # kind in {chat,conf,qr}
+
+
+async def _store_last_vpn_conf_messages(tg_id: int, *, chat_id: int, conf_msg_id: int, qr_msg_id: int) -> None:
+    """Persist last config/QR message ids to allow immediate cleanup on user action."""
+    async with session_scope() as session:
+        await set_app_setting_int(session, _vpn_lastmsg_key(tg_id, "chat"), int(chat_id))
+        await set_app_setting_int(session, _vpn_lastmsg_key(tg_id, "conf"), int(conf_msg_id))
+        await set_app_setting_int(session, _vpn_lastmsg_key(tg_id, "qr"), int(qr_msg_id))
+        await session.commit()
+
+
+async def _delete_last_vpn_conf_messages(bot: Bot, *, tg_id: int) -> None:
+    """Delete last stored VPN config/QR messages (best-effort) and clear pointers."""
+    async with session_scope() as session:
+        chat_id = await get_app_setting_int(session, _vpn_lastmsg_key(tg_id, "chat"), default=0)
+        conf_id = await get_app_setting_int(session, _vpn_lastmsg_key(tg_id, "conf"), default=0)
+        qr_id = await get_app_setting_int(session, _vpn_lastmsg_key(tg_id, "qr"), default=0)
+
+        # Clear first to avoid repeated deletes on races.
+        await set_app_setting_int(session, _vpn_lastmsg_key(tg_id, "chat"), 0)
+        await set_app_setting_int(session, _vpn_lastmsg_key(tg_id, "conf"), 0)
+        await set_app_setting_int(session, _vpn_lastmsg_key(tg_id, "qr"), 0)
+        await session.commit()
+
+    if chat_id and conf_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=conf_id)
+        except Exception:
+            pass
+    if chat_id and qr_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=qr_id)
+        except Exception:
+            pass
+
     if deleted_any:
         try:
             await bot.send_message(
@@ -805,6 +843,20 @@ async def on_nav(cb: CallbackQuery) -> None:
     await _safe_cb_answer(cb)
 
     where = cb.data.split(":", 1)[1]
+
+    if where == "home_vpn":
+        # "Главное меню" under VPN config/QR: delete config messages immediately.
+        try:
+            await _delete_last_vpn_conf_messages(cb.bot, tg_id=cb.from_user.id)
+        except Exception:
+            pass
+        await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
+        try:
+            show_trial = await _trial_visible_for_user(cb.from_user.id)
+            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML")
+        except Exception:
+            pass
+        return
 
     if where == "home":
         # Home text may wait on VPN status; callback already answered above.
@@ -1735,6 +1787,17 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
         chat_id=chat_id,
         photo=qr_file,
         caption=f"QR для WireGuard (удалится через {_vpn_config_ttl_seconds()} сек.)",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home_vpn")]]
+        ),
+    )
+
+    # Allow immediate cleanup when user navigates back to main menu.
+    await _store_last_vpn_conf_messages(
+        tg_id=tg_id,
+        chat_id=chat_id,
+        conf_msg_id=msg_conf.message_id,
+        qr_msg_id=msg_qr.message_id,
     )
 
     asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=chat_id, messages=[msg_conf, msg_qr]))
@@ -2103,6 +2166,16 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     msg_qr = await cb.message.answer_photo(
         photo=qr_file,
         caption=f"QR для WireGuard (удалится через {_vpn_config_ttl_seconds()} сек.)",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home_vpn")]]
+        ),
+    )
+
+    await _store_last_vpn_conf_messages(
+        tg_id=tg_id,
+        chat_id=cb.message.chat.id,
+        conf_msg_id=msg_conf.message_id,
+        qr_msg_id=msg_qr.message_id,
     )
 
     asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=cb.message.chat.id, messages=[msg_conf, msg_qr]))
@@ -2276,6 +2349,16 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
                 chat_id=chat_id,
                 photo=qr_file,
                 caption=f"QR для WireGuard (после сброса, удалится через {_vpn_config_ttl_seconds()} сек.)",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home_vpn")]]
+                ),
+            )
+
+            await _store_last_vpn_conf_messages(
+                tg_id=tg_id,
+                chat_id=chat_id,
+                conf_msg_id=msg_conf.message_id,
+                qr_msg_id=msg_qr.message_id,
             )
 
             asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=chat_id, messages=[msg_conf, msg_qr]))
