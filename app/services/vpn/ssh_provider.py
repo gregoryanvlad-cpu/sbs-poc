@@ -155,6 +155,27 @@ class WireGuardSSHProvider:
                 res[key] = ts
         return res
 
+    async def get_peer_endpoints(self) -> dict[str, str]:
+        """Return endpoints for peers.
+
+        Output of `wg show <iface> endpoints`:
+          <pubkey>\t<ip:port>
+        where endpoint can be "(none)".
+        """
+        out = await self._run_output(f"{WG_BIN} show {self.interface} endpoints", check=False)
+        res: dict[str, str] = {}
+        if not out:
+            return res
+        for ln in out.splitlines():
+            parts = ln.strip().split()
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip()
+            ep = parts[1].strip()
+            if key:
+                res[key] = ep
+        return res
+
     async def has_peer(self, public_key: str) -> bool:
         """Check if a peer exists on the interface (best-effort)."""
         if not public_key:
