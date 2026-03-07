@@ -22,14 +22,15 @@ from dateutil.relativedelta import relativedelta
 from app.bot.auth import is_owner
 from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
-from app.db.models import ReferralEarning, Subscription, User
+from app.db.models import ReferralEarning, Subscription, User, Payment
+from app.db.models.vpn_peer import VpnPeer
 from app.db.models import MessageAudit
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import get_price_rub, set_app_setting_int, get_subscription, extend_subscription
+from app.repo import get_price_rub, set_app_setting_int, get_subscription, extend_subscription, get_app_setting_int
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
 from app.services.regionvpn import RegionVpnService
@@ -630,12 +631,152 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
     lines.append("👤 <b>Карточка пользователя</b>")
     lines.append(f"ID: <code>{tg_id}</code>")
     lines.append(f"Профиль: {username} | {name}")
+    if u:
+        try:
+            lines.append(f"Создан: <b>{_fmt_dt_short(u.created_at)}</b>")
+        except Exception:
+            pass
     if sub_end:
         lines.append(
             f"Подписка: <b>{'активна' if sub_active else 'не активна'}</b> | до: <b>{_fmt_dt_short(sub_end)}</b>"
         )
     else:
         lines.append("Подписка: —")
+
+    # Payments summary (best-effort)
+    try:
+        r = await session.execute(
+            select(func.count(Payment.id), func.coalesce(func.sum(Payment.amount), 0), func.max(Payment.paid_at))
+            .where(Payment.tg_id == tg_id, Payment.status == "success")
+        )
+        cnt, total_amt, last_paid = r.first() or (0, 0, None)
+        if int(cnt or 0) > 0:
+            lines.append(
+                f"Оплаты: <b>{int(cnt)}</b> | Сумма: <b>{int(total_amt)} ₽</b> | Последняя: <b>{_fmt_dt_short(last_paid)}</b>"
+            )
+        else:
+            lines.append("Оплаты: 0")
+    except Exception:
+        pass
+
+    # Activity counters (best-effort, from app_settings; updated by middleware)
+    try:
+        total_actions = int(await get_app_setting_int(session, f"ua:actions_total:{tg_id}", default=0) or 0)
+        msg_in = int(await get_app_setting_int(session, f"ua:messages_in:{tg_id}", default=0) or 0)
+        clicks_in = int(await get_app_setting_int(session, f"ua:clicks_in:{tg_id}", default=0) or 0)
+        last_ts = int(await get_app_setting_int(session, f"ua:last_interaction_ts:{tg_id}", default=0) or 0)
+        last_seen = "—"
+        if last_ts > 0:
+            last_seen = _fmt_dt_short(datetime.fromtimestamp(last_ts, tz=timezone.utc))
+        lines.append(f"Действия: <b>{total_actions}</b> (сообщ.: {msg_in}, клики: {clicks_in}) | Последняя активность: <b>{last_seen}</b>")
+    except Exception:
+        pass
+
+    # Yandex membership snapshot (best-effort)
+    try:
+        ym = (
+            await session.execute(
+                select(YandexMembership)
+                .where(YandexMembership.tg_id == tg_id)
+                .order_by(YandexMembership.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if ym:
+            if ym.removed_at is None:
+                lines.append(
+                    f"Yandex: ✅ в семье | label: <b>{ym.account_label or '—'}</b> | слот: <b>{ym.slot_index if ym.slot_index is not None else '—'}</b> | покрытие до: <b>{_fmt_dt_short(ym.coverage_end_at)}</b>"
+                )
+            else:
+                lines.append(
+                    f"Yandex: ❌ исключён | label: <b>{ym.account_label or '—'}</b> | слот: <b>{ym.slot_index if ym.slot_index is not None else '—'}</b> | removed: <b>{_fmt_dt_short(ym.removed_at)}</b>"
+                )
+        else:
+            lines.append("Yandex: ❗️нет записи")
+    except Exception:
+        pass
+
+    # WireGuard peers & IPs (best-effort)
+    try:
+        peers = list(
+            (
+                await session.execute(
+                    select(VpnPeer)
+                    .where(VpnPeer.tg_id == tg_id)
+                    .order_by(VpnPeer.id.desc())
+                    .limit(10)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception:
+        peers = []
+
+    if peers:
+        lines.append("")
+        lines.append("🧷 <b>WireGuard профили</b>")
+
+        # endpoints & latest handshakes per server (SSH best-effort)
+        endpoints_by_key: dict[str, str] = {}
+        handshakes_by_key: dict[str, int] = {}
+        try:
+            servers = _load_vpn_servers_admin()
+            servers_by_code = {str(s.get('code') or '').upper(): s for s in servers}
+
+            by_code: dict[str, list[str]] = {}
+            for p in peers:
+                code = str((p.server_code or '')).upper() if p.server_code else ''
+                if not code:
+                    # fall back to first server
+                    code = next(iter(servers_by_code.keys()), '')
+                by_code.setdefault(code, []).append(p.client_public_key)
+
+            for code, keys in by_code.items():
+                srv = servers_by_code.get(code)
+                if not srv:
+                    continue
+                host = srv.get('host') or srv.get('VPN_SSH_HOST')
+                user_ = srv.get('user')
+                if not host or not user_:
+                    continue
+                prov = vpn_service._provider_for(
+                    host=str(host),
+                    port=int(srv.get('port') or 22),
+                    user=str(user_),
+                    password=srv.get('password'),
+                    interface=str(srv.get('interface') or 'wg0'),
+                )
+                try:
+                    eps = await prov.get_peer_endpoints()
+                    for k in keys:
+                        if k in eps:
+                            endpoints_by_key[k] = eps[k]
+                except Exception:
+                    pass
+                try:
+                    hs = await prov.get_latest_handshakes()
+                    for k in keys:
+                        if k in hs:
+                            handshakes_by_key[k] = int(hs[k] or 0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        for p in peers:
+            active_txt = '✅' if p.is_active else '⛔️'
+            code = (p.server_code or '—').upper() if p.server_code else '—'
+            vpn_ip = p.client_ip or '—'
+            ep = endpoints_by_key.get(p.client_public_key)
+            ep_txt = ep if ep else '—'
+            hs_ts = int(handshakes_by_key.get(p.client_public_key, 0) or 0)
+            hs_txt = '—'
+            if hs_ts > 0:
+                hs_txt = _fmt_dt_short(datetime.fromtimestamp(hs_ts, tz=timezone.utc))
+            lines.append(
+                f"• {active_txt} peer#{p.id} | {code} | VPN-IP: <code>{vpn_ip}</code> | endpoint: <code>{ep_txt}</code> | last: {hs_txt}"
+            )
 
     lines.append("")
     lines.append("🔌 <b>WG автоотключение</b>")
