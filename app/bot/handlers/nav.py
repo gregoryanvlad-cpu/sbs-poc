@@ -54,6 +54,61 @@ from app.services.referrals.service import referral_service
 router = Router()
 
 
+async def _notify_admins_new_purchase(
+    bot: Bot,
+    *,
+    buyer_tg_id: int,
+    amount_rub: int,
+    months: int,
+    provider: str,
+    new_end_at: datetime | None,
+) -> None:
+    """Best-effort: notify owner/admins about a successful purchase."""
+
+    admin_ids: set[int] = set()
+    try:
+        admin_ids.add(int(settings.owner_tg_id))
+    except Exception:
+        pass
+    try:
+        admin_ids.update({int(x) for x in (settings.admin_tg_ids or [])})
+    except Exception:
+        pass
+    # Don't spam buyer if they are admin
+    admin_ids.discard(int(buyer_tg_id))
+    if not admin_ids:
+        return
+
+    username = "—"
+    full_name = "—"
+    try:
+        async with session_scope() as s:
+            u = (await s.execute(select(User).where(User.tg_id == buyer_tg_id).limit(1))).scalar_one_or_none()
+            if u:
+                username = u.username or "—"
+                full_name = ((u.first_name or "") + (" " + u.last_name if u.last_name else "")).strip() or "—"
+    except Exception:
+        pass
+
+    end_str = fmt_dt(new_end_at) if new_end_at else "—"
+
+    text = (
+        "🧾 <b>Новая покупка</b>\n\n"
+        f"ID: <code>{buyer_tg_id}</code>\n"
+        f"Профиль: @{username} | {full_name}\n"
+        f"Сумма: <b>{amount_rub} ₽</b>\n"
+        f"Период: <b>{months} мес.</b>\n"
+        f"Провайдер: <code>{html_escape(provider)}</code>\n"
+        f"Подписка до: <b>{end_str}</b>"
+    )
+
+    for aid in admin_ids:
+        try:
+            await bot.send_message(int(aid), text, parse_mode="HTML")
+        except Exception:
+            pass
+
+
 async def _restore_wg_peers_after_payment(session, tg_id: int) -> None:
     """After a successful payment, re-enable WG peers disabled on expiration.
 
@@ -1324,6 +1379,19 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                     sub.status = "active"
                     await session.commit()
 
+                    # Admin notification about new purchase (best-effort)
+                    try:
+                        await _notify_admins_new_purchase(
+                            bot,
+                            buyer_tg_id=tg_id,
+                            amount_rub=int(pay.amount),
+                            months=add_months,
+                            provider=str(pay.provider or "platega"),
+                            new_end_at=new_end,
+                        )
+                    except Exception:
+                        pass
+
                     try:
                         await bot.send_message(
                             tg_id,
@@ -1575,6 +1643,19 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                 new_invite_link = None
 
             await session.commit()
+
+            # Admin notification about new purchase (best-effort)
+            try:
+                await _notify_admins_new_purchase(
+                    cb.bot,
+                    buyer_tg_id=cb.from_user.id,
+                    amount_rub=int(pay.amount),
+                    months=add_months,
+                    provider=str(pay.provider or "platega"),
+                    new_end_at=new_end,
+                )
+            except Exception:
+                pass
 
             await cb.answer("Оплата подтверждена")
             kb = InlineKeyboardMarkup(
