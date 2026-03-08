@@ -860,8 +860,11 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
     """User notifications based on coverage_end_at and extension state.
 
     Rules:
-    - If NOT renewed: send 7/3/1 days before subscription end (coverage_end_at).
-    - If renewed: do NOT send 7/3, only 1-day notice about new invite tomorrow.
+    - This job is ONLY about Yandex invite rotation notifications.
+    - Subscription expiry reminders (7/3/1) are sent by
+      _job_subscription_end_at_notifications based on Subscription.end_at for ALL
+      users (VPN-only and VPN+Yandex) so users keep getting reminders after renewals.
+    - If renewed: send 1-day notice about new invite tomorrow.
     - Each notification is sent once using notified_* fields.
     """
     now = _utcnow()
@@ -916,65 +919,9 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
                         pass
                 continue
 
-            # 🔴 Not renewed users: 7 / 3 / 1 days expiry warnings
-            if days_left == 7 and m.notified_7d_at is None:
-                try:
-                    await audit_send_message(
-                        int(m.tg_id),
-                        "⏳ Через 7 дней закончится ваша подписка на сервис.\n\n"
-                        "Продлите подписку, чтобы сохранить доступ к VPN и Yandex Plus.",
-                        kind="sub_warn_7d",
-                        reply_markup=InlineKeyboardMarkup(
-                            inline_keyboard=[
-                                [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
-                                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-                            ]
-                        ),
-                    )
-                    m.notified_7d_at = now
-                    changed = True
-                except Exception:
-                    pass
-
-            if days_left == 3 and m.notified_3d_at is None:
-                try:
-                    await audit_send_message(
-                        int(m.tg_id),
-                        "⚠️ Осталось 3 дня до окончания подписки.\n\n"
-                        "Продлите подписку, чтобы не потерять доступ к VPN и Yandex Plus.",
-                        kind="sub_warn_3d",
-                        reply_markup=InlineKeyboardMarkup(
-                            inline_keyboard=[
-                                [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
-                                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-                            ]
-                        ),
-                    )
-                    m.notified_3d_at = now
-                    changed = True
-                except Exception:
-                    pass
-
-            if days_left == 1 and m.notified_1d_at is None:
-                try:
-                    await audit_send_message(
-                        int(m.tg_id),
-                        "🚨 Завтра ваша подписка закончится.\n\n"
-                        "• VPN будет отключён.\n"
-                        "• Доступ к Yandex Plus завершится.\n\n"
-                        "Продлите подписку, чтобы сохранить доступ.",
-                        kind="sub_warn_1d",
-                        reply_markup=InlineKeyboardMarkup(
-                            inline_keyboard=[
-                                [InlineKeyboardButton(text="💳 Оплата", callback_data="nav:pay")],
-                                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-                            ]
-                        ),
-                    )
-                    m.notified_1d_at = now
-                    changed = True
-                except Exception:
-                    pass
+            # For non-renewed users, expiry reminders are handled by
+            # _job_subscription_end_at_notifications (based on Subscription.end_at).
+            # We intentionally do nothing here to avoid duplicate notifications.
 
         if changed:
             await session.commit()
@@ -990,8 +937,8 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
 
     Rules:
     - Only for active subscriptions with end_at in the future.
-    - Skip users that have an active YandexMembership (they are handled by the
-      membership-based job).
+    - Applies to ALL users (VPN-only and VPN+Yandex). YandexMembership-based job
+      only sends the "invite tomorrow" notice, not expiry reminders.
     - Send once per milestone per конкретную дату окончания (end_at), stored in
       app_settings.
     - Send after 19:00 Europe/Amsterdam to hit evening hours.
@@ -1066,26 +1013,8 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
                     if trial_end_ts > 0 or is_short:
                         continue
 
-            # If user is in an active Yandex family, reminders are handled by
-            # _job_user_subscription_notifications to avoid duplicates.
-            try:
-                y_exists = (
-                    await session.execute(
-                        select(YandexMembership.id)
-                        .where(
-                            YandexMembership.tg_id == tg_id,
-                            YandexMembership.removed_at.is_(None),
-                            YandexMembership.coverage_end_at.is_not(None),
-                        )
-                        .limit(1)
-                    )
-                ).first()
-                if y_exists is not None:
-                    continue
-            except Exception:
-                # If YandexMembership table/query fails, still proceed with
-                # subscription-based reminders.
-                pass
+            # Do NOT skip Yandex users here: they should also receive expiry
+            # reminders based on Subscription.end_at.
 
             end_at = _ensure_tz(sub.end_at)
             days_left = _days_until(end_at, now)
