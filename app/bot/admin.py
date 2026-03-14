@@ -19,7 +19,7 @@ from sqlalchemy import func, select, literal
 
 from dateutil.relativedelta import relativedelta
 
-from app.bot.auth import is_owner
+from app.bot.auth import is_owner, is_admin
 from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, Subscription, User, Payment
@@ -326,6 +326,10 @@ class AdminUserInspectFSM(StatesGroup):
 
 class AdminUserSetEndAtFSM(StatesGroup):
     waiting_end_at = State()
+
+
+class AdminVpnExtraFSM(StatesGroup):
+    waiting_count = State()
 
 
 class AdminGiftSubFSM(StatesGroup):
@@ -1523,6 +1527,88 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
         else:
             raise
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:extra")
+async def admin_vpn_extra_start(cb: CallbackQuery, state: FSMContext) -> None:
+    """Admins: create extra WG configs for themselves (multiple devices)."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await cb.answer()
+    await state.clear()
+    await state.set_state(AdminVpnExtraFSM.waiting_count)
+    await cb.message.edit_text(
+        "➕ <b>Доп. устройства для админа</b>\n\n"
+        "Сколько дополнительных WireGuard-конфигов создать для вас?\n"
+        "Введите число от <b>1</b> до <b>5</b>.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminVpnExtraFSM.waiting_count)
+async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    raw = (message.text or "").strip()
+    try:
+        n = int(raw)
+    except Exception:
+        await message.answer("Введите число от 1 до 5.")
+        return
+    if n < 1 or n > 5:
+        await message.answer("Введите число от 1 до 5.")
+        return
+
+    tg_id = int(message.from_user.id)
+
+    from app.services.vpn.service import VPNService
+    from aiogram.types import BufferedInputFile
+
+    try:
+        vpn_svc = VPNService()
+    except Exception:
+        await state.clear()
+        await message.answer("⚠️ VPN сервис не настроен (нет WG_* env).", reply_markup=kb_admin_menu())
+        return
+
+    created = 0
+    async with session_scope() as session:
+        for _ in range(n):
+            try:
+                peer = await vpn_svc.create_extra_peer(session, tg_id)
+                try:
+                    await vpn_svc.ensure_rate_limit(tg_id=tg_id, ip=str(peer.get("client_ip") or ""))
+                except Exception:
+                    pass
+                conf_text = vpn_svc.build_wg_conf(
+                    peer,
+                    user_label=str(tg_id),
+                    server_public_key=vpn_svc.server_pub,
+                    endpoint=vpn_svc.endpoint,
+                    dns=vpn_svc.dns,
+                )
+                filename = f"admin-{tg_id}-extra-{int(peer.get('peer_id') or 0)}.conf"
+                await message.answer_document(
+                    document=BufferedInputFile(conf_text.encode("utf-8"), filename=filename),
+                    caption="WireGuard конфиг (доп. устройство).",
+                )
+                created += 1
+            except Exception:
+                pass
+
+        await session.commit()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Создано конфигов: <b>{created}</b> из <b>{n}</b>.",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
 
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
