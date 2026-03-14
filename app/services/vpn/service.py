@@ -88,6 +88,81 @@ class VPNService:
         host = (tg_id % 65000) + 2
         return str(VPN_NET.network_address + host)
 
+    async def _alloc_ip_unique(self, session: AsyncSession, *, tg_id: int) -> str:
+        """Allocate a unique client IP inside VPN_NET.
+
+        Base IP stays stable for the first peer (same as _alloc_ip). For
+        additional peers (admin-only feature), we probe for a free IP derived
+        from tg_id and an incrementing offset, ensuring global uniqueness.
+        """
+
+        base = ipaddress.ip_address(self._alloc_ip(tg_id))
+
+        # Fast path: if base IP isn't used, keep it.
+        exists = await session.execute(select(VpnPeer.id).where(VpnPeer.client_ip == str(base)).limit(1))
+        if exists.scalar_one_or_none() is None:
+            return str(base)
+
+        # Probe deterministic offsets until we find a free IP.
+        # We intentionally avoid the first few addresses and stay within the /16.
+        for off in range(1, 5000):
+            cand_int = int(base) + off
+            cand = ipaddress.ip_address(cand_int)
+            if cand not in VPN_NET:
+                break
+            exists = await session.execute(select(VpnPeer.id).where(VpnPeer.client_ip == str(cand)).limit(1))
+            if exists.scalar_one_or_none() is None:
+                return str(cand)
+
+        # Last resort: scan forward from network base.
+        start = int(VPN_NET.network_address) + 100
+        end = int(VPN_NET.broadcast_address) - 1
+        for cand_int in range(start, min(end, start + 20000)):
+            cand = ipaddress.ip_address(cand_int)
+            exists = await session.execute(select(VpnPeer.id).where(VpnPeer.client_ip == str(cand)).limit(1))
+            if exists.scalar_one_or_none() is None:
+                return str(cand)
+
+        raise RuntimeError("No free VPN client IPs available")
+
+    async def create_extra_peer(self, session: AsyncSession, tg_id: int) -> Dict[str, Any]:
+        """Create an additional active peer for the same tg_id.
+
+        Intended for admin-only usage (multiple devices for the same admin).
+        Does not deactivate existing peers.
+        """
+        try:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
+        except Exception:
+            pass
+
+        client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
+        client_priv, client_pub = gen_keys()
+
+        log.info("vpn_create_extra_peer tg_id=%s ip=%s", tg_id, client_ip)
+        await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+
+        row = VpnPeer(
+            tg_id=tg_id,
+            client_public_key=client_pub,
+            client_private_key_enc=crypto.encrypt(client_priv),
+            client_ip=client_ip,
+            server_code=None,
+            is_active=True,
+            revoked_at=None,
+            rotation_reason=None,
+        )
+        session.add(row)
+        await session.flush()
+        return {
+            "peer_id": row.id,
+            "tg_id": tg_id,
+            "client_ip": client_ip,
+            "public_key": client_pub,
+            "client_private_key_enc": row.client_private_key_enc,
+            "client_private_key_plain": client_priv,
+        }
+
     async def _get_active_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
         q = (
             select(VpnPeer)
