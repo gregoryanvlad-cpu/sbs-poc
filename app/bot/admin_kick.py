@@ -224,7 +224,35 @@ async def admin_kick_report(cb: CallbackQuery) -> None:
                 f"• <code>{sub.tg_id}</code> — до <code>{_fmt_dt_short(sub.end_at)}</code> ({when}) — семья: <code>{fam}</code>"
             )
 
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
+    text = "\n".join(lines)
+
+    # Telegram message limit is 4096 chars. If report is too long, show a short
+    # summary and attach the full report as a file.
+    try:
+        if len(text) <= 3900:
+            await cb.message.edit_text(text, reply_markup=kb_admin_menu(), parse_mode="HTML")
+        else:
+            from aiogram.types import BufferedInputFile
+            import datetime as _dt
+
+            summary = (
+                "🚨 Отчёт сформирован, но он слишком большой для одного сообщения. "
+                "Прикрепил файл с полным списком.\n\n"
+                + "\n".join(lines[:60])
+            )
+            summary = summary[:3900]
+            await cb.message.edit_text(summary, reply_markup=kb_admin_menu(), parse_mode="HTML")
+
+            filename = f"kick-report-{_dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%d-%H%M%S')}.txt"
+            await cb.message.answer_document(
+                document=BufferedInputFile(text.encode("utf-8"), filename=filename),
+                caption="Полный список для исключения",
+            )
+    except Exception:
+        try:
+            await cb.message.answer(text[:3900], reply_markup=kb_admin_menu(), parse_mode="HTML")
+        except Exception:
+            pass
     await cb.answer()
 
 
