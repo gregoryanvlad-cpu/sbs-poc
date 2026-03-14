@@ -657,8 +657,28 @@ async def _job_prune_regionvpn_clients() -> None:
     but eventually frees up the server state.
     """
 
-    # Backwards compatible safety: older configs may not have the flag.
-    if not getattr(settings, "regionvpn_enabled", True):
+    # Backwards compatible safety:
+    # - In some deployments RegionVPN isn't configured at all.
+    # - Older Settings may expose region_* fields instead of regionvpn_*.
+    # This job must NEVER crash the scheduler loop.
+    if not getattr(settings, "regionvpn_enabled", False):
+        return
+
+    # If required RegionVPN settings are missing, skip silently.
+    required = [
+        "regionvpn_ssh_host",
+        "regionvpn_ssh_user",
+        "regionvpn_ssh_key_path",
+        "regionvpn_xray_config_path",
+        "regionvpn_xray_restart_command",
+        "regionvpn_vless_tag",
+        "regionvpn_vless_port",
+        "regionvpn_vless_sni",
+        "regionvpn_vless_pbk",
+        "regionvpn_vless_sid",
+        "regionvpn_vless_flow",
+    ]
+    if any(not hasattr(settings, k) for k in required):
         return
 
     cutoff = _utcnow() - timedelta(days=1)
