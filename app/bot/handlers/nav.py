@@ -1344,7 +1344,40 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
 
                 status = (st.status or "").upper()
                 if status in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
-                    # Reuse the same logic as manual check
+                    # Family group payment (seats) vs normal subscription
+                    if (pay.provider or "").startswith("platega_family_"):
+                        try:
+                            seats = int((pay.provider or "").split("_")[-1])
+                        except Exception:
+                            seats = int(await get_app_setting_int(session, f"family_seats_pending:{tg_id}", default=0))
+                        seats = max(0, min(FAMILY_MAX_SEATS, seats))
+                        from app.db.models import FamilyVpnGroup
+                        grp = await _get_or_create_family_group(session, tg_id)
+                        now = utcnow()
+                        base = grp.active_until if grp.active_until and grp.active_until > now else now
+                        grp.active_until = base + relativedelta(months=1)
+                        grp.seats_total = seats
+                        await _ensure_family_profiles(session, tg_id, seats)
+                        pay.status = "success"
+                        await session.commit()
+                        try:
+                            await bot.send_message(
+                                tg_id,
+                                "✅ <b>Оплата семейной группы подтверждена!</b>\n\n"
+                                "Запомнить и присылать счёт ежемесячно для оплаты семейной группы?",
+                                parse_mode="HTML",
+                                reply_markup=InlineKeyboardMarkup(
+                                    inline_keyboard=[
+                                        [InlineKeyboardButton(text="✅ Да", callback_data="family:bill:yes")],
+                                        [InlineKeyboardButton(text="❌ Нет", callback_data="family:bill:no")],
+                                    ]
+                                ),
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    # Reuse the same logic as manual check for normal subscription
                     sub = await get_subscription(session, tg_id)
                     now = utcnow()
                     base = sub.end_at if sub.end_at and sub.end_at > now else now
@@ -1592,6 +1625,37 @@ async def on_pay_check(cb: CallbackQuery) -> None:
         # The status API page doesn't enumerate all terminal statuses,
         # so we treat CONFIRMED as success too.
         if status in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
+            # Family group payment (seats)
+            if (pay.provider or "").startswith("platega_family_"):
+                try:
+                    seats = int((pay.provider or "").split("_")[-1])
+                except Exception:
+                    seats = int(await get_app_setting_int(session, f"family_seats_pending:{cb.from_user.id}", default=0))
+                seats = max(0, min(FAMILY_MAX_SEATS, seats))
+
+                grp = await _get_or_create_family_group(session, cb.from_user.id)
+                now = utcnow()
+                base = grp.active_until if grp.active_until and grp.active_until > now else now
+                grp.active_until = base + relativedelta(months=1)
+                grp.seats_total = seats
+                await _ensure_family_profiles(session, cb.from_user.id, seats)
+                pay.status = "success"
+                await session.commit()
+
+                await cb.answer("Оплата подтверждена")
+                await cb.message.edit_text(
+                    "✅ <b>Оплата семейной группы подтверждена!</b>\n\n"
+                    "Запомнить и присылать счёт ежемесячно для оплаты семейной группы?",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="✅ Да", callback_data="family:bill:yes")],
+                            [InlineKeyboardButton(text="❌ Нет", callback_data="family:bill:no")],
+                        ]
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+
             # extend subscription and mark payment
             sub = await get_subscription(session, cb.from_user.id)
             now = utcnow()
@@ -2514,6 +2578,448 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
             return
 
     await on_vpn_location_menu(cb)
+
+
+# -------------------- VPN Family Group --------------------
+
+FAMILY_MAX_SEATS = 10
+FAMILY_SEAT_PRICE_DEFAULT = 100
+
+
+async def _get_family_seat_price(session, owner_tg_id: int) -> int:
+    # per-user override first, then global, then default
+    v = await get_app_setting_int(session, f"family_seat_price_override:{owner_tg_id}", default=0)
+    if v and v > 0:
+        return int(v)
+    v = await get_app_setting_int(session, "family_seat_price_default", default=FAMILY_SEAT_PRICE_DEFAULT)
+    return int(v) if v and v > 0 else FAMILY_SEAT_PRICE_DEFAULT
+
+
+def _family_kb_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:vpn")]])
+
+
+async def _get_or_create_family_group(session, owner_tg_id: int):
+    from app.db.models import FamilyVpnGroup
+
+    grp = await session.scalar(select(FamilyVpnGroup).where(FamilyVpnGroup.owner_tg_id == owner_tg_id).limit(1))
+    if grp:
+        return grp
+    grp = FamilyVpnGroup(owner_tg_id=owner_tg_id, seats_total=0, active_until=None, billing_opt_in=False)
+    session.add(grp)
+    await session.flush()
+    return grp
+
+
+async def _ensure_family_profiles(session, owner_tg_id: int, seats_total: int) -> None:
+    from app.db.models import FamilyVpnProfile
+
+    if seats_total <= 0:
+        return
+    rows = list(
+        (await session.execute(
+            select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == owner_tg_id)
+        )).scalars().all()
+    )
+    existing = {int(r.slot_no) for r in rows}
+    for i in range(1, seats_total + 1):
+        if i in existing:
+            continue
+        session.add(FamilyVpnProfile(owner_tg_id=owner_tg_id, slot_no=i, label=None, vpn_peer_id=None, is_paused=False))
+    await session.flush()
+
+
+def _family_manage_kb(*, can_manage: bool, has_seats: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_manage:
+        rows.append([InlineKeyboardButton(text="➕ Увеличить места", callback_data="family:seats")])
+        if has_seats:
+            rows.append([InlineKeyboardButton(text="📤 Поделиться VPN", callback_data="family:share")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:vpn")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data == "vpn:family")
+async def on_vpn_family(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    now = utcnow()
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        owner_active = _is_sub_active(sub.end_at)
+
+        grp = await _get_or_create_family_group(session, tg_id)
+        price = await _get_family_seat_price(session, tg_id)
+
+        # Ensure placeholder profiles for listing
+        await _ensure_family_profiles(session, tg_id, int(grp.seats_total or 0))
+        await session.commit()
+
+        profiles = list(
+            (await session.execute(
+                select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == tg_id).order_by(FamilyVpnProfile.slot_no.asc())
+            )).scalars().all()
+        )
+
+        # group active status (separate from owner's subscription)
+        group_active = bool(grp.active_until and grp.active_until > now)
+
+        header = "👨‍👩‍👧‍👦 <b>Семейная группа VPN</b>\n\n"
+        desc = (
+            "Здесь вы можете добавить участников семьи/друзей/коллег: "
+            f"<b>{price} ₽</b> за человека в месяц.\n"
+            f"Максимум мест: <b>{FAMILY_MAX_SEATS}</b>.\n\n"
+        )
+
+        if grp.seats_total <= 0:
+            body = "Вы пока никого не пригласили в семейную группу VPN.\n\n"
+        else:
+            body_lines = [f"Куплено мест: <b>{grp.seats_total}</b>"]
+            if grp.active_until:
+                body_lines.append(f"Оплачено до: <b>{fmt_dt(grp.active_until)}</b>")
+            body_lines.append(f"Статус группы: {'✅ активна' if group_active else '⛔️ не активна'}")
+            body_lines.append("")
+            body_lines.append("Профили:")
+            for p in profiles[: int(grp.seats_total)]:
+                name = p.label or f"Устройство {p.slot_no}"
+                state = "⏸ пауза" if p.is_paused else ("✅ создан" if p.vpn_peer_id else "➕ не создан")
+                body_lines.append(f"• <b>{html_escape(name)}</b> — {state}")
+            body = "\n".join(body_lines) + "\n\n"
+
+        note = ""
+        if not owner_active:
+            note = (
+                "⚠️ <b>Ваша подписка не активна.</b>\n"
+                "Просматривать группу можно, но создать/оплатить/сбросить/делиться VPN нельзя, пока вы не продлите свою подписку.\n\n"
+            )
+
+        kb = _family_manage_kb(can_manage=owner_active, has_seats=bool(grp.seats_total))
+        await cb.message.edit_text(header + desc + note + body, reply_markup=kb, parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+def _family_seats_kb(current: int, target: int) -> InlineKeyboardMarkup:
+    # current seats already purchased, target is desired
+    rows: list[list[InlineKeyboardButton]] = []
+    minus = InlineKeyboardButton(text="➖", callback_data="family:seats:dec")
+    plus = InlineKeyboardButton(text="➕", callback_data="family:seats:inc")
+    rows.append([minus, InlineKeyboardButton(text=f"{target}", callback_data="noop"), plus])
+    rows.append([InlineKeyboardButton(text="💳 Оплатить", callback_data=f"family:pay:{target}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:family")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data == "family:seats")
+async def on_family_seats(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
+            return
+        grp = await _get_or_create_family_group(session, tg_id)
+        target = int(grp.seats_total or 0)
+        await set_app_setting_int(session, f"family_seats_target:{tg_id}", target)
+        price = await _get_family_seat_price(session, tg_id)
+        await session.commit()
+
+    text = (
+        "👨‍👩‍👧‍👦 <b>Семейная группа VPN</b>\n\n"
+        f"Выберите количество мест (максимум {FAMILY_MAX_SEATS}).\n"
+        f"Цена: <b>{price} ₽</b> за место в месяц.\n\n"
+        f"Текущее значение: <b>{target}</b>"
+    )
+    await cb.message.edit_text(text, reply_markup=_family_seats_kb(current=target, target=target), parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data in ("family:seats:inc", "family:seats:dec"))
+async def on_family_seats_adjust(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    async with session_scope() as session:
+        target = int(await get_app_setting_int(session, f"family_seats_target:{tg_id}", default=0))
+        if cb.data.endswith(":inc"):
+            target = min(FAMILY_MAX_SEATS, target + 1)
+        else:
+            target = max(0, target - 1)
+        await set_app_setting_int(session, f"family_seats_target:{tg_id}", target)
+        grp = await _get_or_create_family_group(session, tg_id)
+        current = int(grp.seats_total or 0)
+        price = await _get_family_seat_price(session, tg_id)
+        await session.commit()
+
+    text = (
+        "👨‍👩‍👧‍👦 <b>Семейная группа VPN</b>\n\n"
+        f"Цена: <b>{price} ₽</b> за место в месяц.\n"
+        f"Максимум: <b>{FAMILY_MAX_SEATS}</b>\n\n"
+        f"Сейчас куплено: <b>{current}</b>\n"
+        f"Выбрано: <b>{target}</b>\n"
+        f"Итого к оплате за месяц: <b>{target * price} ₽</b>"
+    )
+    await cb.message.edit_text(text, reply_markup=_family_seats_kb(current=current, target=target), parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+async def _start_platega_family_payment(cb: CallbackQuery, *, tg_id: int, seats: int, amount_rub: int) -> None:
+    """Create a Platega transaction for family group seats."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from app.services.payments.platega import PlategaClient, PlategaError
+    from app.db.models import Payment
+
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        await cb.answer("Платежи временно недоступны")
+        return
+
+    client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
+    payload = f"tg_id={tg_id};family_seats={seats};period=1m"
+    description = f"Семейная группа VPN: {seats} мест (TG {tg_id})"
+    try:
+        res = await client.create_transaction(
+            payment_method=settings.platega_payment_method,
+            amount=int(amount_rub),
+            currency="RUB",
+            description=description,
+            return_url=settings.platega_return_url,
+            failed_url=settings.platega_failed_url,
+            payload=payload,
+        )
+    except PlategaError:
+        await cb.answer("Ошибка платежного провайдера")
+        return
+
+    async with session_scope() as session:
+        p = Payment(
+            tg_id=tg_id,
+            amount=int(amount_rub),
+            currency="RUB",
+            provider=f"platega_family_{int(seats)}",
+            status="pending",
+            period_days=30,
+            period_months=1,
+            provider_payment_id=res.transaction_id,
+        )
+        session.add(p)
+        await session.commit()
+        payment_db_id = p.id
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Перейти к оплате", url=res.redirect_url)],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pay:check:{payment_db_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:family")],
+        ]
+    )
+
+    await cb.message.edit_text(
+        "💳 <b>Оплата семейной группы VPN</b>\n\n"
+        f"Мест: <b>{seats}</b>\n"
+        f"Сумма за 1 месяц: <b>{int(amount_rub)} ₽</b>\n\n"
+        "1) Нажмите «✅ Перейти к оплате»\n"
+        "2) После оплаты нажмите «🔄 Проверить оплату»",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("family:pay:"))
+async def on_family_pay(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        await _safe_cb_answer(cb)
+        return
+    try:
+        seats = int(parts[2])
+    except Exception:
+        seats = 0
+    seats = max(0, min(FAMILY_MAX_SEATS, seats))
+    if seats <= 0:
+        await cb.answer("Выберите количество мест", show_alert=True)
+        return
+
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
+            return
+        price = await _get_family_seat_price(session, tg_id)
+        amount = seats * price
+        # store desired seats for confirmation on pay success
+        await set_app_setting_int(session, f"family_seats_pending:{tg_id}", seats)
+        await session.commit()
+
+    if settings.payment_provider == "platega":
+        await _start_platega_family_payment(cb, tg_id=tg_id, seats=seats, amount_rub=amount)
+        return
+
+    # mock provider
+    async with session_scope() as session:
+        from app.db.models import FamilyVpnGroup
+        grp = await _get_or_create_family_group(session, tg_id)
+        now = utcnow()
+        base = grp.active_until if grp.active_until and grp.active_until > now else now
+        grp.active_until = base + relativedelta(months=1)
+        grp.seats_total = seats
+        await _ensure_family_profiles(session, tg_id, seats)
+        await session.commit()
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да", callback_data="family:bill:yes")],
+            [InlineKeyboardButton(text="❌ Нет", callback_data="family:bill:no")],
+        ]
+    )
+    await cb.message.edit_text(
+        "✅ <b>Оплата семейной группы прошла успешно!</b>\n\n"
+        "Запомнить и присылать счёт ежемесячно для оплаты семейной группы?",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data in ("family:bill:yes", "family:bill:no"))
+async def on_family_billing_opt(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    opt = cb.data.endswith(":yes")
+    async with session_scope() as session:
+        grp = await _get_or_create_family_group(session, tg_id)
+        grp.billing_opt_in = bool(opt)
+        await session.commit()
+    await cb.answer("Сохранено")
+    await on_vpn_family(cb)
+
+
+def _family_share_kb(seats_total: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(1, seats_total + 1):
+        rows.append([InlineKeyboardButton(text=f"Поделиться профилем {i}", callback_data=f"family:share:{i}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:family")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data == "family:share")
+async def on_family_share_menu(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    now = utcnow()
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        grp = await _get_or_create_family_group(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
+            return
+        if not (grp.active_until and grp.active_until > now):
+            await cb.answer("Семейная группа не активна. Оплатите продление.", show_alert=True)
+            return
+        seats_total = int(grp.seats_total or 0)
+        if seats_total <= 0:
+            await cb.answer("Сначала купите места", show_alert=True)
+            return
+    await cb.message.edit_text(
+        "📤 <b>Поделиться VPN</b>\n\nВыберите профиль (конфиг), который хотите отправить.\n"
+        "Бот выдаст файл — вы просто перешлёте его человеку.",
+        reply_markup=_family_share_kb(seats_total),
+        parse_mode="HTML",
+    )
+    await _safe_cb_answer(cb)
+
+
+def _family_forward_instructions_text() -> str:
+    return (
+        "📌 <b>Инструкции для подключения</b>\n"
+        "Android: установите WireGuard из Google Play и импортируйте .conf\n"
+        "Windows: WireGuard для Windows, импорт .conf\n"
+        "macOS: WireGuard из App Store, импорт .conf\n"
+        "Linux: wg-quick up wg0\n\n"
+        "iPhone/iPad: инструкции в боте в разделе VPN → Инструкция → iPhone/iPad."
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("family:share:"))
+async def on_family_share_slot(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        await _safe_cb_answer(cb)
+        return
+    try:
+        slot_no = int(parts[2])
+    except Exception:
+        slot_no = 0
+    if slot_no <= 0:
+        await _safe_cb_answer(cb)
+        return
+
+    now = utcnow()
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
+            return
+        grp = await _get_or_create_family_group(session, tg_id)
+        if not (grp.active_until and grp.active_until > now):
+            await cb.answer("Семейная группа не активна. Оплатите продление.", show_alert=True)
+            return
+        if slot_no > int(grp.seats_total or 0):
+            await cb.answer("Такого профиля нет", show_alert=True)
+            return
+
+        from app.db.models import FamilyVpnProfile, VpnPeer
+        prof = await session.scalar(
+            select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == tg_id, FamilyVpnProfile.slot_no == slot_no).limit(1)
+        )
+        if not prof:
+            await cb.answer("Профиль не найден", show_alert=True)
+            return
+
+        peer_dict = None
+        if prof.vpn_peer_id:
+            # load existing peer (can be inactive if paused/expired)
+            row = await session.scalar(select(VpnPeer).where(VpnPeer.id == prof.vpn_peer_id).limit(1))
+            if row and row.is_active and not prof.is_paused:
+                peer_dict = vpn_service._row_to_peer_dict(row)  # type: ignore
+            elif row and not prof.is_paused:
+                # best-effort re-enable if it was disabled (family group active)
+                try:
+                    await vpn_service.provider.add_peer(row.client_public_key, row.client_ip, tg_id=tg_id)
+                    row.is_active = True
+                    row.revoked_at = None
+                    peer_dict = vpn_service._row_to_peer_dict(row)  # type: ignore
+                except Exception:
+                    peer_dict = None
+
+        if not peer_dict and not prof.is_paused:
+            # Create a new extra peer (same tg_id, unique IP)
+            peer_dict = await vpn_service.create_extra_peer(session, tg_id=tg_id)
+            # mark as family slot
+            try:
+                row = await session.get(VpnPeer, int(peer_dict.get("peer_id")))
+                if row:
+                    row.rotation_reason = f"family_slot_{slot_no}"
+            except Exception:
+                pass
+            prof.vpn_peer_id = int(peer_dict.get("peer_id"))
+
+        if prof.is_paused:
+            await cb.answer("Профиль на паузе. Сначала включите его.", show_alert=True)
+            return
+
+        await session.commit()
+
+    # Build and send config (no QR)
+    conf_text = vpn_service.build_wg_conf(peer_dict, user_label=f"family:{tg_id}:{slot_no}")
+    conf_file = BufferedInputFile(conf_text.encode(), filename=f"familyVPN_{slot_no}.conf")
+    await cb.message.answer_document(
+        conf_file,
+        caption=(
+            f"WireGuard конфиг для семейной группы (профиль {slot_no}).\n"
+            "Перешлите этот файл человеку, которому нужен VPN." 
+        ),
+    )
+    await cb.message.answer(_family_forward_instructions_text(), parse_mode="HTML")
+    await cb.message.answer("⬅️ Назад", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад к семейной группе", callback_data="vpn:family")]]))
+    await _safe_cb_answer(cb)
+
+
 
 
 # --- FAQ: About / Offer ---
