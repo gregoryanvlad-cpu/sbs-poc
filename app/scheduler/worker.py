@@ -12,7 +12,7 @@ from sqlalchemy import select, text, func, delete
 from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
-from app.db.models import Payment, Subscription, VpnPeer
+from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, FamilyVpnProfile
 from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
 from app.repo import list_expired_subscriptions, set_subscription_expired, get_app_setting_int, set_app_setting_int
@@ -247,6 +247,8 @@ async def run_scheduler() -> None:
                     await _job_subscription_end_at_notifications(bot)
                     await _job_trial_expiring_notifications(bot)
                     await _job_trial_reengagement_notifications(bot)
+                    await _job_family_group_expiring_notifications(bot)
+                    await _job_expire_family_groups()
                     await _job_winback_discount_campaign(bot)
                     # Make pending referral earnings available when hold expires.
                     try:
@@ -262,6 +264,116 @@ async def run_scheduler() -> None:
             log.exception("scheduler_loop_error")
 
         await asyncio.sleep(SLEEP_SECONDS)
+
+
+async def _job_family_group_expiring_notifications(bot: Bot) -> None:
+    """Warn owners 3/2/1 days before family group (VPN seats) expires."""
+    now = _utcnow()
+    now_local = now.astimezone(AMSTERDAM_TZ)
+    if now_local.hour < 19:
+        return
+
+    async with session_scope() as session:
+        q = (
+            select(FamilyVpnGroup)
+            .where(FamilyVpnGroup.seats_total > 0)
+            .where(FamilyVpnGroup.active_until.is_not(None))
+            .where(FamilyVpnGroup.active_until > now)
+            .limit(2000)
+        )
+        groups = list((await session.execute(q)).scalars().all())
+        if not groups:
+            return
+
+        changed = False
+
+        for g in groups:
+            owner = int(g.owner_tg_id)
+            # Only meaningful if owner has an active subscription (otherwise they can't manage).
+            sub = await session.scalar(select(Subscription).where(Subscription.tg_id == owner).limit(1))
+            if not sub or not sub.end_at or _ensure_tz(sub.end_at) <= now:
+                continue
+
+            end_at = _ensure_tz(g.active_until)
+            days_left = _days_until(end_at, now)
+            if days_left not in (3, 2, 1):
+                continue
+
+            sent_key = f"family_warn_{days_left}d_sent:{owner}:{end_at.date().isoformat()}"
+            if bool(await get_app_setting_int(session, sent_key, default=0)):
+                continue
+
+            try:
+                await bot.send_message(
+                    owner,
+                    (
+                        f"⏳ Через <b>{days_left}</b> дн. закончится семейная группа VPN.\n\n"
+                        "Если не продлить — профили семейной группы перестанут работать."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="💳 Оплатить", callback_data="family:seats")],
+                            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                        ]
+                    ),
+                )
+                await set_app_setting_int(session, sent_key, 1)
+                changed = True
+            except Exception:
+                # even if blocked, we still mark as attempted to avoid spam loops
+                await set_app_setting_int(session, sent_key, 1)
+                changed = True
+
+        if changed:
+            await session.commit()
+
+
+async def _job_expire_family_groups() -> None:
+    """Disable family VPN peers when family group coverage ends."""
+    now = _utcnow()
+    async with session_scope() as session:
+        q = (
+            select(FamilyVpnGroup)
+            .where(FamilyVpnGroup.seats_total > 0)
+            .where(FamilyVpnGroup.active_until.is_not(None))
+            .where(FamilyVpnGroup.active_until <= now)
+            .limit(500)
+        )
+        groups = list((await session.execute(q)).scalars().all())
+        if not groups:
+            return
+
+        try:
+            from app.services.vpn.service import vpn_service
+        except Exception:
+            vpn_service = None
+
+        for g in groups:
+            owner = int(g.owner_tg_id)
+            # find all family profiles with peers
+            profs = list(
+                (await session.execute(
+                    select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == owner, FamilyVpnProfile.vpn_peer_id.is_not(None))
+                )).scalars().all()
+            )
+            for p in profs:
+                try:
+                    peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
+                    if not peer or not peer.is_active:
+                        continue
+                    if vpn_service:
+                        try:
+                            await vpn_service.provider.remove_peer(peer.client_public_key)
+                        except Exception:
+                            pass
+                    peer.is_active = False
+                    peer.revoked_at = now
+                    peer.rotation_reason = "family_expired"
+                except Exception:
+                    pass
+
+        await session.commit()
 
 
 def _winback_kb(*, amount_rub: int) -> InlineKeyboardMarkup:
