@@ -328,6 +328,11 @@ class AdminUserSetEndAtFSM(StatesGroup):
     waiting_end_at = State()
 
 
+class AdminFamilyPriceMenuFSM(StatesGroup):
+    waiting_user = State()
+    waiting_price = State()
+
+
 class AdminUserSetFamilyPriceFSM(StatesGroup):
     waiting_price = State()
 
@@ -1022,6 +1027,71 @@ async def admin_user_set_end_at_start(cb: CallbackQuery, state: FSMContext) -> N
         reply_markup=_kb_admin_back(),
         parse_mode="HTML",
     )
+
+
+
+@router.callback_query(lambda c: (c.data or "") == "admin:family_price")
+async def admin_family_price_menu_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    await state.clear()
+    await state.set_state(AdminFamilyPriceMenuFSM.waiting_user)
+    await cb.message.edit_text(
+        "💰 <b>Цена места семьи</b>\n\n"
+        "Отправьте <b>TG ID</b> пользователя (например <code>123456789</code>).\n"
+        "(Username можно только если он уже писал боту.)",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminFamilyPriceMenuFSM.waiting_user)
+async def admin_family_price_menu_user(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    try:
+        tg_id = int(raw)
+    except Exception:
+        await message.answer("Пришлите TG ID числом, например 123456789")
+        return
+
+    await state.update_data(tg_id=int(tg_id))
+    await state.set_state(AdminFamilyPriceMenuFSM.waiting_price)
+    await message.answer(
+        "Отправьте цену в рублях (например <code>100</code>).\n"
+        "Чтобы сбросить к общей цене — отправьте <code>0</code>.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminFamilyPriceMenuFSM.waiting_price)
+async def admin_family_price_menu_price(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    tg_id = int(data.get("tg_id") or 0)
+    raw = (message.text or "").strip()
+    try:
+        price = int(raw)
+    except Exception:
+        await message.answer("Введите число, например 100")
+        return
+
+    price = max(0, min(10_000, price))
+
+    async with session_scope() as session:
+        if price == 0:
+            await set_app_setting_int(session, f"family_seat_price_override:{tg_id}", 0)
+        else:
+            await set_app_setting_int(session, f"family_seat_price_override:{tg_id}", price)
+        await session.commit()
+        card = await _render_user_card(session, message.bot, tg_id)
+
+    await state.clear()
+    await message.answer(card, parse_mode="HTML", reply_markup=_kb_admin_user_card_actions(tg_id))
 
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:set_family_price:"))
