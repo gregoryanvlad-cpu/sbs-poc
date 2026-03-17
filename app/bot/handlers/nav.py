@@ -2644,6 +2644,10 @@ async def on_vpn_family(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
     now = utcnow()
     async with session_scope() as session:
+        # Local import here because this handler is loaded early at startup.
+        # Without an explicit import, FamilyVpnProfile would be undefined.
+        from app.db.models import FamilyVpnProfile
+
         sub = await get_subscription(session, tg_id)
         owner_active = _is_sub_active(sub.end_at)
 
