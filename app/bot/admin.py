@@ -328,6 +328,10 @@ class AdminUserSetEndAtFSM(StatesGroup):
     waiting_end_at = State()
 
 
+class AdminUserSetFamilyPriceFSM(StatesGroup):
+    waiting_price = State()
+
+
 class AdminVpnExtraFSM(StatesGroup):
     waiting_count = State()
 
@@ -512,6 +516,7 @@ def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:user:card:{tg_id}")],
             [InlineKeyboardButton(text="📨 Напомнить об оплате", callback_data=f"admin:user:notify_expired:{tg_id}")],
             [InlineKeyboardButton(text="🗓 Изменить дату окончания", callback_data=f"admin:user:set_end_at:{tg_id}")],
+            [InlineKeyboardButton(text="💰 Цена места семьи", callback_data=f"admin:user:set_family_price:{tg_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
@@ -673,6 +678,37 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
         if last_ts > 0:
             last_seen = _fmt_dt_short(datetime.fromtimestamp(last_ts, tz=timezone.utc))
         lines.append(f"Действия: <b>{total_actions}</b> (сообщ.: {msg_in}, клики: {clicks_in}) | Последняя активность: <b>{last_seen}</b>")
+    except Exception:
+        pass
+
+    # Family VPN group (best-effort)
+    try:
+        from app.db.models import FamilyVpnGroup, FamilyVpnProfile
+
+        grp = await session.scalar(select(FamilyVpnGroup).where(FamilyVpnGroup.owner_tg_id == tg_id).limit(1))
+        if grp and int(grp.seats_total or 0) > 0:
+            active_until = grp.active_until if grp.active_until and grp.active_until.tzinfo else (
+                grp.active_until.replace(tzinfo=timezone.utc) if grp.active_until else None
+            )
+            # active profiles count
+            prof_cnt = await session.scalar(
+                select(func.count(FamilyVpnProfile.id)).where(
+                    FamilyVpnProfile.owner_tg_id == tg_id, FamilyVpnProfile.vpn_peer_id.is_not(None)
+                )
+            )
+            lines.append(
+                f"Семейная группа VPN: мест <b>{int(grp.seats_total)}</b> | профилей создано: <b>{int(prof_cnt or 0)}</b> | до: <b>{_fmt_dt_short(active_until)}</b>"
+            )
+        else:
+            lines.append("Семейная группа VPN: —")
+
+        # show price override
+        ov = int(await get_app_setting_int(session, f"family_seat_price_override:{tg_id}", default=0) or 0)
+        default_price = int(await get_app_setting_int(session, "family_seat_price_default", default=100) or 100)
+        if ov and ov > 0:
+            lines.append(f"Цена места семьи: <b>{ov} ₽</b> (override)")
+        else:
+            lines.append(f"Цена места семьи: <b>{default_price} ₽</b> (общая)")
     except Exception:
         pass
 
@@ -986,6 +1022,56 @@ async def admin_user_set_end_at_start(cb: CallbackQuery, state: FSMContext) -> N
         reply_markup=_kb_admin_back(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:set_family_price:"))
+async def admin_user_set_family_price_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        return
+    await state.clear()
+    await state.set_state(AdminUserSetFamilyPriceFSM.waiting_price)
+    await state.update_data(tg_id=tg_id)
+    await cb.message.edit_text(
+        "💰 <b>Цена места в семейной группе (для этого пользователя)</b>\n\n"
+        "Отправьте число в рублях (например <code>100</code>).\n"
+        "Чтобы сбросить к общей цене — отправьте <code>0</code>.",
+        reply_markup=_kb_admin_back(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminUserSetFamilyPriceFSM.waiting_price)
+async def admin_user_set_family_price_input(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    tg_id = int(data.get("tg_id") or 0)
+    raw = (message.text or "").strip()
+    try:
+        price = int(raw)
+    except Exception:
+        await message.answer("Введите число, например 100")
+        return
+
+    price = max(0, min(10_000, price))
+
+    async with session_scope() as session:
+        if price == 0:
+            await set_app_setting_int(session, f"family_seat_price_override:{tg_id}", 0)
+        else:
+            await set_app_setting_int(session, f"family_seat_price_override:{tg_id}", price)
+        await session.commit()
+        card = await _render_user_card(session, message.bot, tg_id)
+
+    await state.clear()
+    await message.answer("✅ Сохранено.")
+    await message.answer(card, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
 
 
 @router.message(AdminUserSetEndAtFSM.waiting_end_at)
