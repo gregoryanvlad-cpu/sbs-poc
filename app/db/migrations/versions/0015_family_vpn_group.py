@@ -17,13 +17,12 @@ def _has_table(bind, name: str) -> bool:
         return False
 
 
-def _has_index(bind, table: str, index: str) -> bool:
+
+def _has_index(bind, index: str) -> bool:
+    """Check index existence by name in Postgres catalog (robust for partial migrations)."""
     try:
-        insp = sa.inspect(bind)
-        for idx in insp.get_indexes(table):
-            if idx.get("name") == index:
-                return True
-        return False
+        res = bind.execute(sa.text("SELECT 1 FROM pg_class WHERE relkind = 'i' AND relname = :n LIMIT 1"), {"n": index})
+        return res.scalar() is not None
     except Exception:
         return False
 
@@ -59,7 +58,7 @@ def upgrade() -> None:
 
     # owner_tg_id already has index=True above, but older/partial runs may
     # have created it; create only if missing.
-    if not _has_index(bind, "family_vpn_groups", "ix_family_vpn_groups_owner_tg_id"):
+    if not _has_index(bind, "ix_family_vpn_groups_owner_tg_id"):
         op.create_index(
             "ix_family_vpn_groups_owner_tg_id",
             "family_vpn_groups",
@@ -85,7 +84,7 @@ def upgrade() -> None:
             ),
         )
 
-    if not _has_index(bind, "family_vpn_profiles", "ix_family_vpn_profiles_owner_tg_id"):
+    if not _has_index(bind, "ix_family_vpn_profiles_owner_tg_id"):
         op.create_index(
             "ix_family_vpn_profiles_owner_tg_id",
             "family_vpn_profiles",
@@ -93,7 +92,7 @@ def upgrade() -> None:
             unique=False,
         )
 
-    if not _has_index(bind, "family_vpn_profiles", "ux_family_vpn_profiles_owner_slot"):
+    if not _has_index(bind, "ux_family_vpn_profiles_owner_slot"):
         op.create_index(
             "ux_family_vpn_profiles_owner_slot",
             "family_vpn_profiles",
