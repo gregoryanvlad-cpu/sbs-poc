@@ -8,6 +8,8 @@ from .payout_request import PayoutRequest
 from .content_request import ContentRequest
 from .region_vpn_session import RegionVpnSession
 from .message_audit import MessageAudit
+from .family_vpn_group import FamilyVpnGroup
+from .family_vpn_profile import FamilyVpnProfile
 try:
     from .app_setting import AppSetting  # optional
 except Exception:  # pragma: no cover
@@ -25,5 +27,7 @@ __all__ = [
     "AppSetting",
     "RegionVpnSession",
     "MessageAudit",
+    "FamilyVpnGroup",
+    "FamilyVpnProfile",
 ]
 
