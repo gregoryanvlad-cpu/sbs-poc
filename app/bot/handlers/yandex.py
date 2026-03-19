@@ -22,9 +22,9 @@ router = Router()
 async def _home_text_with_vpn() -> str:
     return (
         "🏠 <b>Главное меню</b>\n\n"
-        '🇳🇱 Сервер "Нидерланды": <b>Работает ✅</b>\n'
-        f'📶 "LTE-Обход": <b>{"Работает ✅" if settings.lte_enabled else "Отключён ⛔️"}</b>\n\n'
-        "🔐 Форма шифрования: <b>ChaCha20-Poly1305</b>"
+        '🇳🇱 "VPN-Cервер": <b>Active ✅</b>\n'
+        f'📶 "LTE-Обход-Сервер": <b>{"Active ✅" if settings.lte_enabled else "Отключён ⛔️"}</b>\n\n'
+        '🔐 Шифрование: <a href="https://habr.com/ru/articles/573268/">ChaCha20-Poly1305</a>'
     )
 
 
@@ -189,6 +189,7 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
                 text=await _home_text_with_vpn(),
                 reply_markup=kb_main(),
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except Exception:
             pass
