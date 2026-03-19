@@ -10,6 +10,7 @@ from .region_vpn_session import RegionVpnSession
 from .message_audit import MessageAudit
 from .family_vpn_group import FamilyVpnGroup
 from .family_vpn_profile import FamilyVpnProfile
+from .lte_vpn_client import LteVpnClient
 try:
     from .app_setting import AppSetting  # optional
 except Exception:  # pragma: no cover
@@ -29,5 +30,6 @@ __all__ = [
     "MessageAudit",
     "FamilyVpnGroup",
     "FamilyVpnProfile",
+    "LteVpnClient",
 ]
 
