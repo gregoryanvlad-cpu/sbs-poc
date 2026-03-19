@@ -242,6 +242,7 @@ async def run_scheduler() -> None:
                     await _job_expire_subscriptions(bot)
                     await _job_prune_wg_peers()
                     await _job_prune_regionvpn_clients()
+                    await _job_expire_lte_clients(bot)
                     await _job_poll_lte_connections(bot)
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
@@ -251,6 +252,7 @@ async def run_scheduler() -> None:
                     await _job_trial_expiring_notifications(bot)
                     await _job_trial_reengagement_notifications(bot)
                     await _job_family_group_expiring_notifications(bot)
+                    await _job_lte_expiring_notifications(bot)
                     await _job_expire_family_groups()
                     await _job_winback_discount_campaign(bot)
                     # Make pending referral earnings available when hold expires.
@@ -1060,6 +1062,54 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
 
         if changed:
             await session.commit()
+
+
+async def _job_expire_lte_clients(bot: Bot) -> None:
+    now = _utcnow()
+    async with session_scope() as session:
+        q = (
+            select(LteVpnClient, Subscription)
+            .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+            .where(LteVpnClient.is_enabled.is_(True))
+            .limit(1000)
+        )
+        rows = (await session.execute(q)).all()
+        if not rows:
+            return
+
+        to_disable: list[int] = []
+        for row, sub in rows:
+            main_active = bool(sub and sub.end_at and _ensure_tz(sub.end_at) > now)
+            paid_lte_expired = bool(row.cycle_anchor_end_at and _ensure_tz(row.cycle_anchor_end_at) <= now)
+            if (not main_active) or paid_lte_expired:
+                row.is_enabled = False
+                row.updated_at = now
+                to_disable.append(int(row.tg_id))
+
+        if not to_disable:
+            return
+        await session.commit()
+
+    for tg_id in to_disable:
+        try:
+            await lte_vpn_service.disable_remote_client(tg_id)
+        except Exception:
+            log.exception("lte_disable_remote_failed tg_id=%s", tg_id)
+        try:
+            await audit_send_message(
+                bot,
+                tg_id,
+                "⛔️ Срок действия VPN LTE закончился, поэтому профиль отключён.\n\nЧтобы снова пользоваться LTE-профилем, откройте раздел «📶 VPN LTE» и активируйте его заново.",
+                kind="lte_expired",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="📶 Открыть VPN LTE", callback_data="vpn:lte")],
+                        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                    ]
+                ),
+            )
+        except Exception:
+            pass
 
 
 async def _job_lte_expiring_notifications(bot: Bot) -> None:
