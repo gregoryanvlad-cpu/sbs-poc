@@ -855,7 +855,7 @@ async def _build_home_text() -> str:
     lte_status = "Active ✅" if settings.lte_enabled else "Отключён ⛔️"
     lines.append('📶 "LTE-Обход-Сервер": <b>%s</b>' % lte_status)
     lines.append("")
-    lines.append('🔐 Шифрование: <a href="https://blog.cloudflare.com/it-takes-two-to-chacha-poly/">ChaCha20-Poly1305</a>')
+    lines.append('🔐 Шифрование: <a href="https://habr.com/ru/articles/573268/">ChaCha20-Poly1305</a>')
 
     return "\n".join([
         "🏠 <b>Главное меню</b>",
@@ -926,7 +926,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         try:
             show_trial = await _trial_visible_for_user(cb.from_user.id)
-            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML")
+            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             pass
         return
@@ -936,7 +936,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         await _cleanup_flow_messages_for_user(cb.bot, cb.message.chat.id, cb.from_user.id)
         try:
             show_trial = await _trial_visible_for_user(cb.from_user.id)
-            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML")
+            await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             pass
         return
