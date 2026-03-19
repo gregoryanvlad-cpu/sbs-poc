@@ -26,17 +26,9 @@ async def audit_send_message(
     kind: str,
     reply_markup: InlineKeyboardMarkup | None = None,
     parse_mode: str | None = None,
+    photo: str | None = None,
 ) -> bool:
-    """Send a message and store it to message_audit (best-effort).
-
-    Notes:
-    - We log BOTH successful sends and failed attempts.
-    - Telegram bots can't reliably know if a user *read* a message.
-      We approximate "read" as: the user interacted with the bot after sent_at.
-
-    Returns:
-        True if message was sent, False otherwise.
-    """
+    """Send a text message or photo+caption and store it to message_audit (best-effort)."""
 
     ok = False
     msg = None
@@ -44,7 +36,16 @@ async def audit_send_message(
     err_text = ""
 
     try:
-        msg = await bot.send_message(int(tg_id), text, reply_markup=reply_markup, parse_mode=parse_mode)
+        if photo:
+            msg = await bot.send_photo(
+                int(tg_id),
+                photo=photo,
+                caption=text or None,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+        else:
+            msg = await bot.send_message(int(tg_id), text, reply_markup=reply_markup, parse_mode=parse_mode)
         ok = True
     except TelegramForbiddenError as e:
         ok = False
@@ -64,7 +65,7 @@ async def audit_send_message(
         if len(err_text) > 240:
             err_text = err_text[:239] + "…"
 
-    preview = _preview(text)
+    preview = _preview(("[PHOTO]\n" if photo else "") + (text or ""))
     if not ok:
         preview = f"[SEND_FAILED:{err_tag}] {err_text}\n{preview}".strip()
 
@@ -82,7 +83,6 @@ async def audit_send_message(
             )
             await session.commit()
     except Exception:
-        # Never fail bot flow due to audit logging.
         pass
 
     return ok
