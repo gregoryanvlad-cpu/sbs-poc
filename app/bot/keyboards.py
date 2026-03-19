@@ -175,7 +175,7 @@ def kb_lte_vpn(*, has_access: bool, activation_rub: int) -> InlineKeyboardMarkup
     b = InlineKeyboardBuilder()
     b.button(text="ℹ️ Что это?", callback_data="vpn:lte:about")
     if has_access:
-        b.button(text="📲 Установить в Happ+", callback_data="vpn:lte:install")
+        b.button(text="📋 Скопировать в Happ+", callback_data="vpn:lte:install")
         b.button(text="♻️ Получить новый конфиг", callback_data="vpn:lte:reset")
     else:
         b.button(text=f"💳 Активировать за {int(activation_rub)} ₽", callback_data="vpn:lte:pay")
