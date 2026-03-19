@@ -847,17 +847,16 @@ async def _build_home_text() -> str:
     nl_srv = next((srv for srv in servers if str(srv.get("code") or "").upper() == "NL"), None)
     if nl_srv:
         status = await _fmt_status(nl_srv)
-        works = "Работает ✅" if status not in ("Недоступно", "Подключается...") else status
-        lines.append('🇳🇱 Сервер "Нидерланды": <b>%s</b>' % works)
+        works = "Active ✅" if status not in ("Недоступно", "Подключается...") else status
+        lines.append('🇳🇱 "VPN-Cервер": <b>%s</b>' % works)
     else:
-        lines.append('🇳🇱 Сервер "Нидерланды": <b>Подключается...</b>')
+        lines.append('🇳🇱 "VPN-Cервер": <b>Подключается...</b>')
 
-    lte_status = "Работает ✅" if settings.lte_enabled else "Отключён ⛔️"
-    lines.append('📶 "LTE-Обход": <b>%s</b>' % lte_status)
+    lte_status = "Active ✅" if settings.lte_enabled else "Отключён ⛔️"
+    lines.append('📶 "LTE-Обход-Сервер": <b>%s</b>' % lte_status)
     lines.append("")
-    lines.append("🔐 Форма шифрования: <b>ChaCha20-Poly1305</b>")
+    lines.append('🔐 Шифрование: <a href="https://blog.cloudflare.com/it-takes-two-to-chacha-poly/">ChaCha20-Poly1305</a>')
 
-    # Safe string building (prevents SyntaxError due to unterminated literals)
     return "\n".join([
         "🏠 <b>Главное меню</b>",
         "",
