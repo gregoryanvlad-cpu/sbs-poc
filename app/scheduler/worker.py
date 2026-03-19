@@ -1062,6 +1062,79 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
             await session.commit()
 
 
+async def _job_lte_expiring_notifications(bot: Bot) -> None:
+    now = _utcnow()
+    from app.db.models import LteVpnClient
+
+    async with session_scope() as session:
+        q = (
+            select(LteVpnClient)
+            .where(
+                LteVpnClient.is_enabled.is_(True),
+                LteVpnClient.cycle_anchor_end_at.is_not(None),
+                LteVpnClient.cycle_anchor_end_at > now,
+            )
+            .order_by(LteVpnClient.tg_id.asc())
+            .limit(1000)
+        )
+        rows = (await session.execute(q)).scalars().all()
+        if not rows:
+            return
+
+        changed = False
+        for row in rows:
+            tg_id = int(row.tg_id)
+            end_at = _ensure_tz(row.cycle_anchor_end_at)
+            days_left = _days_until(end_at, now)
+            if days_left not in (7, 3, 1):
+                continue
+
+            sent_key = f"lte_warn_{days_left}d_sent:{tg_id}:{end_at.date().isoformat()}"
+            if bool(await get_app_setting_int(session, sent_key, default=0)):
+                continue
+
+            if days_left == 7:
+                text_msg = (
+                    "⏳ Через 7 дней закончится активация VPN LTE.\n\n"
+                    "Чтобы LTE-профиль продолжал работать без перерыва, продлите его заранее."
+                )
+            elif days_left == 3:
+                text_msg = (
+                    "⚠️ Осталось 3 дня до окончания активации VPN LTE.\n\n"
+                    "Продлите LTE заранее, чтобы профиль не отключился."
+                )
+            else:
+                text_msg = (
+                    "🚨 Завтра закончится активация VPN LTE.\n\n"
+                    "Продлите LTE сейчас, чтобы доступ не отключился."
+                )
+
+            try:
+                await audit_send_message(
+                    bot,
+                    tg_id,
+                    text_msg,
+                    kind=f"lte_warn_{days_left}d",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="💳 Оплатить LTE", callback_data="vpn:lte")],
+                            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+                        ]
+                    ),
+                )
+                await set_app_setting_int(session, sent_key, 1)
+                changed = True
+            except Exception:
+                try:
+                    await set_app_setting_int(session, sent_key, 1)
+                    changed = True
+                except Exception:
+                    pass
+
+        if changed:
+            await session.commit()
+
+
 async def _job_subscription_end_at_notifications(bot: Bot) -> None:
     """Send 7/3/1 day reminders based on Subscription.end_at for VPN users.
 
