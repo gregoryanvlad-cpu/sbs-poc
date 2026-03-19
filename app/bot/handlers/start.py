@@ -64,4 +64,5 @@ async def cmd_start(message: Message) -> None:
         await _build_home_text(),
         reply_markup=kb_main(show_trial=show_trial),
         parse_mode="HTML",
+        disable_web_page_preview=True,
     )
