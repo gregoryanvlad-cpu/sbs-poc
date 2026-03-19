@@ -24,7 +24,7 @@ async def _home_text_with_vpn() -> str:
         "🏠 <b>Главное меню</b>\n\n"
         '🇳🇱 "VPN-Cервер": <b>Active ✅</b>\n'
         f'📶 "LTE-Обход-Сервер": <b>{"Active ✅" if settings.lte_enabled else "Отключён ⛔️"}</b>\n\n'
-        '🔐 Шифрование: <a href="https://habr.com/ru/articles/573268/">ChaCha20-Poly1305</a>'
+        '🔐 Шифрование: <a href="https://en.wikipedia.org/wiki/ChaCha20-Poly1305?ysclid=mmxjfy37uz259328312">ChaCha20-Poly1305</a>'
     )
 
 
