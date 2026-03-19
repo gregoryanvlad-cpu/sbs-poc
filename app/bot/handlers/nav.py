@@ -1771,7 +1771,7 @@ async def on_pay_check(cb: CallbackQuery) -> None:
 
             if (pay.provider or "") == "platega_lte":
                 sub = await get_subscription(session, cb.from_user.id)
-                await lte_vpn_service.get_or_create_client(cb.from_user.id, subscription_end_at=sub.end_at, force_rotate=False)
+                await lte_vpn_service.activate_paid_month(cb.from_user.id)
                 pay.status = "success"
                 await session.commit()
 
@@ -3437,14 +3437,14 @@ def _lte_summary_text(*, has_access: bool, paid: bool, sub_end: datetime | None,
         "",
     ]
     if has_access and sub_end:
-        lines.append(f"✅ LTE активирован для текущего цикла подписки.")
+        lines.append(f"✅ LTE активирован.")
         lines.append(f"Активно до: <b>{fmt_dt(sub_end)}</b>")
         lines.append("")
         lines.append("Ниже вы можете скопировать конфиг для Happ+ или получить новый конфиг.")
     else:
         lines.append("ℹ️ Подробное описание, когда использовать LTE-профиль и какие есть ограничения, откроется по кнопке <b>«Что это?»</b>.")
         lines.append("")
-        lines.append(f"Активация на текущий цикл: <b>{lte_price} ₽</b>.")
+        lines.append(f"Активация на 1 месяц: <b>{lte_price} ₽</b>.")
         if not paid:
             lines.append("Для пользователей на пробном периоде доплата не требуется.")
     return "\n".join(lines)
@@ -3468,12 +3468,12 @@ def _lte_menu_text(*, has_access: bool, sub_end: datetime | None, lte_price: int
         lines.append("")
         lines.append("Нажмите <b>«Что это?»</b>, чтобы прочитать подробную информацию о разделе.")
         lines.append("")
-        lines.append(f"Активация на текущий цикл: <b>{lte_price} ₽</b>.")
+        lines.append(f"Активация на 1 месяц: <b>{lte_price} ₽</b>.")
         if not paid:
             lines.append("Для пользователей на пробном периоде доплата не требуется.")
     return "\n".join(lines)
 def _lte_about_text(*, has_access: bool, sub_end: datetime | None) -> str:
-    active_until_text = f"\n\n✅ LTE уже активирован для текущего цикла подписки.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
+    active_until_text = f"\n\n✅ LTE уже активирован.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
     return LTE_INFO_TEXT + active_until_text
 
 LTE_INFO_TEXT = """📶 <b>VPN LTE</b>
@@ -3511,10 +3511,12 @@ async def _lte_has_access(tg_id: int) -> tuple[bool, datetime | None, bool]:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            return False, sub.end_at, False
+            return False, None, False
         paid = await has_successful_payments(session, tg_id)
     allowed = await lte_vpn_service.has_lte_access(tg_id, subscription_end_at=sub.end_at, has_success_payment=paid)
-    return allowed, sub.end_at, paid
+    lte_row = await lte_vpn_service.get_client(tg_id)
+    lte_end = lte_row.cycle_anchor_end_at if lte_row else (sub.end_at if not paid else None)
+    return allowed, lte_end, paid
 
 
 async def _lte_price_rub() -> int:
@@ -3569,7 +3571,7 @@ async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
         return
     async with session_scope() as session:
         sub = await get_subscription(session, cb.from_user.id)
-        await lte_vpn_service.get_or_create_client(cb.from_user.id, subscription_end_at=sub.end_at, force_rotate=False)
+        await lte_vpn_service.activate_paid_month(cb.from_user.id)
         lte_price = await _lte_price_rub()
         pay = Payment(tg_id=cb.from_user.id, amount=lte_price, currency="RUB", provider="mock_lte", status="success", period_days=0, period_months=0)
         session.add(pay)
