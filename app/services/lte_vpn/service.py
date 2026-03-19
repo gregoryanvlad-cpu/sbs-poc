@@ -11,10 +11,11 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import calendar
 from typing import Optional
 
 import asyncssh
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 
 from app.core.config import settings
 from app.db.models import LteVpnClient, Subscription
@@ -146,6 +147,17 @@ class LteVpnService:
         return str(s).replace("%", "%25").replace(" ", "%20").replace("#", "%23").replace("?", "%3F").replace("&", "%26").replace("/", "%2F")
 
     @staticmethod
+    def _add_one_month(dt: datetime) -> datetime:
+        base = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        year = base.year
+        month = base.month + 1
+        if month > 12:
+            month = 1
+            year += 1
+        day = min(base.day, calendar.monthrange(year, month)[1])
+        return base.replace(year=year, month=month, day=day)
+
+    @staticmethod
     def _parse_timestamp(line: str) -> datetime | None:
         for rx in _TS_PATTERNS:
             m = rx.search(line)
@@ -219,8 +231,30 @@ class LteVpnService:
                 row.last_seen_at = None
             row.email = email
             row.is_enabled = True
-            row.cycle_anchor_end_at = subscription_end_at
+            if row.cycle_anchor_end_at is None and subscription_end_at is not None:
+                row.cycle_anchor_end_at = subscription_end_at
             row.updated_at = datetime.now(timezone.utc)
+            await session.flush()
+            await session.commit()
+            return row
+
+    async def get_client(self, tg_id: int) -> LteVpnClient | None:
+        async with session_scope() as session:
+            return await session.get(LteVpnClient, tg_id)
+
+    async def activate_paid_month(self, tg_id: int) -> LteVpnClient:
+        now = datetime.now(timezone.utc)
+        async with session_scope() as session:
+            row = await session.get(LteVpnClient, tg_id)
+            email = self.email_for_tg_id(tg_id)
+            if row is None:
+                row = LteVpnClient(tg_id=tg_id, uuid=str(uuid.uuid4()), email=email, rate_mbit=settings.lte_rate_mbit)
+                session.add(row)
+            row.email = email
+            row.is_enabled = True
+            anchor = row.cycle_anchor_end_at if row.cycle_anchor_end_at and row.cycle_anchor_end_at > now else now
+            row.cycle_anchor_end_at = self._add_one_month(anchor)
+            row.updated_at = now
             await session.flush()
             await session.commit()
             return row
@@ -230,19 +264,16 @@ class LteVpnService:
             return False
         if not has_success_payment:
             return True
+        now = datetime.now(timezone.utc)
         async with session_scope() as session:
             row = await session.get(LteVpnClient, tg_id)
-            if not row or not row.cycle_anchor_end_at:
+            if not row or not row.cycle_anchor_end_at or not row.is_enabled:
                 return False
             try:
-                current = subscription_end_at.astimezone(timezone.utc)
-            except Exception:
-                current = subscription_end_at
-            try:
-                anchor = row.cycle_anchor_end_at.astimezone(timezone.utc) if row.cycle_anchor_end_at else None
+                anchor = row.cycle_anchor_end_at.astimezone(timezone.utc)
             except Exception:
                 anchor = row.cycle_anchor_end_at
-            return bool(anchor and current and anchor >= current)
+            return bool(anchor and anchor > now)
 
     async def ensure_remote_client(self, tg_id: int, client_uuid: str) -> None:
         email = self.email_for_tg_id(tg_id)
