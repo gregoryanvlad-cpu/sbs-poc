@@ -7,6 +7,7 @@ def kb_main(*, show_trial: bool = False) -> InlineKeyboardMarkup:
     b.button(text="👤 Личный кабинет", callback_data="nav:cabinet")
     b.button(text="🟡 Yandex Plus", callback_data="nav:yandex")
     b.button(text="🌍 VPN", callback_data="nav:vpn")
+    b.button(text="⚡ Антилаг-Telegram", callback_data="nav:tgproxy")
     if show_trial:
         b.button(text="🎁 Пробный период 5 дней", callback_data="trial:start")
     b.button(text="💳 Оплата", callback_data="nav:pay")
