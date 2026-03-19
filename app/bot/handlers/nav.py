@@ -40,16 +40,19 @@ from app.bot.keyboards import (
     kb_vpn_guide_platforms,
     kb_vpn_guide_back,
     kb_kinoteka,
+    kb_lte_vpn,
+    kb_lte_main_menu,
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
-from app.db.models import Payment, User
+from app.db.models import Payment, User, LteVpnClient
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int, get_app_setting_int
+from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int, get_app_setting_int, has_successful_payments
 
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
+from app.services.lte_vpn.service import lte_vpn_service
 
 router = Router()
 
@@ -1377,6 +1380,24 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                             pass
                         return
 
+                    if (pay.provider or "") == "platega_lte":
+                        sub = await get_subscription(session, tg_id)
+                        await lte_vpn_service.get_or_create_client(tg_id, subscription_end_at=sub.end_at, force_rotate=False)
+                        pay.status = "success"
+                        await session.commit()
+                        try:
+                            await bot.send_message(
+                                tg_id,
+                                "✅ <b>VPN LTE активирован!</b>\n\nТеперь можно открыть раздел «📶 VPN LTE» и установить конфиг.",
+                                parse_mode="HTML",
+                                reply_markup=InlineKeyboardMarkup(
+                                    inline_keyboard=[[InlineKeyboardButton(text="📶 Открыть VPN LTE", callback_data="vpn:lte")]]
+                                ),
+                            )
+                        except Exception:
+                            pass
+                        return
+
                     # Reuse the same logic as manual check for normal subscription
                     sub = await get_subscription(session, tg_id)
                     now = utcnow()
@@ -1502,7 +1523,9 @@ async def _start_platega_payment(
     payload = f"tg_id={tg_id};period={pay_months}m"
     if promo_code:
         payload += f";promo={promo_code}"
-    description = f"Подписка SBS: {pay_months} мес (TG {tg_id})"
+    if promo_code == "lte":
+        payload += ";purpose=lte"
+    description = (f"VPN LTE activation (TG {tg_id})" if promo_code == "lte" else f"Подписка SBS: {pay_months} мес (TG {tg_id})")
 
     try:
         res = await client.create_transaction(
@@ -3215,3 +3238,132 @@ async def faq_terms(cb: CallbackQuery) -> None:
     await cb.message.answer("⬅️ Назад в FAQ", reply_markup=kb_back_faq())
     await _safe_cb_answer(cb)
 
+
+
+LTE_INFO_TEXT = (
+    "📶 <b>VPN LTE</b>\n\n"
+    "VPN LTE — это специальный VPN для обхода глушилок.\n"
+    "Работает только по мобильному интернету (LTE/5G/4G/3G).\n"
+    "Не работает по Wi‑Fi.\n\n"
+    "Используй его, когда в городе включены глушилки.\n"
+    "После выхода на Wi‑Fi рекомендуется отключаться."
+)
+
+
+async def _lte_is_main_sub_active(tg_id: int) -> tuple[bool, datetime | None]:
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        return _is_sub_active(sub.end_at), sub.end_at
+
+
+async def _lte_has_access(tg_id: int) -> tuple[bool, datetime | None, bool]:
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            return False, sub.end_at, False
+        paid = await has_successful_payments(session, tg_id)
+    allowed = await lte_vpn_service.has_lte_access(tg_id, subscription_end_at=sub.end_at, has_success_payment=paid)
+    return allowed, sub.end_at, paid
+
+
+@router.callback_query(lambda c: c.data == "vpn:lte")
+async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
+    if not settings.lte_enabled:
+        await cb.answer("Раздел временно отключён", show_alert=True)
+        return
+    has_sub, sub_end = await _lte_is_main_sub_active(cb.from_user.id)
+    if not has_sub:
+        await cb.message.edit_text(
+            "📶 <b>VPN LTE</b>\n\n🚫 Доступен только при активной основной подписке.\nОформи подписку в разделе «💳 Оплата».",
+            reply_markup=kb_back_home(),
+            parse_mode="HTML",
+        )
+        await _safe_cb_answer(cb)
+        return
+    has_access, _, _ = await _lte_has_access(cb.from_user.id)
+    txt = LTE_INFO_TEXT + ("\n\n✅ LTE уже активирован для текущего цикла подписки." if has_access else f"\n\nАктивация на текущий цикл: <b>{settings.lte_activation_rub} ₽</b>.\nДля пользователей на пробном периоде доплата не требуется.")
+    await cb.message.edit_text(txt, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=settings.lte_activation_rub), parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "vpn:lte:about")
+async def on_vpn_lte_about(cb: CallbackQuery) -> None:
+    has_access, _, _ = await _lte_has_access(cb.from_user.id)
+    await cb.message.edit_text(LTE_INFO_TEXT, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=settings.lte_activation_rub), parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "vpn:lte:pay")
+async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
+    has_sub, _ = await _lte_is_main_sub_active(cb.from_user.id)
+    if not has_sub:
+        await cb.answer("Сначала нужна основная подписка", show_alert=True)
+        return
+    async with session_scope() as session:
+        paid = await has_successful_payments(session, cb.from_user.id)
+        if not paid:
+            await cb.answer("Для пробного периода доплата не нужна", show_alert=True)
+            return
+    provider = settings.payment_provider
+    if provider == "platega":
+        await _start_platega_payment(cb, tg_id=cb.from_user.id, amount_override=settings.lte_activation_rub, months_override=0, promo_code="lte")
+        return
+    async with session_scope() as session:
+        sub = await get_subscription(session, cb.from_user.id)
+        await lte_vpn_service.get_or_create_client(cb.from_user.id, subscription_end_at=sub.end_at, force_rotate=False)
+        pay = Payment(tg_id=cb.from_user.id, amount=settings.lte_activation_rub, currency="RUB", provider="mock_lte", status="success", period_days=0, period_months=0)
+        session.add(pay)
+        await session.commit()
+    await cb.answer("LTE активирован")
+    await on_vpn_lte_menu(cb)
+
+
+@router.callback_query(lambda c: c.data == "vpn:lte:install")
+async def on_vpn_lte_install(cb: CallbackQuery) -> None:
+    has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
+    if not has_access:
+        await cb.answer("Сначала активируйте VPN LTE", show_alert=True)
+        return
+    used = await lte_vpn_service.active_clients_count()
+    if used >= settings.lte_max_clients:
+        await cb.message.edit_text(
+            f"📶 <b>VPN LTE</b>\n\nСейчас все места заняты: <b>{used}/{settings.lte_max_clients}</b>. Попробуйте позже.",
+            reply_markup=kb_lte_vpn(has_access=True, activation_rub=settings.lte_activation_rub),
+            parse_mode="HTML",
+        )
+        await _safe_cb_answer(cb)
+        return
+    row = await lte_vpn_service.sync_client(cb.from_user.id, subscription_end_at=sub_end, force_rotate=False)
+    url = lte_vpn_service.build_vless_url(row.uuid, tg_id=cb.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📲 Установить в Happ+", url=url)],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+    ])
+    await cb.message.edit_text(
+        "📶 <b>VPN LTE</b>\n\nНажмите кнопку ниже — конфиг откроется в Happ+ и предложит импорт.\nПосле подключения отключайтесь при переходе на Wi‑Fi.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    # fallback, если access.log не включён
+    if not settings.lte_access_log_poll_enabled:
+        try:
+            await cb.bot.send_message(cb.from_user.id, "Вы подключились к VPN LTE. Не забудьте отключиться, когда выйдете на Wi‑Fi.", reply_markup=kb_lte_main_menu())
+        except Exception:
+            pass
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "vpn:lte:reset")
+async def on_vpn_lte_reset(cb: CallbackQuery) -> None:
+    has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
+    if not has_access:
+        await cb.answer("Сначала активируйте VPN LTE", show_alert=True)
+        return
+    row = await lte_vpn_service.sync_client(cb.from_user.id, subscription_end_at=sub_end, force_rotate=True)
+    url = lte_vpn_service.build_vless_url(row.uuid, tg_id=cb.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📲 Установить новый конфиг в Happ+", url=url)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:lte")],
+    ])
+    await cb.message.edit_text("♻️ <b>Конфиг VPN LTE обновлён.</b>\n\nСтарый UUID отключён, новый конфиг готов к установке.", reply_markup=kb, parse_mode="HTML")
+    await _safe_cb_answer(cb)
