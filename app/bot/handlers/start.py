@@ -1,6 +1,7 @@
 from aiogram import Router
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardRemove, FSInputFile
+from pathlib import Path
 
 from app.bot.keyboards import kb_main
 from app.db.session import session_scope
@@ -58,7 +59,16 @@ async def cmd_start(message: Message) -> None:
         "По вопросам сотрудничества: @sbsmanager_bot"
     )
 
-    await message.answer(text, reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
+    welcome_image = Path(__file__).resolve().parents[2] / "content" / "welcome-start.jpg"
+
+    if welcome_image.exists():
+        await message.answer_photo(
+            FSInputFile(str(welcome_image)),
+            caption=text,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await message.answer(text, reply_markup=ReplyKeyboardRemove())
 
     from app.bot.handlers.nav import _build_home_text
 
