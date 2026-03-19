@@ -321,6 +321,10 @@ class AdminPriceFSM(StatesGroup):
     waiting_price = State()
 
 
+class AdminLtePriceFSM(StatesGroup):
+    waiting_price = State()
+
+
 class AdminUserInspectFSM(StatesGroup):
     waiting_user = State()
 
@@ -1283,6 +1287,67 @@ async def admin_price_set(message: Message, state: FSMContext) -> None:
     )
 
 
+
+
+@router.callback_query(lambda c: c.data == "admin:lte_price")
+async def admin_lte_price(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        current_price = await get_app_setting_int(session, "lte_activation_rub", default=settings.lte_activation_rub)
+
+    text = (
+        "📶 <b>Цена VPN LTE</b>\n\n"
+        f"Текущая цена активации: <b>{current_price} ₽</b>\n\n"
+        "Введите новую цену для активации VPN LTE (целое число в рублях), например: <code>99</code>"
+    )
+
+    await state.set_state(AdminLtePriceFSM.waiting_price)
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+    await cb.answer()
+
+
+@router.message(AdminLtePriceFSM.waiting_price)
+async def admin_lte_price_set(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    raw = re.sub(r"[^0-9]", "", (message.text or "").strip())
+    if not raw:
+        await message.answer("❌ Введите цену числом, например: 99", reply_markup=_kb_admin_back())
+        return
+
+    try:
+        new_price = int(raw)
+    except Exception:
+        await message.answer("❌ Введите цену числом, например: 99", reply_markup=_kb_admin_back())
+        return
+
+    if new_price < 0 or new_price > 1_000_000:
+        await message.answer("❌ Некорректная цена. Укажите значение от 0 до 1 000 000 ₽", reply_markup=_kb_admin_back())
+        return
+
+    async with session_scope() as session:
+        await set_app_setting_int(session, "lte_activation_rub", new_price)
+        await session.commit()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Цена активации VPN LTE обновлена: <b>{new_price} ₽</b>",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+
+
 # ==========================
 # ADMIN: GIFT SUBSCRIPTION
 # ==========================
@@ -1678,9 +1743,16 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         text += "\n\n👥 <b>Места по локациям</b>\n⚠️ Не удалось рассчитать свободные места."
 
     try:
+        async with session_scope() as session:
+            lte_price = await get_app_setting_int(session, "lte_activation_rub", default=settings.lte_activation_rub)
         lte_used = await lte_vpn_service.active_clients_count() if settings.lte_enabled else 0
         lte_free = max(0, int(settings.lte_max_clients) - int(lte_used))
-        text += f"\n\n📶 <b>VPN LTE</b>\nЗанято: <b>{lte_used}</b>/<b>{int(settings.lte_max_clients)}</b>\nСвободно: <b>{lte_free}</b>"
+        text += (
+            f"\n\n📶 <b>VPN LTE</b>\n"
+            f"Цена активации: <b>{lte_price} ₽</b>\n"
+            f"Занято: <b>{lte_used}</b>/<b>{int(settings.lte_max_clients)}</b>\n"
+            f"Свободно: <b>{lte_free}</b>"
+        )
     except Exception:
         text += "\n\n📶 <b>VPN LTE</b>\n⚠️ Не удалось получить статус мест."
 
