@@ -163,6 +163,11 @@ class Settings:
     lte_activation_rub: int = 99
     lte_max_clients: int = 40
     lte_rate_mbit: int = 25
+    lte_anti_sharing_mode: str = "off"
+    lte_anti_sharing_window_seconds: int = 180
+    lte_anti_sharing_cooldown_seconds: int = 1800
+    lte_anti_sharing_min_events_per_ip: int = 2
+    lte_anti_sharing_min_total_events: int = 4
 
 
 def _load_settings() -> Settings:
@@ -271,6 +276,11 @@ def _load_settings() -> Settings:
         lte_activation_rub=int(os.getenv("LTE_ACTIVATION_RUB", "99")),
         lte_max_clients=int(os.getenv("LTE_MAX_CLIENTS", "40")),
         lte_rate_mbit=int(os.getenv("LTE_RATE_MBIT", "25")),
+        lte_anti_sharing_mode=(os.getenv("LTE_ANTI_SHARING_MODE", "off").strip().lower() or "off"),
+        lte_anti_sharing_window_seconds=int(os.getenv("LTE_ANTI_SHARING_WINDOW_SECONDS", "180")),
+        lte_anti_sharing_cooldown_seconds=int(os.getenv("LTE_ANTI_SHARING_COOLDOWN_SECONDS", "1800")),
+        lte_anti_sharing_min_events_per_ip=int(os.getenv("LTE_ANTI_SHARING_MIN_EVENTS_PER_IP", "2")),
+        lte_anti_sharing_min_total_events=int(os.getenv("LTE_ANTI_SHARING_MIN_TOTAL_EVENTS", "4")),
     )
 
 
