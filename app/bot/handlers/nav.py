@@ -56,6 +56,17 @@ from app.services.lte_vpn.service import lte_vpn_service
 
 router = Router()
 
+TG_PROXY_URL = "https://t.me/proxy?server=mt.masterpix.org&port=443&secret=7ix9qzx1rb59pdRm9E7ivEp4cC5hcHBsZS5jb20"
+
+
+def kb_tgproxy() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Подключить Антилаг-Telegram", url=TG_PROXY_URL)],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
 
 async def _notify_admins_new_purchase(
     bot: Bot,
@@ -929,6 +940,26 @@ async def on_nav(cb: CallbackQuery) -> None:
             await cb.message.edit_text(await _build_home_text(), reply_markup=kb_main(show_trial=show_trial), parse_mode="HTML")
         except Exception:
             pass
+        return
+
+    if where == "tgproxy":
+        txt = (
+            "⚡ <b>Антилаг-Telegram</b>\n\n"
+            "Это бесплатный Telegram-прокси для случаев, когда сам Telegram открывается медленно, долго отправляет сообщения или плохо загружает медиа.\n\n"
+            "<b>Как использовать</b>\n"
+            "1) Нажмите кнопку <b>«⚡ Подключить Антилаг-Telegram»</b>.\n"
+            "2) Telegram предложит добавить и включить прокси — подтвердите.\n"
+            "3) Если прокси работает нестабильно, просто подключите его заново этой же кнопкой.\n\n"
+            "<b>Важно</b>\n"
+            "— не используйте этот прокси одновременно с любым включённым VPN;\n"
+            "— если Telegram работает некорректно, сначала отключите VPN, затем переустановите прокси;\n"
+            "— работа прокси может быть нестабильной, это нормально для такого типа подключения.\n\n"
+            "Сама техническая ссылка скрыта — подключение выполняется по кнопке ниже."
+        )
+        try:
+            await cb.message.edit_text(txt, reply_markup=kb_tgproxy(), parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            await cb.message.answer(txt, reply_markup=kb_tgproxy(), parse_mode="HTML", disable_web_page_preview=True)
         return
 
     if where == "cabinet":
