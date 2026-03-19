@@ -34,6 +34,7 @@ from app.repo import get_price_rub, set_app_setting_int, get_subscription, exten
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
 from app.services.regionvpn import RegionVpnService
+from app.services.lte_vpn.service import lte_vpn_service
 from app.services.message_audit import audit_send_message
 
 
@@ -1675,6 +1676,13 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             text += "\n\n👥 <b>Места по локациям</b>\n" + "\n".join(seat_lines)
     except Exception:
         text += "\n\n👥 <b>Места по локациям</b>\n⚠️ Не удалось рассчитать свободные места."
+
+    try:
+        lte_used = await lte_vpn_service.active_clients_count() if settings.lte_enabled else 0
+        lte_free = max(0, int(settings.lte_max_clients) - int(lte_used))
+        text += f"\n\n📶 <b>VPN LTE</b>\nЗанято: <b>{lte_used}</b>/<b>{int(settings.lte_max_clients)}</b>\nСвободно: <b>{lte_free}</b>"
+    except Exception:
+        text += "\n\n📶 <b>VPN LTE</b>\n⚠️ Не удалось получить статус мест."
 
     try:
         await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
