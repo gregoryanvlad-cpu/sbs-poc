@@ -521,6 +521,12 @@ def _kb_admin_back() -> InlineKeyboardMarkup:
     )
 
 
+def _kb_home_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+    )
+
+
 def _message_html_text(message: Message) -> str:
     html = getattr(message, "html_text", None)
     if html:
@@ -1661,7 +1667,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
                 target,
                 payload,
                 kind="admin_broadcast_one",
-                reply_markup=None,
+                reply_markup=_kb_home_menu(),
                 parse_mode=parse_mode,
                 photo=photo,
                 entities=entities,
@@ -1716,7 +1722,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
                 target,
                 payload,
                 kind=f"admin_broadcast_{mode or 'all'}",
-                reply_markup=None,
+                reply_markup=_kb_home_menu(),
                 parse_mode=parse_mode,
                 photo=photo,
                 entities=entities,
