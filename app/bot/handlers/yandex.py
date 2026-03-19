@@ -48,7 +48,8 @@ async def _notify_admins_yandex_issue(bot, *, tg_id: int, reason: str, sub_end_a
         admin_ids.update({int(x) for x in (settings.admin_tg_ids or [])})
     except Exception:
         pass
-    admin_ids.discard(int(tg_id))
+    # Do not exclude the requester here: if the user is also an admin/owner,
+    # they must receive the alert too.
     if not admin_ids:
         return
 
@@ -65,7 +66,7 @@ async def _notify_admins_yandex_issue(bot, *, tg_id: int, reason: str, sub_end_a
 
     text = (
         "⚠️ <b>Ошибка выдачи приглашения Yandex Plus</b>\n\n"
-        f"ID: <code>{tg_id}</code>\n"
+        f"Telegram ID пользователя: <code>{tg_id}</code>\n"
         f"Профиль: @{html_escape(username)} | {html_escape(full_name)}\n"
         f"Подписка активна до: <b>{html_escape(str(sub_end_at) if sub_end_at else '—')}</b>\n"
         f"Причина: <code>{html_escape(reason)}</code>"
@@ -77,7 +78,7 @@ async def _notify_admins_yandex_issue(bot, *, tg_id: int, reason: str, sub_end_a
             try:
                 plain = (
                     "⚠️ Ошибка выдачи приглашения Yandex Plus\n\n"
-                    f"ID: {tg_id}\n"
+                    f"Telegram ID пользователя: {tg_id}\n"
                     f"Профиль: @{username} | {full_name}\n"
                     f"Подписка активна до: {sub_end_at or '—'}\n"
                     f"Причина: {reason}"
