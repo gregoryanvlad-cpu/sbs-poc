@@ -24,6 +24,7 @@ from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, Subscription, User, Payment
 from app.db.models.vpn_peer import VpnPeer
+from app.db.models.lte_vpn_client import LteVpnClient
 from app.db.models import MessageAudit
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
@@ -1934,6 +1935,45 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
     if len(recent) > shown:
         lines.append("")
         lines.append(f"Показано: <b>{shown}</b> (лимит 25)")
+
+    now = datetime.now(timezone.utc)
+    lte_cutoff = now - timedelta(seconds=180)
+    async with session_scope() as session:
+        lte_res = await session.execute(
+            select(LteVpnClient, Subscription)
+            .join(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+            .where(
+                LteVpnClient.is_enabled == True,  # noqa: E712
+                LteVpnClient.last_seen_at.is_not(None),
+                LteVpnClient.last_seen_at > lte_cutoff,
+                Subscription.is_active == True,  # noqa: E712
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .order_by(LteVpnClient.last_seen_at.desc())
+            .limit(25)
+        )
+        lte_rows = lte_res.all()
+
+    if lte_rows:
+        lines.append("")
+        lines.append("📶 <b>Активные LTE-профили</b>")
+        lines.append("")
+        lte_tg_ids = sorted({int(row.tg_id) for row, _sub in lte_rows})[:50]
+        try:
+            lte_labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in lte_tg_ids], return_exceptions=True)
+            lte_label_map = {}
+            for tid, lbl in zip(lte_tg_ids, lte_labels):
+                lte_label_map[tid] = f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)
+        except Exception:
+            lte_label_map = {}
+        for idx, (row, _sub) in enumerate(lte_rows, start=1):
+            who = lte_label_map.get(int(row.tg_id)) or f"ID {row.tg_id}"
+            seen_dt = row.last_seen_at
+            if seen_dt and seen_dt.tzinfo is None:
+                seen_dt = seen_dt.replace(tzinfo=timezone.utc)
+            age_s = "—" if not seen_dt else f"{int((now - seen_dt).total_seconds())}s"
+            lines.append(f"{idx}. {who} | <code>{row.uuid[:8]}…</code> | LTE | hs {age_s} | id <code>{row.tg_id}</code>")
 
     text = "\n".join(lines)
 
