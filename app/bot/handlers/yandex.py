@@ -74,7 +74,17 @@ async def _notify_admins_yandex_issue(bot, *, tg_id: int, reason: str, sub_end_a
         try:
             await bot.send_message(int(aid), text, parse_mode="HTML")
         except Exception:
-            pass
+            try:
+                plain = (
+                    "⚠️ Ошибка выдачи приглашения Yandex Plus\n\n"
+                    f"ID: {tg_id}\n"
+                    f"Профиль: @{username} | {full_name}\n"
+                    f"Подписка активна до: {sub_end_at or '—'}\n"
+                    f"Причина: {reason}"
+                )
+                await bot.send_message(int(aid), plain)
+            except Exception:
+                pass
 
 
 @router.callback_query(lambda c: c.data == "yandex:copy")
@@ -139,6 +149,9 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
                     "⚠️ Сейчас свободные места или приглашения временно закончились.\n\n"
                     "Переживать не нужно — в ближайшее время вам придёт приглашение. Мы уже получили уведомление и проверим это вручную.",
                     parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                    ),
                 )
                 return
 
@@ -148,6 +161,9 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
             "⚠️ Сейчас свободные места или приглашения временно закончились.\n\n"
             "Переживать не нужно — в ближайшее время вам придёт приглашение. Мы уже получили уведомление и проверим это вручную.",
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+            ),
         )
         return
 
