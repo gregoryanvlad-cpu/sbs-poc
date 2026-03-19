@@ -194,12 +194,13 @@ class LteVpnService:
             q = (
                 select(func.count())
                 .select_from(LteVpnClient)
-                .join(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+                .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
                 .where(
                     LteVpnClient.is_enabled == True,
-                    Subscription.is_active == True,
-                    Subscription.end_at.is_not(None),
-                    Subscription.end_at > now,
+                    or_(
+                        and_(Subscription.is_active == True, Subscription.end_at.is_not(None), Subscription.end_at > now),
+                        and_(LteVpnClient.cycle_anchor_end_at.is_not(None), LteVpnClient.cycle_anchor_end_at > now),
+                    ),
                 )
             )
             val = await session.scalar(q)
