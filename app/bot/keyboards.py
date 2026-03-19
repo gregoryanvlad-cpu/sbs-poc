@@ -48,7 +48,6 @@ def kb_vpn(*, show_my_config: bool = False) -> InlineKeyboardMarkup:
     if show_my_config:
         b.button(text="📌 Мой конфиг", callback_data="vpn:my")
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
-    b.button(text="📶 VPN LTE", callback_data="vpn:lte")
     b.button(text="🌍 Сменить локацию", callback_data="vpn:loc")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
     b.button(text="⬅️ Назад", callback_data="nav:home")
