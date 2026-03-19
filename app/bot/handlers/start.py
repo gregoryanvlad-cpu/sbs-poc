@@ -49,14 +49,14 @@ async def cmd_start(message: Message) -> None:
 
     # Greeting (обычный текст, без рамки/код-блока)
     text = (
-        "Добро пожаловать 👋\n"
-        "Этот бот — ваш центр управления сервисами:\n\n"
+        "<b>Добро пожаловать</b> 👋\n"
+        "<i>Этот бот — ваш центр управления сервисами:</i>\n\n"
         "• Безопасный VPN\n"
         "• Обход глушилок региона\n"
         "• Обход замедления Telegram\n"
         "• Yandex Plus\n\n"
-        "Всего 199 ₽ в месяц\n\n"
-        "По вопросам сотрудничества: @sbsmanager_bot"
+        "<b>Всего 199 ₽ в месяц</b>\n\n"
+        "<i>По вопросам сотрудничества:</i> @sbsmanager_bot"
     )
 
     welcome_image = Path(__file__).resolve().parents[2] / "content" / "welcome-start.jpg"
@@ -66,9 +66,10 @@ async def cmd_start(message: Message) -> None:
             FSInputFile(str(welcome_image)),
             caption=text,
             reply_markup=ReplyKeyboardRemove(),
+            parse_mode="HTML",
         )
     else:
-        await message.answer(text, reply_markup=ReplyKeyboardRemove())
+        await message.answer(text, reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
 
     from app.bot.handlers.nav import _build_home_text
 
