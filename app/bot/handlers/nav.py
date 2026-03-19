@@ -3266,6 +3266,11 @@ async def _lte_has_access(tg_id: int) -> tuple[bool, datetime | None, bool]:
     return allowed, sub.end_at, paid
 
 
+async def _lte_price_rub() -> int:
+    async with session_scope() as session:
+        return await get_app_setting_int(session, "lte_activation_rub", default=settings.lte_activation_rub)
+
+
 @router.callback_query(lambda c: c.data == "vpn:lte")
 async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
     if not settings.lte_enabled:
@@ -3281,15 +3286,17 @@ async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
         await _safe_cb_answer(cb)
         return
     has_access, _, _ = await _lte_has_access(cb.from_user.id)
-    txt = LTE_INFO_TEXT + ("\n\n✅ LTE уже активирован для текущего цикла подписки." if has_access else f"\n\nАктивация на текущий цикл: <b>{settings.lte_activation_rub} ₽</b>.\nДля пользователей на пробном периоде доплата не требуется.")
-    await cb.message.edit_text(txt, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=settings.lte_activation_rub), parse_mode="HTML")
+    lte_price = await _lte_price_rub()
+    txt = LTE_INFO_TEXT + ("\n\n✅ LTE уже активирован для текущего цикла подписки." if has_access else f"\n\nАктивация на текущий цикл: <b>{lte_price} ₽</b>.\nДля пользователей на пробном периоде доплата не требуется.")
+    await cb.message.edit_text(txt, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data == "vpn:lte:about")
 async def on_vpn_lte_about(cb: CallbackQuery) -> None:
     has_access, _, _ = await _lte_has_access(cb.from_user.id)
-    await cb.message.edit_text(LTE_INFO_TEXT, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=settings.lte_activation_rub), parse_mode="HTML")
+    lte_price = await _lte_price_rub()
+    await cb.message.edit_text(LTE_INFO_TEXT, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
 
@@ -3306,12 +3313,14 @@ async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
             return
     provider = settings.payment_provider
     if provider == "platega":
-        await _start_platega_payment(cb, tg_id=cb.from_user.id, amount_override=settings.lte_activation_rub, months_override=0, promo_code="lte")
+        lte_price = await _lte_price_rub()
+        await _start_platega_payment(cb, tg_id=cb.from_user.id, amount_override=lte_price, months_override=0, promo_code="lte")
         return
     async with session_scope() as session:
         sub = await get_subscription(session, cb.from_user.id)
         await lte_vpn_service.get_or_create_client(cb.from_user.id, subscription_end_at=sub.end_at, force_rotate=False)
-        pay = Payment(tg_id=cb.from_user.id, amount=settings.lte_activation_rub, currency="RUB", provider="mock_lte", status="success", period_days=0, period_months=0)
+        lte_price = await _lte_price_rub()
+        pay = Payment(tg_id=cb.from_user.id, amount=lte_price, currency="RUB", provider="mock_lte", status="success", period_days=0, period_months=0)
         session.add(pay)
         await session.commit()
     await cb.answer("LTE активирован")
@@ -3328,7 +3337,7 @@ async def on_vpn_lte_install(cb: CallbackQuery) -> None:
     if used >= settings.lte_max_clients:
         await cb.message.edit_text(
             f"📶 <b>VPN LTE</b>\n\nСейчас все места заняты: <b>{used}/{settings.lte_max_clients}</b>. Попробуйте позже.",
-            reply_markup=kb_lte_vpn(has_access=True, activation_rub=settings.lte_activation_rub),
+            reply_markup=kb_lte_vpn(has_access=True, activation_rub=await _lte_price_rub()),
             parse_mode="HTML",
         )
         await _safe_cb_answer(cb)
