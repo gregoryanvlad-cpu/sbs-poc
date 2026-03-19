@@ -855,7 +855,7 @@ async def _build_home_text() -> str:
     lte_status = "Active ✅" if settings.lte_enabled else "Отключён ⛔️"
     lines.append('📶 "LTE-Обход-Сервер": <b>%s</b>' % lte_status)
     lines.append("")
-    lines.append('🔐 Шифрование: <a href="https://habr.com/ru/articles/573268/">ChaCha20-Poly1305</a>')
+    lines.append('🔐 Шифрование: <a href="https://en.wikipedia.org/wiki/ChaCha20-Poly1305?ysclid=mmxjfy37uz259328312">ChaCha20-Poly1305</a>')
 
     return "\n".join([
         "🏠 <b>Главное меню</b>",
