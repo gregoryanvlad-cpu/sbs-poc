@@ -2047,7 +2047,14 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
     # Allow immediate cleanup when user navigates back to main menu.
     if family_note:
         try:
-            await cb.bot.send_message(chat_id=chat_id, text=family_note, parse_mode="HTML")
+            await cb.bot.send_message(
+                chat_id=chat_id,
+                text=family_note,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home_vpn")]]
+                ),
+            )
         except Exception:
             pass
 
@@ -3371,6 +3378,33 @@ async def faq_terms(cb: CallbackQuery) -> None:
     await _safe_cb_answer(cb)
 
 
+
+
+
+def _lte_summary_text(*, has_access: bool, paid: bool, sub_end: datetime | None, lte_price: int) -> str:
+    lines = [
+        "📶 <b>VPN LTE</b>",
+        "",
+        "Это отдельный профиль для мобильного интернета, который помогает, когда обычный мобильный доступ работает нестабильно.",
+        "",
+    ]
+    if has_access and sub_end:
+        lines.append(f"✅ LTE активирован для текущего цикла подписки.")
+        lines.append(f"Активно до: <b>{fmt_dt(sub_end)}</b>")
+        lines.append("")
+        lines.append("Ниже вы можете скопировать конфиг для Happ+ или получить новый конфиг.")
+    else:
+        lines.append("ℹ️ Подробное описание, когда использовать LTE-профиль и какие есть ограничения, откроется по кнопке <b>«Что это?»</b>.")
+        lines.append("")
+        lines.append(f"Активация на текущий цикл: <b>{lte_price} ₽</b>.")
+        if not paid:
+            lines.append("Для пользователей на пробном периоде доплата не требуется.")
+    return "\n".join(lines)
+
+
+def _lte_about_text(*, has_access: bool, sub_end: datetime | None) -> str:
+    active_until_text = f"\n\n✅ LTE уже активирован для текущего цикла подписки.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
+    return LTE_INFO_TEXT + active_until_text
 
 LTE_INFO_TEXT = """📶 <b>VPN LTE</b>
 
