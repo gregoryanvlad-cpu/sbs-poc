@@ -13,12 +13,14 @@ from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
 from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, FamilyVpnProfile
+from app.db.models import LteVpnClient
 from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
 from app.repo import list_expired_subscriptions, set_subscription_expired, get_app_setting_int, set_app_setting_int
 from app.services.yandex.service import yandex_service
 from app.services.referrals.service import referral_service
 from app.services.regionvpn.service import RegionVpnService
+from app.services.lte_vpn.service import lte_vpn_service
 from app.services.message_audit import audit_send_message
 
 log = logging.getLogger(__name__)
@@ -240,6 +242,7 @@ async def run_scheduler() -> None:
                     await _job_expire_subscriptions(bot)
                     await _job_prune_wg_peers()
                     await _job_prune_regionvpn_clients()
+                    await _job_poll_lte_connections(bot)
                     if settings.yandex_enabled:
                         await _job_rotate_yandex_invites(bot)
                     await _job_user_subscription_notifications(bot)
@@ -1330,3 +1333,24 @@ async def _job_trial_reengagement_notifications(bot: Bot) -> None:
 
         if changed:
             await session.commit()
+
+
+async def _job_poll_lte_connections(bot: Bot) -> None:
+    if not settings.lte_enabled:
+        return
+    try:
+        ids = await lte_vpn_service.poll_new_connections()
+    except Exception:
+        log.exception("lte_poll_failed")
+        return
+    for tg_id in ids:
+        try:
+            await bot.send_message(
+                int(tg_id),
+                "Вы подключились к VPN LTE. Не забудьте отключиться, когда выйдете на Wi‑Fi.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+            )
+        except Exception:
+            pass
