@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import func, select, literal
+from sqlalchemy import func, select, literal, and_, or_
 
 from dateutil.relativedelta import relativedelta
 
@@ -464,7 +464,7 @@ async def _render_users_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
 
 @router.callback_query(lambda c: c.data == "admin:users")
 async def admin_users(cb: CallbackQuery) -> None:
-    if not is_owner(cb.from_user.id):
+    if not (is_owner(cb.from_user.id) or is_admin(cb.from_user.id)):
         await cb.answer()
         return
 
