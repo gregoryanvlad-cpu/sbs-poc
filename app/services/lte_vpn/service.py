@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 import base64
+import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncssh
@@ -20,12 +22,32 @@ from app.db.session import session_scope
 
 log = logging.getLogger(__name__)
 ENV_PATH = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+_EMAIL_RE = re.compile(r"(?P<email>\d+@lte)")
+_IPV4_RE = re.compile(r"(?<![\d.])(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?![\d.])")
+_TS_PATTERNS = (
+    re.compile(r"(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})"),
+    re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"),
+)
+_PRIVATE_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+)
 
 
 @dataclass
 class _InboundRef:
     inbound: dict
     clients: list
+
+
+@dataclass
+class LtePollResult:
+    connected_ids: list[int]
+    warned_ids: list[int]
+    strict_disabled_ids: list[int]
 
 
 class LteVpnService:
@@ -43,6 +65,10 @@ class LteVpnService:
         self.ws_path = settings.lte_ws_path or "/"
         self.inbound_tag = settings.lte_inbound_tag or "inbound-clients"
         self._key_obj = None
+        self._seen_line_hashes: deque[str] = deque(maxlen=4000)
+        self._seen_line_hash_set: set[str] = set()
+        self._events_by_email: dict[str, deque[tuple[datetime, str]]] = defaultdict(lambda: deque(maxlen=200))
+        self._anti_share_cooldown_until: dict[int, datetime] = {}
         key_b64 = (os.environ.get("LTE_SSH_PRIVATE_KEY_B64") or "").strip()
         if key_b64:
             try:
@@ -118,6 +144,49 @@ class LteVpnService:
     @staticmethod
     def _url_escape(s: str) -> str:
         return str(s).replace("%", "%25").replace(" ", "%20").replace("#", "%23").replace("?", "%3F").replace("&", "%26").replace("/", "%2F")
+
+    @staticmethod
+    def _parse_timestamp(line: str) -> datetime | None:
+        for rx in _TS_PATTERNS:
+            m = rx.search(line)
+            if not m:
+                continue
+            raw = m.group("ts")
+            try:
+                if "/" in raw:
+                    return datetime.strptime(raw, "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                norm = raw.replace("Z", "+00:00")
+                if re.match(r".*[+-]\d{4}$", norm):
+                    norm = norm[:-5] + norm[-5:-2] + ":" + norm[-2:]
+                dt = datetime.fromisoformat(norm)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _extract_public_ip(line: str) -> str | None:
+        for m in _IPV4_RE.finditer(line):
+            raw = m.group("ip")
+            try:
+                ip = ipaddress.ip_address(raw)
+            except Exception:
+                continue
+            if any(ip in net for net in _PRIVATE_NETS):
+                continue
+            return raw
+        return None
+
+    def _remember_line(self, line: str) -> bool:
+        digest = hashlib.sha1(line.encode("utf-8", errors="ignore")).hexdigest()
+        if digest in self._seen_line_hash_set:
+            return False
+        if len(self._seen_line_hashes) == self._seen_line_hashes.maxlen:
+            old = self._seen_line_hashes.popleft()
+            self._seen_line_hash_set.discard(old)
+        self._seen_line_hashes.append(digest)
+        self._seen_line_hash_set.add(digest)
+        return True
 
     async def active_clients_count(self) -> int:
         async with session_scope() as session:
@@ -214,31 +283,101 @@ class LteVpnService:
         await self.ensure_remote_client(tg_id, row.uuid)
         return row
 
-    async def tail_access_log(self, lines: int = 300) -> str:
+    async def tail_access_log(self, lines: int = 500) -> str:
         return await self._run_output(f"tail -n {int(lines)} {self.access_log_path}", check=False)
 
-    async def poll_new_connections(self) -> list[int]:
+    async def _disable_client_locally(self, tg_id: int) -> None:
+        async with session_scope() as session:
+            row = await session.get(LteVpnClient, tg_id)
+            if row is not None:
+                row.is_enabled = False
+                row.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+
+    def _windowed_ip_counts(self, email: str, now: datetime) -> dict[str, int]:
+        dq = self._events_by_email[email]
+        cutoff = now - timedelta(seconds=max(30, settings.lte_anti_sharing_window_seconds))
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+        counts: dict[str, int] = {}
+        for _, ip in dq:
+            counts[ip] = counts.get(ip, 0) + 1
+        return counts
+
+    def _should_flag_antishare(self, tg_id: int, email: str, now: datetime) -> bool:
+        mode = (settings.lte_anti_sharing_mode or "off").lower()
+        if mode == "off":
+            return False
+        until = self._anti_share_cooldown_until.get(int(tg_id))
+        if until and until > now:
+            return False
+        counts = self._windowed_ip_counts(email, now)
+        if len(counts) < 2:
+            return False
+        min_per_ip = max(2, int(settings.lte_anti_sharing_min_events_per_ip or 2))
+        strong_ips = [ip for ip, c in counts.items() if c >= min_per_ip]
+        total = sum(counts.values())
+        return len(strong_ips) >= 2 and total >= max(4, int(settings.lte_anti_sharing_min_total_events or 4))
+
+    async def poll_new_connections(self) -> LtePollResult:
         if not settings.lte_enabled or not settings.lte_access_log_poll_enabled:
-            return []
+            return LtePollResult([], [], [])
         raw = await self.tail_access_log()
         now = datetime.now(timezone.utc)
         connected: list[int] = []
+        warned: list[int] = []
+        strict_disabled: list[int] = []
         async with session_scope() as session:
             rows = (await session.execute(select(LteVpnClient))).scalars().all()
             by_email = {r.email: r for r in rows}
             for line in raw.splitlines():
-                for email, row in by_email.items():
-                    if email not in line:
-                        continue
-                    recent = row.notified_at and (now - row.notified_at).total_seconds() < 1800
-                    if recent:
-                        continue
+                if not line.strip() or not self._remember_line(line):
+                    continue
+                email_match = _EMAIL_RE.search(line)
+                if not email_match:
+                    continue
+                email = email_match.group("email")
+                row = by_email.get(email)
+                if row is None:
+                    continue
+                line_ts = self._parse_timestamp(line) or now
+                ip = self._extract_public_ip(line)
+                recent = row.notified_at and (now - row.notified_at).total_seconds() < 1800
+                if not recent:
                     row.notified_at = now
                     row.last_seen_at = now
                     row.updated_at = now
                     connected.append(int(row.tg_id))
+                if ip:
+                    self._events_by_email[email].append((line_ts, ip))
+                    if self._should_flag_antishare(int(row.tg_id), email, now):
+                        cooldown = now + timedelta(seconds=max(300, int(settings.lte_anti_sharing_cooldown_seconds or 1800)))
+                        self._anti_share_cooldown_until[int(row.tg_id)] = cooldown
+                        mode = (settings.lte_anti_sharing_mode or "off").lower()
+                        if mode == "strict":
+                            strict_disabled.append(int(row.tg_id))
+                        elif mode == "warn":
+                            warned.append(int(row.tg_id))
             await session.commit()
-        return connected
+        # de-dup lists while preserving order
+        def _uniq(vals: list[int]) -> list[int]:
+            seen: set[int] = set()
+            out: list[int] = []
+            for v in vals:
+                if v in seen:
+                    continue
+                seen.add(v)
+                out.append(v)
+            return out
+        warned = [x for x in _uniq(warned) if x not in strict_disabled]
+        strict_disabled = _uniq(strict_disabled)
+        for tg_id in strict_disabled:
+            try:
+                await self.disable_remote_client(tg_id)
+                await self._disable_client_locally(tg_id)
+            except Exception:
+                log.exception("lte_antishare_disable_failed tg_id=%s", tg_id)
+        return LtePollResult(connected_ids=_uniq(connected), warned_ids=warned, strict_disabled_ids=strict_disabled)
 
 
 lte_vpn_service = LteVpnService()
