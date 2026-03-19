@@ -1,36 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+from html import escape as html_escape
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select
 
 from app.bot.keyboards import kb_main
-from app.services.vpn.service import vpn_service
-from app.db.session import session_scope
+from app.db.models import User
 from app.db.models.yandex_membership import YandexMembership
+from app.db.session import session_scope
 from app.repo import get_subscription
 from app.bot.ui import utcnow
+from app.core.config import settings
 from app.services.yandex.service import yandex_service
 
 router = Router()
 
 
 async def _home_text_with_vpn() -> str:
-    """Local helper to keep main menu consistent."""
-    line = "🌍 VPN: статус недоступен"
-    try:
-        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
-        if st.get("ok"):
-            cpu = st.get("cpu_load_percent")
-            act = st.get("active_peers")
-            tot = st.get("total_peers")
-            if cpu is not None and act is not None and tot is not None:
-                line = f"🌍 VPN: загрузка ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
-    except Exception:
-        pass
-    return "🏠 <b>Главное меню</b>\n" + line
+    return (
+        "🏠 <b>Главное меню</b>\n\n"
+        '🇳🇱 Сервер "Нидерланды": <b>Работает ✅</b>\n'
+        f'📶 "LTE-Обход": <b>{"Работает ✅" if settings.lte_enabled else "Отключён ⛔️"}</b>\n\n'
+        "🔐 Форма шифрования: <b>ChaCha20-Poly1305</b>"
+    )
 
 
 def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
@@ -43,9 +38,47 @@ def _kb_open_invite(invite_link: str) -> InlineKeyboardMarkup:
     )
 
 
+async def _notify_admins_yandex_issue(bot, *, tg_id: int, reason: str, sub_end_at) -> None:
+    admin_ids: set[int] = set()
+    try:
+        admin_ids.add(int(settings.owner_tg_id))
+    except Exception:
+        pass
+    try:
+        admin_ids.update({int(x) for x in (settings.admin_tg_ids or [])})
+    except Exception:
+        pass
+    admin_ids.discard(int(tg_id))
+    if not admin_ids:
+        return
+
+    username = "—"
+    full_name = "—"
+    try:
+        async with session_scope() as session:
+            u = await session.scalar(select(User).where(User.tg_id == tg_id).limit(1))
+            if u:
+                username = u.username or "—"
+                full_name = ((u.first_name or "") + (" " + u.last_name if u.last_name else "")).strip() or "—"
+    except Exception:
+        pass
+
+    text = (
+        "⚠️ <b>Ошибка выдачи приглашения Yandex Plus</b>\n\n"
+        f"ID: <code>{tg_id}</code>\n"
+        f"Профиль: @{html_escape(username)} | {html_escape(full_name)}\n"
+        f"Подписка активна до: <b>{html_escape(str(sub_end_at) if sub_end_at else '—')}</b>\n"
+        f"Причина: <code>{html_escape(reason)}</code>"
+    )
+    for aid in admin_ids:
+        try:
+            await bot.send_message(int(aid), text, parse_mode="HTML")
+        except Exception:
+            pass
+
+
 @router.callback_query(lambda c: c.data == "yandex:copy")
 async def yandex_copy_invite(cb: CallbackQuery) -> None:
-    """Send invite link as plain text so user can copy it."""
     tg_id = cb.from_user.id
 
     async with session_scope() as session:
@@ -75,8 +108,6 @@ async def yandex_copy_invite(cb: CallbackQuery) -> None:
 @router.callback_query(F.data == "yandex:issue")
 async def on_yandex_issue(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
-    # Do not answer the callback here: in the "subscription inactive" branch we
-    # need to show an alert, and Telegram allows answering only once.
 
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
@@ -85,7 +116,6 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
             await cb.answer("Подписка не активна. Оплатите доступ.", show_alert=True)
             return
 
-        # если уже есть ссылка — просто покажем её
         ym = await session.scalar(
             select(YandexMembership)
             .where(YandexMembership.tg_id == tg_id)
@@ -95,7 +125,6 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
         if ym and ym.invite_link:
             invite_link = ym.invite_link
         else:
-            # Логин больше не нужен. Пишем placeholder, чтобы не ломать nullable=False.
             try:
                 ym = await yandex_service.ensure_membership_for_user(
                     session=session,
@@ -105,22 +134,23 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
                 await session.commit()
                 invite_link = ym.invite_link
             except Exception as e:
+                await _notify_admins_yandex_issue(cb.bot, tg_id=tg_id, reason=f"{type(e).__name__}: {e}", sub_end_at=sub.end_at)
                 await cb.message.answer(
-                    "❌ Не получилось выдать приглашение.\n\n"
-                    f"<code>{type(e).__name__}: {e}</code>\n\n"
-                    "Попробуй ещё раз через минуту.",
+                    "⚠️ Сейчас свободные места или приглашения временно закончились.\n\n"
+                    "Переживать не нужно — в ближайшее время вам придёт приглашение. Мы уже получили уведомление и проверим это вручную.",
                     parse_mode="HTML",
                 )
                 return
 
     if not invite_link:
+        await _notify_admins_yandex_issue(cb.bot, tg_id=tg_id, reason="invite_link is empty", sub_end_at=sub.end_at)
         await cb.message.answer(
-            "⚠️ Сейчас нет доступных приглашений.\n"
-            "Напиши в поддержку или попробуй позже."
+            "⚠️ Сейчас свободные места или приглашения временно закончились.\n\n"
+            "Переживать не нужно — в ближайшее время вам придёт приглашение. Мы уже получили уведомление и проверим это вручную.",
+            parse_mode="HTML",
         )
         return
 
-    # Best-effort stop the spinner for the successful path.
     try:
         await cb.answer()
     except Exception:
@@ -133,8 +163,6 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
         reply_markup=_kb_open_invite(invite_link),
     )
 
-    # Через минуту превращаем сообщение обратно в главное меню,
-    # но ссылка останется в разделе Yandex Plus.
     async def _auto_back() -> None:
         try:
             await asyncio.sleep(60)
@@ -149,18 +177,3 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
             pass
 
     asyncio.create_task(_auto_back())
-
-
-async def _home_text_with_vpn() -> str:
-    line = "🌍 VPN: статус недоступен"
-    try:
-        st = await asyncio.wait_for(vpn_service.get_server_status(), timeout=4)
-        if st.get("ok"):
-            cpu = st.get("cpu_load_percent")
-            act = st.get("active_peers")
-            tot = st.get("total_peers")
-            if cpu is not None and act is not None and tot is not None:
-                line = f"🌍 VPN: загрузка ~<b>{cpu:.0f}%</b> | активных пиров <b>{act}</b>/<b>{tot}</b>"
-    except Exception:
-        pass
-    return "🏠 <b>Главное меню</b>\n" + line
