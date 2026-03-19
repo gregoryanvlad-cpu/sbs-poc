@@ -521,6 +521,22 @@ def _kb_admin_back() -> InlineKeyboardMarkup:
     )
 
 
+def _message_html_text(message: Message) -> str:
+    html = getattr(message, "html_text", None)
+    if html:
+        return str(html).strip()
+    text = getattr(message, "text", None)
+    return (text or "").strip()
+
+
+def _message_html_caption(message: Message) -> str:
+    html = getattr(message, "html_caption", None)
+    if html:
+        return str(html).strip()
+    caption = getattr(message, "caption", None)
+    return (caption or "").strip()
+
+
 def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1590,7 +1606,7 @@ async def admin_broadcast_one_target(message: Message, state: FSMContext) -> Non
     await state.update_data(broadcast_mode="one", broadcast_target=int(tg_id))
     await state.set_state(AdminBroadcastFSM.waiting_text)
     await message.answer(
-        f"✍️ Теперь отправьте текст сообщения для <code>{tg_id}</code>.",
+        f"✍️ Теперь отправьте текст сообщения или фото с подписью для <code>{tg_id}</code>.\n\nФорматирование <b>жирным</b> и <i>курсивом</i> сохранится у пользователя.",
         reply_markup=_kb_admin_back(),
         parse_mode="HTML",
     )
@@ -1600,10 +1616,28 @@ async def admin_broadcast_one_target(message: Message, state: FSMContext) -> Non
 async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
         return
-    payload = (message.text or "").strip()
-    if not payload:
-        await message.answer("❌ Текст рассылки не должен быть пустым.", reply_markup=_kb_admin_back())
-        return
+
+    photo = None
+    payload = ""
+    parse_mode = "HTML"
+
+    if message.photo:
+        photo = message.photo[-1].file_id
+        payload = _message_html_caption(message)
+        if not payload:
+            await message.answer(
+                "❌ У фото должна быть подпись. Добавьте текст к фото, чтобы отправить рассылку.",
+                reply_markup=_kb_admin_back(),
+            )
+            return
+    else:
+        payload = _message_html_text(message)
+        if not payload:
+            await message.answer(
+                "❌ Отправьте текст рассылки или фото с подписью.",
+                reply_markup=_kb_admin_back(),
+            )
+            return
 
     data = await state.get_data()
     mode = str(data.get("broadcast_mode") or "")
@@ -1618,8 +1652,17 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
             await message.answer("⚠️ Получатель не найден. Начните заново.", reply_markup=kb_admin_menu())
             return
         try:
-            await audit_send_message(message.bot, target, payload, kind="admin_broadcast_one", reply_markup=None)
-            sent = 1
+            ok = await audit_send_message(
+                message.bot,
+                target,
+                payload,
+                kind="admin_broadcast_one",
+                reply_markup=None,
+                parse_mode=parse_mode,
+                photo=photo,
+            )
+            sent = 1 if ok else 0
+            failed = 0 if ok else 1
         except Exception:
             failed = 1
         await state.clear()
@@ -1662,14 +1705,19 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
 
     for target in targets:
         try:
-            await audit_send_message(
+            ok = await audit_send_message(
                 message.bot,
                 target,
                 payload,
                 kind=f"admin_broadcast_{mode or 'all'}",
                 reply_markup=None,
+                parse_mode=parse_mode,
+                photo=photo,
             )
-            sent += 1
+            if ok:
+                sent += 1
+            else:
+                failed += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.03)
@@ -1680,9 +1728,11 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
         "paid": "пользователям с активной подпиской",
         "unpaid": "пользователям без активной подписки",
     }.get(mode, "пользователям")
+    content_label = "фото с подписью" if photo else "текст"
     await message.answer(
         "✅ <b>Рассылка завершена</b>\n\n"
         f"Сегмент: <b>{mode_label}</b>\n"
+        f"Тип: <b>{content_label}</b>\n"
         f"Доставлено: <b>{sent}</b>\n"
         f"Ошибок: <b>{failed}</b>",
         reply_markup=kb_admin_menu(),
