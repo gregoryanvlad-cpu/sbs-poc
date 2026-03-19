@@ -146,6 +146,24 @@ class Settings:
     region_tc_dev: str = "eth0"
     region_tc_rate_mbit: int = 25
 
+    # VPN LTE (VLESS over WS, separate from main VPN)
+    lte_enabled: bool = False
+    lte_vless_host: str = ""
+    lte_vless_port: int = 443
+    lte_ws_path: str = "/"
+    lte_inbound_tag: str = "inbound-clients"
+    lte_ssh_host: str = ""
+    lte_ssh_port: int = 22
+    lte_ssh_user: str = "root"
+    lte_ssh_password: str | None = None
+    lte_xray_config_path: str = "/usr/local/etc/xray/config.json"
+    lte_xray_restart_command: str = "systemctl restart xray"
+    lte_access_log_path: str = "/var/log/xray/access.log"
+    lte_access_log_poll_enabled: bool = True
+    lte_activation_rub: int = 99
+    lte_max_clients: int = 40
+    lte_rate_mbit: int = 25
+
 
 def _load_settings() -> Settings:
     # Bot1 uses BOT_TOKEN, Bot2 can use PLAYER_BOT_TOKEN.
@@ -235,6 +253,24 @@ def _load_settings() -> Settings:
         region_tc_enabled=_env_bool("REGION_TC_ENABLED", True),
         region_tc_dev=os.getenv("REGION_TC_DEV", "eth0").strip() or "eth0",
         region_tc_rate_mbit=int(os.getenv("REGION_TC_RATE_MBIT", "25")),
+
+        # VPN LTE
+        lte_enabled=_env_bool("LTE_ENABLED", False),
+        lte_vless_host=os.getenv("LTE_VLESS_HOST", "").strip(),
+        lte_vless_port=int(os.getenv("LTE_VLESS_PORT", "443")),
+        lte_ws_path=os.getenv("LTE_WS_PATH", "/").strip() or "/",
+        lte_inbound_tag=os.getenv("LTE_INBOUND_TAG", "inbound-clients").strip() or "inbound-clients",
+        lte_ssh_host=os.getenv("LTE_SSH_HOST", "").strip(),
+        lte_ssh_port=int(os.getenv("LTE_SSH_PORT", "22")),
+        lte_ssh_user=os.getenv("LTE_SSH_USER", "root").strip() or "root",
+        lte_ssh_password=(os.getenv("LTE_SSH_PASSWORD") or "").strip() or None,
+        lte_xray_config_path=os.getenv("LTE_XRAY_CONFIG_PATH", "/usr/local/etc/xray/config.json").strip(),
+        lte_xray_restart_command=os.getenv("LTE_XRAY_RESTART_COMMAND", "systemctl restart xray").strip(),
+        lte_access_log_path=os.getenv("LTE_ACCESS_LOG_PATH", "/var/log/xray/access.log").strip(),
+        lte_access_log_poll_enabled=_env_bool("LTE_ACCESS_LOG_POLL_ENABLED", True),
+        lte_activation_rub=int(os.getenv("LTE_ACTIVATION_RUB", "99")),
+        lte_max_clients=int(os.getenv("LTE_MAX_CLIENTS", "40")),
+        lte_rate_mbit=int(os.getenv("LTE_RATE_MBIT", "25")),
     )
 
 
