@@ -58,8 +58,10 @@ async def cmd_start(message: Message) -> None:
 
     await message.answer(text, reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
 
+    from app.bot.handlers.nav import _build_home_text
+
     await message.answer(
-        "🏠 <b>Главное меню</b>",
+        await _build_home_text(),
         reply_markup=kb_main(show_trial=show_trial),
         parse_mode="HTML",
     )
