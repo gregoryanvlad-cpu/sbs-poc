@@ -1339,15 +1339,37 @@ async def _job_poll_lte_connections(bot: Bot) -> None:
     if not settings.lte_enabled:
         return
     try:
-        ids = await lte_vpn_service.poll_new_connections()
+        result = await lte_vpn_service.poll_new_connections()
     except Exception:
         log.exception("lte_poll_failed")
         return
-    for tg_id in ids:
+    for tg_id in result.connected_ids:
         try:
             await bot.send_message(
                 int(tg_id),
                 "Вы подключились к VPN LTE. Не забудьте отключиться, когда выйдете на Wi‑Fi.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+            )
+        except Exception:
+            pass
+    for tg_id in result.warned_ids:
+        try:
+            await bot.send_message(
+                int(tg_id),
+                "⚠️ Обнаружены признаки одновременного использования VPN LTE с нескольких сетей или устройств. Пожалуйста, используйте LTE-конфиг только лично и на одном активном подключении.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+            )
+        except Exception:
+            pass
+    for tg_id in result.strict_disabled_ids:
+        try:
+            await bot.send_message(
+                int(tg_id),
+                "⛔️ VPN LTE временно отключён из-за признаков передачи доступа другим людям. Зайдите в раздел VPN LTE и получите конфиг заново, если это были вы и произошла ошибка.",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
                 ),
