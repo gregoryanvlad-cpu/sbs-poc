@@ -65,6 +65,7 @@ async def _notify_admins_new_purchase(
     months: int,
     provider: str,
     new_end_at: datetime | None,
+    item_label: str = "Подписка VPN",
 ) -> None:
     """Best-effort: notify owner/admins about a successful purchase."""
 
@@ -95,14 +96,17 @@ async def _notify_admins_new_purchase(
 
     end_str = fmt_dt(new_end_at) if new_end_at else "—"
 
+    period_str = f"<b>{months} мес.</b>" if months > 0 else "<b>текущий цикл</b>"
+
     text = (
         "🧾 <b>Новая покупка</b>\n\n"
+        f"Услуга: <b>{html_escape(item_label)}</b>\n"
         f"ID: <code>{buyer_tg_id}</code>\n"
         f"Профиль: @{username} | {full_name}\n"
         f"Сумма: <b>{amount_rub} ₽</b>\n"
-        f"Период: <b>{months} мес.</b>\n"
+        f"Период: {period_str}\n"
         f"Провайдер: <code>{html_escape(provider)}</code>\n"
-        f"Подписка до: <b>{end_str}</b>"
+        f"Активно до: <b>{end_str}</b>"
     )
 
     for aid in admin_ids:
@@ -829,15 +833,16 @@ async def _build_home_text() -> str:
             pass
         return "Подключается..."
 
-    for srv in servers:
-        code = str(srv.get("code") or "").upper() or "??"
-        name = str(srv.get("name") or f"VPN-{code}")
-        load = await _fmt_status(srv)
-        if load in ("Недоступно", "Подключается..."):
-            lines.append(f'🌍{_flag(code)} "{name}", нагрузка: <b>{load}</b>')
-        else:
-            lines.append(f'🌍{_flag(code)} "{name}", нагрузка составляет: <b>{load}</b>')
+    nl_srv = next((srv for srv in servers if str(srv.get("code") or "").upper() == "NL"), None)
+    if nl_srv:
+        status = await _fmt_status(nl_srv)
+        works = "Работает ✅" if status not in ("Недоступно", "Подключается...") else status
+        lines.append('🇳🇱 Сервер "Нидерланды": <b>%s</b>' % works)
+    else:
+        lines.append('🇳🇱 Сервер "Нидерланды": <b>Подключается...</b>')
 
+    lte_status = "Работает ✅" if settings.lte_enabled else "Отключён ⛔️"
+    lines.append('📶 "LTE-Обход": <b>%s</b>' % lte_status)
     lines.append("")
     lines.append("🔐 Форма шифрования: <b>ChaCha20-Poly1305</b>")
 
@@ -1364,6 +1369,18 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                         pay.status = "success"
                         await session.commit()
                         try:
+                            await _notify_admins_new_purchase(
+                                bot,
+                                buyer_tg_id=tg_id,
+                                amount_rub=int(pay.amount),
+                                months=1,
+                                provider=str(pay.provider or "platega_family"),
+                                new_end_at=grp.active_until,
+                                item_label="Семейная группа VPN",
+                            )
+                        except Exception:
+                            pass
+                        try:
                             await bot.send_message(
                                 tg_id,
                                 "✅ <b>Оплата семейной группы подтверждена!</b>\n\n"
@@ -1385,6 +1402,18 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                         await lte_vpn_service.get_or_create_client(tg_id, subscription_end_at=sub.end_at, force_rotate=False)
                         pay.status = "success"
                         await session.commit()
+                        try:
+                            await _notify_admins_new_purchase(
+                                bot,
+                                buyer_tg_id=tg_id,
+                                amount_rub=int(pay.amount),
+                                months=1,
+                                provider=str(pay.provider or "platega_lte"),
+                                new_end_at=sub.end_at,
+                                item_label="VPN LTE",
+                            )
+                        except Exception:
+                            pass
                         try:
                             await bot.send_message(
                                 tg_id,
@@ -1665,6 +1694,19 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                 pay.status = "success"
                 await session.commit()
 
+                try:
+                    await _notify_admins_new_purchase(
+                        cb.bot,
+                        buyer_tg_id=cb.from_user.id,
+                        amount_rub=int(pay.amount),
+                        months=1,
+                        provider=str(pay.provider or "platega_family"),
+                        new_end_at=grp.active_until,
+                        item_label="Семейная группа VPN",
+                    )
+                except Exception:
+                    pass
+
                 await cb.answer("Оплата подтверждена")
                 await cb.message.edit_text(
                     "✅ <b>Оплата семейной группы подтверждена!</b>\n\n"
@@ -1674,6 +1716,35 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                             [InlineKeyboardButton(text="✅ Да", callback_data="family:bill:yes")],
                             [InlineKeyboardButton(text="❌ Нет", callback_data="family:bill:no")],
                         ]
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+
+            if (pay.provider or "") == "platega_lte":
+                sub = await get_subscription(session, cb.from_user.id)
+                await lte_vpn_service.get_or_create_client(cb.from_user.id, subscription_end_at=sub.end_at, force_rotate=False)
+                pay.status = "success"
+                await session.commit()
+
+                try:
+                    await _notify_admins_new_purchase(
+                        cb.bot,
+                        buyer_tg_id=cb.from_user.id,
+                        amount_rub=int(pay.amount),
+                        months=1,
+                        provider=str(pay.provider or "platega_lte"),
+                        new_end_at=sub.end_at,
+                        item_label="VPN LTE",
+                    )
+                except Exception:
+                    pass
+
+                await cb.answer("Оплата подтверждена")
+                await cb.message.edit_text(
+                    "✅ <b>VPN LTE активирован!</b>\n\nТеперь можно открыть раздел «📶 VPN LTE» и установить конфиг.",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="📶 Открыть VPN LTE", callback_data="vpn:lte")]]
                     ),
                     parse_mode="HTML",
                 )
@@ -1931,6 +2002,19 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
             loc_title = "<b>ваша локация</b>"
 
         filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, getattr(active, 'id', None))
+
+        family_note = None
+        try:
+            from app.db.models import FamilyVpnGroup
+            grp = await session.scalar(select(FamilyVpnGroup).where(FamilyVpnGroup.owner_tg_id == tg_id).limit(1))
+            if grp and grp.seats_total and grp.active_until and grp.active_until > utcnow():
+                family_note = (
+                    "ℹ️ <b>Важно:</b> это <b>ваш личный конфиг</b>, а не конфиг из семейной группы.\n\n"
+                    "Если включить этот личный конфиг сразу на другом устройстве, соединение может работать нестабильно и с просадками по скорости.\n\n"
+                    "Чтобы выдать отдельный профиль другому человеку или устройству, откройте: <b>VPN → Семейная группа</b> → <b>📤 Поделиться VPN</b> и отправьте нужный профиль из группы."
+                )
+        except Exception:
+            family_note = None
         await session.commit()
 
     # Build QR + files.
@@ -1961,6 +2045,12 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
     )
 
     # Allow immediate cleanup when user navigates back to main menu.
+    if family_note:
+        try:
+            await cb.bot.send_message(chat_id=chat_id, text=family_note, parse_mode="HTML")
+        except Exception:
+            pass
+
     await _store_last_vpn_conf_messages(
         tg_id=tg_id,
         chat_id=chat_id,
@@ -2895,6 +2985,21 @@ async def on_family_pay(cb: CallbackQuery) -> None:
             [InlineKeyboardButton(text="❌ Нет", callback_data="family:bill:no")],
         ]
     )
+    try:
+        async with session_scope() as session:
+            grp = await _get_or_create_family_group(session, tg_id)
+            await _notify_admins_new_purchase(
+                cb.bot,
+                buyer_tg_id=tg_id,
+                amount_rub=int(amount),
+                months=1,
+                provider="mock_family",
+                new_end_at=grp.active_until,
+                item_label="Семейная группа VPN",
+            )
+    except Exception:
+        pass
+
     await cb.message.edit_text(
         "✅ <b>Оплата семейной группы прошла успешно!</b>\n\n"
         "Запомнить и присылать счёт ежемесячно для оплаты семейной группы?",
@@ -2951,14 +3056,41 @@ async def on_family_share_menu(cb: CallbackQuery) -> None:
 
 
 def _family_forward_instructions_text() -> str:
-    return (
-        "📌 <b>Инструкции для подключения</b>\n"
-        "Android: установите WireGuard из Google Play и импортируйте .conf\n"
-        "Windows: WireGuard для Windows, импорт .conf\n"
-        "macOS: WireGuard из App Store, импорт .conf\n"
-        "Linux: wg-quick up wg0\n\n"
-        "iPhone/iPad: инструкции в боте в разделе VPN → Инструкция → iPhone/iPad."
-    )
+    return """📌 <b>Как подключить профиль семейной группы</b>
+
+<b>Это отдельный профиль семейной группы.</b> Его можно передать другому человеку или установить на отдельное устройство.
+
+<b>iPhone / iPad</b>
+1) Установите приложение <b>WireGuard</b> из App Store.
+2) Откройте присланный файл <code>.conf</code>.
+3) Нажмите <b>Поделиться</b> → <b>Открыть в WireGuard</b>.
+4) Подтвердите импорт и включите туннель.
+
+<b>Android</b>
+1) Установите приложение <b>WireGuard</b> из Google Play.
+2) Откройте файл <code>.conf</code> или сохраните его в память устройства.
+3) В WireGuard нажмите <b>+</b> → <b>Импорт из файла</b>.
+4) Выберите присланный файл и включите профиль.
+
+<b>Windows</b>
+1) Установите <b>WireGuard</b> для Windows.
+2) Откройте программу и нажмите <b>Import tunnel(s) from file</b>.
+3) Выберите присланный файл <code>.conf</code>.
+4) Нажмите <b>Activate</b>.
+
+<b>macOS</b>
+1) Установите <b>WireGuard</b> из App Store.
+2) Откройте приложение и нажмите <b>Import tunnel(s) from file</b>.
+3) Выберите присланный файл <code>.conf</code>.
+4) Активируйте профиль.
+
+<b>Linux</b>
+1) Установите WireGuard.
+2) Сохраните файл как, например, <code>/etc/wireguard/wg0.conf</code>.
+3) Запустите: <code>sudo wg-quick up wg0</code>.
+4) Для отключения: <code>sudo wg-quick down wg0</code>.
+
+Подробные инструкции для каждого устройства также есть в боте: <b>VPN → Инструкция</b>."""
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("family:share:"))
@@ -3034,7 +3166,7 @@ async def on_family_share_slot(cb: CallbackQuery) -> None:
 
     # Build and send config (no QR)
     conf_text = vpn_service.build_wg_conf(peer_dict, user_label=f"family:{tg_id}:{slot_no}")
-    conf_file = BufferedInputFile(conf_text.encode(), filename=f"familyVPN_{slot_no}.conf")
+    conf_file = BufferedInputFile(conf_text.encode(), filename=f"FamilyVPN{slot_no}.conf")
     await cb.message.answer_document(
         conf_file,
         caption=(
@@ -3240,14 +3372,29 @@ async def faq_terms(cb: CallbackQuery) -> None:
 
 
 
-LTE_INFO_TEXT = (
-    "📶 <b>VPN LTE</b>\n\n"
-    "VPN LTE — это специальный VPN для обхода глушилок.\n"
-    "Работает только по мобильному интернету (LTE/5G/4G/3G).\n"
-    "Не работает по Wi‑Fi.\n\n"
-    "Используй его, когда в городе включены глушилки.\n"
-    "После выхода на Wi‑Fi рекомендуется отключаться."
-)
+LTE_INFO_TEXT = """📶 <b>VPN LTE</b>
+
+<b>Что это такое</b>
+VPN LTE — это отдельный профиль для ситуаций, когда в регионе временно ограничен или нестабильно работает обычный мобильный интернет. Он помогает открыть нужные приложения и сайты через защищённое соединение, когда стандартное подключение по LTE/4G/5G/3G работает с перебоями.
+
+<b>Как это работает</b>
+Сервис шифрует трафик и отправляет его через отдельный сервер. Для пользователя это обычное защищённое подключение: вы просто включаете профиль в приложении и пользуетесь интернетом как обычно. Это технический инструмент для стабильного доступа и защиты соединения, а не замена мобильной связи и не обещание доступа ко всем ресурсам в любой момент.
+
+<b>Когда включать</b>
+— когда мобильный интернет в вашем регионе работает нестабильно;
+— когда приложения или сайты не открываются через обычный LTE;
+— когда нужно быстро восстановить доступ через мобильную сеть.
+
+<b>Важно</b>
+— профиль рассчитан именно на мобильный интернет (LTE/5G/4G/3G);
+— при переходе на Wi‑Fi его лучше отключать;
+— некоторые сервисы из так называемых белых списков могут через этот профиль не открываться; если нужный вам сервис не загружается, просто отключите VPN LTE и попробуйте снова без него.
+
+<b>Где такие ограничения уже встречались</b>
+По открытым сообщениям СМИ, ограничения мобильного интернета уже отмечались, в том числе, в Крыму, Ростовской области, Краснодарском крае, Дагестане, Самарской, Саратовской, Орловской, Ивановской, Ярославской, Воронежской и Ульяновской областях, а также в Санкт‑Петербурге и Ленинградской области. Перечень может меняться в зависимости от региона и текущей обстановки.
+
+<b>Законность использования</b>
+Профиль предназначен для личного использования как средство защищённого соединения и стабильного доступа к обычным интернет‑сервисам. Пользователь обязан соблюдать применимое законодательство и правила используемых сервисов."""
 
 
 async def _lte_is_main_sub_active(tg_id: int) -> tuple[bool, datetime | None]:
@@ -3294,9 +3441,10 @@ async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:lte:about")
 async def on_vpn_lte_about(cb: CallbackQuery) -> None:
-    has_access, _, _ = await _lte_has_access(cb.from_user.id)
+    has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
     lte_price = await _lte_price_rub()
-    await cb.message.edit_text(LTE_INFO_TEXT, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
+    active_until_text = f"\n\n✅ LTE уже активирован для текущего цикла подписки.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
+    await cb.message.edit_text(LTE_INFO_TEXT + active_until_text, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
 
@@ -3323,6 +3471,20 @@ async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
         pay = Payment(tg_id=cb.from_user.id, amount=lte_price, currency="RUB", provider="mock_lte", status="success", period_days=0, period_months=0)
         session.add(pay)
         await session.commit()
+    try:
+        async with session_scope() as session:
+            sub = await get_subscription(session, cb.from_user.id)
+            await _notify_admins_new_purchase(
+                cb.bot,
+                buyer_tg_id=cb.from_user.id,
+                amount_rub=int(lte_price),
+                months=1,
+                provider="mock_lte",
+                new_end_at=sub.end_at,
+                item_label="VPN LTE",
+            )
+    except Exception:
+        pass
     await cb.answer("LTE активирован")
     await on_vpn_lte_menu(cb)
 
