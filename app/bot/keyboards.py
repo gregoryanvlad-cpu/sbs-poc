@@ -47,6 +47,7 @@ def kb_vpn(*, show_my_config: bool = False) -> InlineKeyboardMarkup:
     if show_my_config:
         b.button(text="📌 Мой конфиг", callback_data="vpn:my")
     b.button(text="📦 Отправить конфиг + QR", callback_data="vpn:bundle")
+    b.button(text="📶 VPN LTE", callback_data="vpn:lte")
     b.button(text="🌍 Сменить локацию", callback_data="vpn:loc")
     b.button(text="♻️ Сбросить VPN", callback_data="vpn:reset:confirm")
     b.button(text="⬅️ Назад", callback_data="nav:home")
@@ -165,5 +166,25 @@ def kb_faq() -> InlineKeyboardMarkup:
     b.button(text="🔐 Политика конфиденциальности", callback_data="faq:privacy")
     b.button(text="📝 Пользовательское соглашение", callback_data="faq:terms")
     b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_lte_vpn(*, has_access: bool, activation_rub: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="ℹ️ Что это?", callback_data="vpn:lte:about")
+    if has_access:
+        b.button(text="📲 Установить в Happ+", callback_data="vpn:lte:install")
+        b.button(text="♻️ Получить новый конфиг", callback_data="vpn:lte:reset")
+    else:
+        b.button(text=f"💳 Активировать за {int(activation_rub)} ₽", callback_data="vpn:lte:pay")
+    b.button(text="⬅️ Назад", callback_data="nav:vpn")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_lte_main_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
