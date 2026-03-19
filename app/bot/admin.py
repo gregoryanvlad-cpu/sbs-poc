@@ -1751,7 +1751,7 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         text += (
             f"\n\n📶 <b>VPN LTE</b>\n"
             f"Цена активации: <b>{lte_price} ₽</b>\n"
-            f"Занято: <b>{lte_used}</b>/<b>{int(settings.lte_max_clients)}</b>\n"
+            f"Активных профилей: <b>{lte_used}</b>/<b>{int(settings.lte_max_clients)}</b>\n"
             f"Свободно: <b>{lte_free}</b>"
         )
     except Exception:
@@ -1977,6 +1977,75 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
 
     text = "\n".join(lines)
 
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:active_lte_profiles")
+async def admin_vpn_active_lte_profiles(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc)
+    online_cutoff = now - timedelta(seconds=180)
+    async with session_scope() as session:
+        q = (
+            select(LteVpnClient, Subscription)
+            .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+            .where(
+                LteVpnClient.is_enabled == True,  # noqa: E712
+                or_(
+                    and_(Subscription.is_active == True, Subscription.end_at.is_not(None), Subscription.end_at > now),
+                    and_(LteVpnClient.cycle_anchor_end_at.is_not(None), LteVpnClient.cycle_anchor_end_at > now),
+                ),
+            )
+            .order_by(LteVpnClient.last_seen_at.desc().nullslast(), LteVpnClient.updated_at.desc().nullslast())
+            .limit(50)
+        )
+        rows = (await session.execute(q)).all()
+
+    lines = ["📶 <b>Активные LTE-профили</b>", ""]
+    if not rows:
+        lines.append("Сейчас нет активированных LTE-профилей.")
+    else:
+        lines.append(f"Занято мест: <b>{len(rows)}</b>/<b>{int(settings.lte_max_clients)}</b>")
+        lines.append("")
+        tg_ids = sorted({int(row.tg_id) for row, _ in rows})[:50]
+        try:
+            labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in tg_ids], return_exceptions=True)
+            label_map = {tid: (f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)) for tid, lbl in zip(tg_ids, labels)}
+        except Exception:
+            label_map = {}
+        for idx, (row, sub) in enumerate(rows, start=1):
+            who = label_map.get(int(row.tg_id)) or f"ID {row.tg_id}"
+            seen_dt = row.last_seen_at
+            if seen_dt and seen_dt.tzinfo is None:
+                seen_dt = seen_dt.replace(tzinfo=timezone.utc)
+            is_online = bool(seen_dt and seen_dt > online_cutoff)
+            online_text = "🟢 онлайн" if is_online else "⚪️ не в сети"
+            age_s = "—" if not seen_dt else f"{int((now - seen_dt).total_seconds())}s назад"
+            until_dt = None
+            if sub and getattr(sub, 'end_at', None):
+                until_dt = sub.end_at
+            elif row.cycle_anchor_end_at:
+                until_dt = row.cycle_anchor_end_at
+            until_txt = _fmt_dt_short(until_dt) if until_dt else "—"
+            lines.append(
+                f"{idx}. {who} | <code>{(row.uuid or '')[:8]}…</code> | {online_text} | последняя активность: <b>{age_s}</b> | активно до: <b>{until_txt}</b> | id <code>{row.tg_id}</code>"
+            )
+
+    text = "\n".join(lines)
     try:
         await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
     except TelegramBadRequest as e:
