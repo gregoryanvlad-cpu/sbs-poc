@@ -3344,16 +3344,61 @@ async def on_vpn_lte_install(cb: CallbackQuery) -> None:
         return
     row = await lte_vpn_service.sync_client(cb.from_user.id, subscription_end_at=sub_end, force_rotate=False)
     url = lte_vpn_service.build_vless_url(row.uuid, tg_id=cb.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📲 Установить в Happ+", url=url)],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+
+    copy_btn: InlineKeyboardButton | None = None
+    if CopyTextButton is not None and 1 <= len(url) <= 256:
+        try:
+            copy_btn = InlineKeyboardButton(
+                text="📋 Скопировать в Happ+",
+                copy_text=CopyTextButton(text=url),  # type: ignore[arg-type]
+            )
+        except Exception:
+            copy_btn = None
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if copy_btn:
+        kb_rows.append([copy_btn])
+    kb_rows.append([
+        InlineKeyboardButton(
+            text="🍏 Happ Plus (App Store)",
+            url="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+        )
     ])
+    kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    if copy_btn:
+        howto = (
+            "1) Нажмите кнопку <b>«📋 Скопировать в Happ+»</b> — ссылка скопируется автоматически.\n"
+            "2) Откройте <b>Happ Plus</b>.\n"
+            "3) Нажмите <b>+</b>.\n"
+            "4) Выберите <b>Из буфера</b> / <b>Import from Clipboard</b>.\n"
+            "5) Подтвердите импорт конфига.\n\n"
+            "Если кнопка копирования не сработала, ниже есть сама ссылка — её можно скопировать вручную долгим нажатием."
+        )
+    else:
+        howto = (
+            "1) Скопируйте ссылку ниже долгим нажатием → <b>Копировать</b>.\n"
+            "2) Откройте <b>Happ Plus</b>.\n"
+            "3) Нажмите <b>+</b>.\n"
+            "4) Выберите <b>Из буфера</b> / <b>Import from Clipboard</b>.\n"
+            "5) Подтвердите импорт конфига."
+        )
+
+    show_inline_link = len(url) <= 3500
+    link_block = f"<code>{html_escape(url)}</code>" if show_inline_link else "<i>Ссылка слишком длинная для сообщения. Получите новый конфиг или обратитесь в поддержку.</i>"
+
     await cb.message.edit_text(
-        "📶 <b>VPN LTE</b>\n\nНажмите кнопку ниже — конфиг откроется в Happ+ и предложит импорт.\nПосле подключения отключайтесь при переходе на Wi‑Fi.",
+        "📶 <b>VPN LTE</b>\n\n"
+        "📌 <b>Как добавить конфиг в Happ Plus</b>\n"
+        f"{howto}\n\n"
+        "🔗 <b>Ссылка для Happ Plus</b>\n"
+        f"{link_block}\n\n"
+        "После подключения отключайтесь при переходе на Wi‑Fi.",
         reply_markup=kb,
         parse_mode="HTML",
+        disable_web_page_preview=True,
     )
-    # fallback, если access.log не включён
     if not settings.lte_access_log_poll_enabled:
         try:
             await cb.bot.send_message(cb.from_user.id, "Вы подключились к VPN LTE. Не забудьте отключиться, когда выйдете на Wi‑Fi.", reply_markup=kb_lte_main_menu())
@@ -3370,9 +3415,54 @@ async def on_vpn_lte_reset(cb: CallbackQuery) -> None:
         return
     row = await lte_vpn_service.sync_client(cb.from_user.id, subscription_end_at=sub_end, force_rotate=True)
     url = lte_vpn_service.build_vless_url(row.uuid, tg_id=cb.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📲 Установить новый конфиг в Happ+", url=url)],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:lte")],
+
+    copy_btn: InlineKeyboardButton | None = None
+    if CopyTextButton is not None and 1 <= len(url) <= 256:
+        try:
+            copy_btn = InlineKeyboardButton(
+                text="📋 Скопировать новый конфиг в Happ+",
+                copy_text=CopyTextButton(text=url),  # type: ignore[arg-type]
+            )
+        except Exception:
+            copy_btn = None
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if copy_btn:
+        kb_rows.append([copy_btn])
+    kb_rows.append([
+        InlineKeyboardButton(
+            text="🍏 Happ Plus (App Store)",
+            url="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+        )
     ])
-    await cb.message.edit_text("♻️ <b>Конфиг VPN LTE обновлён.</b>\n\nСтарый UUID отключён, новый конфиг готов к установке.", reply_markup=kb, parse_mode="HTML")
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:lte")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    if copy_btn:
+        howto = (
+            "1) Нажмите кнопку <b>«📋 Скопировать новый конфиг в Happ+»</b>.\n"
+            "2) Откройте <b>Happ Plus</b> → <b>+</b> → <b>Из буфера</b>.\n"
+            "3) Подтвердите импорт нового конфига."
+        )
+    else:
+        howto = (
+            "1) Скопируйте ссылку ниже вручную.\n"
+            "2) Откройте <b>Happ Plus</b> → <b>+</b> → <b>Из буфера</b>.\n"
+            "3) Подтвердите импорт нового конфига."
+        )
+
+    link_block = f"<code>{html_escape(url)}</code>" if len(url) <= 3500 else "<i>Ссылка слишком длинная для сообщения. Попробуйте ещё раз позже.</i>"
+
+    await cb.message.edit_text(
+        "♻️ <b>Конфиг VPN LTE обновлён.</b>\n\n"
+        "Старый UUID отключён, новый конфиг готов.\n\n"
+        "📌 <b>Как добавить новый конфиг в Happ Plus</b>\n"
+        f"{howto}\n\n"
+        "🔗 <b>Новая ссылка</b>\n"
+        f"{link_block}",
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
     await _safe_cb_answer(cb)
+
