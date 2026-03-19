@@ -1620,10 +1620,13 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
     photo = None
     payload = ""
     parse_mode = "HTML"
+    entities = None
+    caption_entities = None
 
     if message.photo:
         photo = message.photo[-1].file_id
         payload = _message_html_caption(message)
+        caption_entities = list(message.caption_entities or []) or None
         if not payload:
             await message.answer(
                 "❌ У фото должна быть подпись. Добавьте текст к фото, чтобы отправить рассылку.",
@@ -1632,6 +1635,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
             return
     else:
         payload = _message_html_text(message)
+        entities = list(message.entities or []) or None
         if not payload:
             await message.answer(
                 "❌ Отправьте текст рассылки или фото с подписью.",
@@ -1660,6 +1664,8 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
                 reply_markup=None,
                 parse_mode=parse_mode,
                 photo=photo,
+                entities=entities,
+                caption_entities=caption_entities,
             )
             sent = 1 if ok else 0
             failed = 0 if ok else 1
@@ -1713,6 +1719,8 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
                 reply_markup=None,
                 parse_mode=parse_mode,
                 photo=photo,
+                entities=entities,
+                caption_entities=caption_entities,
             )
             if ok:
                 sent += 1
