@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, MessageEntity
 
 from app.db.models.message_audit import MessageAudit
 from app.db.session import session_scope
@@ -27,6 +27,8 @@ async def audit_send_message(
     reply_markup: InlineKeyboardMarkup | None = None,
     parse_mode: str | None = None,
     photo: str | None = None,
+    entities: list[MessageEntity] | None = None,
+    caption_entities: list[MessageEntity] | None = None,
 ) -> bool:
     """Send a text message or photo+caption and store it to message_audit (best-effort)."""
 
@@ -42,10 +44,17 @@ async def audit_send_message(
                 photo=photo,
                 caption=text or None,
                 reply_markup=reply_markup,
-                parse_mode=parse_mode,
+                parse_mode=parse_mode if not caption_entities else None,
+                caption_entities=caption_entities,
             )
         else:
-            msg = await bot.send_message(int(tg_id), text, reply_markup=reply_markup, parse_mode=parse_mode)
+            msg = await bot.send_message(
+                int(tg_id),
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode if not entities else None,
+                entities=entities,
+            )
         ok = True
     except TelegramForbiddenError as e:
         ok = False
