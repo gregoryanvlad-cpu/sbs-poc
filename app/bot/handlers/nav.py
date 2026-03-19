@@ -3432,6 +3432,28 @@ def _lte_summary_text(*, has_access: bool, paid: bool, sub_end: datetime | None,
     return "\n".join(lines)
 
 
+
+
+def _lte_menu_text(*, has_access: bool, sub_end: datetime | None, lte_price: int, paid: bool) -> str:
+    lines = [
+        "📶 <b>VPN LTE</b>",
+        "",
+        "Это отдельный профиль для случаев, когда обычный мобильный интернет работает нестабильно или с ограничениями.",
+        "",
+    ]
+    if has_access and sub_end:
+        lines.append(f"Статус подписки: <b>активна до {fmt_dt(sub_end)}</b>")
+        lines.append("")
+        lines.append("Ниже вы можете скопировать конфиг для Happ+ или получить новый конфиг.")
+    else:
+        lines.append("Статус подписки: <b>неактивна</b>")
+        lines.append("")
+        lines.append("Нажмите <b>«Что это?»</b>, чтобы прочитать подробную информацию о разделе.")
+        lines.append("")
+        lines.append(f"Активация на текущий цикл: <b>{lte_price} ₽</b>.")
+        if not paid:
+            lines.append("Для пользователей на пробном периоде доплата не требуется.")
+    return "\n".join(lines)
 def _lte_about_text(*, has_access: bool, sub_end: datetime | None) -> str:
     active_until_text = f"\n\n✅ LTE уже активирован для текущего цикла подписки.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
     return LTE_INFO_TEXT + active_until_text
@@ -3496,9 +3518,9 @@ async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
         )
         await _safe_cb_answer(cb)
         return
-    has_access, _, _ = await _lte_has_access(cb.from_user.id)
+    has_access, sub_end, paid = await _lte_has_access(cb.from_user.id)
     lte_price = await _lte_price_rub()
-    txt = LTE_INFO_TEXT + ("\n\n✅ LTE уже активирован для текущего цикла подписки." if has_access else f"\n\nАктивация на текущий цикл: <b>{lte_price} ₽</b>.\nДля пользователей на пробном периоде доплата не требуется.")
+    txt = _lte_menu_text(has_access=has_access, sub_end=sub_end, lte_price=lte_price, paid=paid)
     await cb.message.edit_text(txt, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
@@ -3507,8 +3529,7 @@ async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
 async def on_vpn_lte_about(cb: CallbackQuery) -> None:
     has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
     lte_price = await _lte_price_rub()
-    active_until_text = f"\n\n✅ LTE уже активирован для текущего цикла подписки.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
-    await cb.message.edit_text(LTE_INFO_TEXT + active_until_text, reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
+    await cb.message.edit_text(_lte_about_text(has_access=has_access, sub_end=sub_end), reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
     await _safe_cb_answer(cb)
 
 
