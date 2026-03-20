@@ -1763,6 +1763,7 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                         inline_keyboard=[
                             [InlineKeyboardButton(text="✅ Да", callback_data="family:bill:yes")],
                             [InlineKeyboardButton(text="❌ Нет", callback_data="family:bill:no")],
+                            [InlineKeyboardButton(text="👨‍👩‍👧‍👦 Открыть семейную группу", callback_data="vpn:family")],
                         ]
                     ),
                     parse_mode="HTML",
@@ -2754,6 +2755,62 @@ FAMILY_MAX_SEATS = 10
 FAMILY_SEAT_PRICE_DEFAULT = 100
 
 
+
+
+async def _reconcile_pending_family_payment(session, *, tg_id: int) -> bool:
+    """Best-effort activation for a paid family-group order that was not manually confirmed.
+
+    Returns True if any pending family payment was confirmed and applied.
+    """
+    from app.db.models import Payment
+    from app.services.payments.platega import PlategaClient, PlategaError
+
+    if settings.payment_provider != "platega":
+        return False
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        return False
+
+    pay = await session.scalar(
+        select(Payment)
+        .where(
+            Payment.tg_id == tg_id,
+            Payment.status == "pending",
+            Payment.provider.like("platega_family_%"),
+        )
+        .order_by(Payment.id.desc())
+        .limit(1)
+    )
+    if not pay or not pay.provider_payment_id:
+        return False
+
+    client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
+    try:
+        st = await client.get_transaction_status(transaction_id=pay.provider_payment_id)
+    except PlategaError:
+        return False
+
+    status = (st.status or "").upper()
+    if status not in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
+        return False
+
+    try:
+        seats = int((pay.provider or "").split("_")[-1])
+    except Exception:
+        seats = int(await get_app_setting_int(session, f"family_seats_pending:{tg_id}", default=0))
+    seats = max(0, min(FAMILY_MAX_SEATS, seats))
+    if seats <= 0:
+        return False
+
+    grp = await _get_or_create_family_group(session, tg_id)
+    now = utcnow()
+    base = grp.active_until if grp.active_until and grp.active_until > now else now
+    grp.active_until = base + relativedelta(months=1)
+    grp.seats_total = seats
+    await _ensure_family_profiles(session, tg_id, seats)
+    pay.status = "success"
+    await session.flush()
+    return True
+
 async def _get_family_seat_price(session, owner_tg_id: int) -> int:
     # per-user override first, then global, then default
     v = await get_app_setting_int(session, f"family_seat_price_override:{owner_tg_id}", default=0)
@@ -2820,6 +2877,16 @@ async def on_vpn_family(cb: CallbackQuery) -> None:
         owner_active = _is_sub_active(sub.end_at)
 
         grp = await _get_or_create_family_group(session, tg_id)
+        # Best-effort self-heal: if the user paid for family seats but auto-confirmation
+        # did not run, confirm the last pending family payment here.
+        try:
+            changed = await _reconcile_pending_family_payment(session, tg_id=tg_id)
+            if changed:
+                await session.commit()
+                grp = await _get_or_create_family_group(session, tg_id)
+        except Exception:
+            pass
+
         price = await _get_family_seat_price(session, tg_id)
 
         # Ensure placeholder profiles for listing
