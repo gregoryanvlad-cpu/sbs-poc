@@ -1245,8 +1245,6 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
                         .where(
                             Payment.tg_id == tg_id,
                             Payment.status == "success",
-                            Payment.amount.is_not(None),
-                            Payment.amount > 0,
                         )
                         .limit(1)
                     )
