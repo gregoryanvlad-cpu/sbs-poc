@@ -109,6 +109,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🔎 Карточка пользователя", callback_data="admin:user:inspect")
     b.button(text="💰 Цена места семьи", callback_data="admin:family_price")
     b.button(text="👥 Активные VPN-профили", callback_data="admin:vpn:active_profiles")
+    b.button(text="🗂 Пользователи по серверам", callback_data="admin:vpn:server_users")
     b.button(text="📶 Активные LTE-профили", callback_data="admin:vpn:active_lte_profiles")
     b.button(text="🌐 VPN-Region профили", callback_data="admin:regionvpn:profiles")
 
@@ -128,6 +129,9 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="💲 Цена подписки", callback_data="admin:price")
     b.button(text="📶 Цена VPN LTE", callback_data="admin:lte_price")
     b.button(text="🎁 Подарить подписку", callback_data="admin:sub:gift")
+    b.button(text="🎁 Подарить дни всем", callback_data="admin:sub:gift_days:all")
+    b.button(text="🎁 Подарить дни активным", callback_data="admin:sub:gift_days:active")
+    b.button(text="🧪 Тестовый пир Server #2", callback_data="admin:vpn:test_peer:2")
     b.button(text="📣 Рассылка всем", callback_data="admin:broadcast:all")
     b.button(text="🟢 Рассылка с подпиской", callback_data="admin:broadcast:paid")
     b.button(text="⚪️ Рассылка без подписки", callback_data="admin:broadcast:unpaid")
