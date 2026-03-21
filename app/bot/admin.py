@@ -1768,15 +1768,16 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
     st = await vpn_service.get_server_status()
     if st.get("ok"):
         cpu = st.get("cpu_load_percent")
-        act = st.get("active_peers")
-        tot = st.get("total_peers")
+        online_now = st.get("active_peers")
+        server_peers = st.get("total_peers")
         cpu_s = "—" if cpu is None else f"{cpu:.0f}%"
-        act_s = "—" if act is None else str(act)
-        tot_s = "—" if tot is None else str(tot)
+        online_s = "—" if online_now is None else str(online_now)
+        server_peers_s = "—" if server_peers is None else str(server_peers)
         text = (
             "📊 <b>Статус VPN</b>\n\n"
             f"CPU: <b>{cpu_s}</b>\n"
-            f"Активных пиров: <b>{act_s}</b>/<b>{tot_s}</b>\n\n"
+            f"Онлайн сейчас: <b>{online_s}</b>\n"
+            f"WG-пиров на сервере: <b>{server_peers_s}</b>\n\n"
             "Окно активности: последние ~3 минуты."
         )
     else:
@@ -1801,7 +1802,7 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             name = str(s.get("name") or code)
             used = int(used_map.get(code, 0))
             free = max(0, cap - used)
-            seat_lines.append(f"{code} ({name}): <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
+            seat_lines.append(f"{code} ({name}): занято мест <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
         if seat_lines:
             text += "\n\n👥 <b>Места по локациям</b>\n" + "\n".join(seat_lines)
     except Exception:
