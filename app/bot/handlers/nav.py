@@ -705,6 +705,46 @@ async def _trial_visible_for_user(tg_id: int) -> bool:
         return await is_trial_available(session, tg_id)
 
 
+def _server_code_aliases_nav(servers: list[dict], code: str) -> set[str]:
+    code_u = str(code or '').strip().upper()
+    aliases = {code_u}
+    ordinal = None
+
+    for idx, s in enumerate(servers, start=1):
+        sc = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).strip().upper()
+        if sc == code_u:
+            ordinal = idx
+            break
+        if code_u.startswith("SERVER #"):
+            try:
+                n = int(code_u.replace("SERVER #", "").strip())
+                if idx == n:
+                    ordinal = idx
+                    break
+            except Exception:
+                pass
+        if code_u.startswith("SERVER") and code_u != "SERVER":
+            try:
+                n = int(code_u.replace("SERVER", "").strip())
+                if idx == n:
+                    ordinal = idx
+                    break
+            except Exception:
+                pass
+
+    if ordinal is not None:
+        aliases.update({f"SERVER{ordinal}", f"SERVER #{ordinal}", f"NL{ordinal}"})
+        if ordinal == 1:
+            aliases.add("NL")
+
+    if code_u in {"NL", "NL1"}:
+        aliases.update({"NL", "NL1", "SERVER1", "SERVER #1"})
+    if code_u == "NL2":
+        aliases.update({"SERVER2", "SERVER #2"})
+
+    return {a for a in aliases if a}
+
+
 async def _vpn_seats_by_server_nav() -> dict[str, int]:
     """Return occupied WG slots per server from DB.
 
@@ -770,7 +810,7 @@ async def _pick_available_vpn_server(*, preferred_code: str | None = None, curre
 
     def can_use(server: dict) -> bool:
         code = str(server.get("code") or "").upper()
-        seats = int(used.get(code, 0))
+        seats = sum(int(used.get(alias, 0)) for alias in _server_code_aliases_nav(servers, code))
         cap = _vpn_capacity_limit(server)
         if current_code == code:
             return True
