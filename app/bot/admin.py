@@ -79,36 +79,73 @@ def _load_vpn_servers_admin() -> list[dict]:
 
 
 async def _vpn_seats_by_server() -> dict[str, int]:
-    """Return used seats per server_code among ACTIVE subscriptions.
+    """Return occupied WG slots per server.
 
-    We count distinct tg_id with an active WireGuard peer (is_active=True)
-    AND an active subscription (end_at > now, is_active=True).
+    Source of truth is the actual number of peers configured on each WireGuard
+    server. This is the real capacity limiter for profile allocation.
+
+    If SSH is temporarily unavailable for some server, fall back to the old DB
+    based count so the admin UI still shows something useful.
     """
     from app.db.models import VpnPeer, Subscription
-    now = datetime.now(timezone.utc)
-    # Use a single SQLAlchemy literal instance to avoid generating different
-    # bind params for the same constant in SELECT vs GROUP BY.
-    # Otherwise Postgres may throw: "column vpn_peers.server_code must appear in the GROUP BY..."
-    default_code = (os.environ.get('VPN_CODE') or 'NL').upper()
-    default_code_lit = literal(default_code)
-    async with session_scope() as session:
-        q = (
-            select(
-                func.coalesce(VpnPeer.server_code, default_code_lit).label('code'),
-                func.count(func.distinct(VpnPeer.tg_id)).label('cnt'),
+
+    servers = _load_vpn_servers_admin()
+    result: dict[str, int] = {}
+
+    async def _fetch(server: dict) -> tuple[str, int | None]:
+        code = str(server.get('code') or os.environ.get('VPN_CODE', 'NL')).upper()
+        try:
+            st = await vpn_service.get_server_status_for(
+                host=str(server.get('host') or ''),
+                port=int(server.get('port') or 22),
+                user=str(server.get('user') or ''),
+                password=server.get('password'),
+                interface=str(server.get('interface') or os.environ.get('VPN_INTERFACE', 'wg0')),
             )
-            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
-            .where(
-                VpnPeer.is_active == True,  # noqa: E712
-                Subscription.is_active == True,  # noqa: E712
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
+            total = st.get('total_peers')
+            if total is None:
+                return code, None
+            return code, int(total)
+        except Exception:
+            return code, None
+
+    ready_servers = [s for s in servers if s.get('host') and s.get('user')]
+    if ready_servers:
+        rows = await asyncio.gather(*[_fetch(s) for s in ready_servers], return_exceptions=False)
+        for code, total in rows:
+            if total is not None:
+                result[code] = int(total)
+
+    missing_codes = {
+        str(s.get('code') or os.environ.get('VPN_CODE', 'NL')).upper()
+        for s in servers
+        if str(s.get('code') or os.environ.get('VPN_CODE', 'NL')).upper() not in result
+    }
+    if missing_codes:
+        now = datetime.now(timezone.utc)
+        default_code = (os.environ.get('VPN_CODE') or 'NL').upper()
+        default_code_lit = literal(default_code)
+        async with session_scope() as session:
+            q = (
+                select(
+                    func.coalesce(VpnPeer.server_code, default_code_lit).label('code'),
+                    func.count(func.distinct(VpnPeer.tg_id)).label('cnt'),
+                )
+                .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
+                .where(
+                    VpnPeer.is_active == True,  # noqa: E712
+                    Subscription.is_active == True,  # noqa: E712
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at > now,
+                )
+                .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
             )
-            .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
-        )
-        res = await session.execute(q)
-        rows = res.all()
-    return {str(code).upper(): int(cnt) for code, cnt in rows}
+            res = await session.execute(q)
+            db_rows = {str(code).upper(): int(cnt) for code, cnt in res.all()}
+        for code in missing_codes:
+            result.setdefault(code, int(db_rows.get(code, 0)))
+
+    return result
 def _region_service() -> RegionVpnService:
     return RegionVpnService(
         ssh_host=settings.region_ssh_host,
