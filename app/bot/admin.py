@@ -1867,7 +1867,9 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
 
     if message.photo:
         photo = message.photo[-1].file_id
-        payload = _message_html_caption(message)
+        # Важно: при отправке с entities нельзя подставлять html_caption,
+        # потому что offsets у caption_entities рассчитаны для исходного raw caption.
+        payload = (message.caption or "").strip()
         caption_entities = list(message.caption_entities or []) or None
         if not payload:
             await message.answer(
@@ -1876,7 +1878,9 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
             )
             return
     else:
-        payload = _message_html_text(message)
+        # Аналогично для текста: либо raw text + entities, либо HTML без entities.
+        # Здесь используем raw text, чтобы корректно сохранить форматирование.
+        payload = (message.text or "").strip()
         entities = list(message.entities or []) or None
         if not payload:
             await message.answer(
@@ -1949,7 +1953,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
             )
         else:
             res = await session.execute(select(User.tg_id).order_by(User.created_at.asc()))
-        targets = [int(x) for x in res.scalars().all()]
+        targets = list(dict.fromkeys(int(x) for x in res.scalars().all()))
 
     for target in targets:
         try:
