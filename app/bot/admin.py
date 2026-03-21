@@ -402,6 +402,10 @@ class AdminGiftSubFSM(StatesGroup):
     waiting_months = State()
 
 
+class AdminGiftDaysFSM(StatesGroup):
+    waiting_days = State()
+
+
 class AdminBroadcastFSM(StatesGroup):
     waiting_target = State()
     waiting_text = State()
@@ -569,6 +573,17 @@ def _kb_admin_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")]]
     )
+
+
+def _kb_server_users_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    servers = _load_vpn_servers_admin()
+    for idx, s in enumerate(servers, start=1):
+        name = str(s.get("name") or s.get("code") or f"Server #{idx}")
+        b.button(text=f"👥 Server #{idx} — {name}", callback_data=f"admin:vpn:server_users:{idx}")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    b.adjust(1)
+    return b.as_markup()
 
 
 def _kb_home_menu() -> InlineKeyboardMarkup:
@@ -2103,6 +2118,87 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:server_users")
+async def admin_vpn_server_users_menu(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    text = "🗂 <b>Пользователи по серверам</b>\n\nВыберите сервер."
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_server_users_menu(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_server_users_menu(), parse_mode="HTML")
+        else:
+            raise
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:vpn:server_users:"))
+async def admin_vpn_server_users_list(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        idx = int((cb.data or '').split(':')[-1])
+    except Exception:
+        idx = 1
+    servers = _load_vpn_servers_admin()
+    if idx < 1 or idx > len(servers):
+        await cb.message.answer("⚠️ Сервер не найден.", reply_markup=_kb_server_users_menu())
+        return
+    srv = servers[idx-1]
+    code = str(srv.get('code') or os.environ.get('VPN_CODE', 'NL')).upper()
+    aliases = {code}
+    if code == 'NL1':
+        aliases.add('NL')
+    elif code == 'NL':
+        aliases.add('NL1')
+
+    from app.db.models.vpn_peer import VpnPeer
+    from app.db.models.subscription import Subscription
+    now = datetime.now(timezone.utc)
+    async with session_scope() as session:
+        q = (
+            select(VpnPeer, Subscription)
+            .outerjoin(Subscription, Subscription.tg_id == VpnPeer.tg_id)
+            .where(VpnPeer.is_active == True, func.coalesce(func.upper(VpnPeer.server_code), literal('NL')).in_(list(aliases)))  # noqa: E712
+            .order_by(VpnPeer.tg_id.asc(), VpnPeer.id.asc())
+            .limit(200)
+        )
+        rows = (await session.execute(q)).all()
+
+    text_lines = [f"🗂 <b>Пользователи { _server_numbered_label(servers, code) }</b>", ""]
+    if not rows:
+        text_lines.append("Сейчас на этом сервере нет активных VPN-профилей в БД.")
+    else:
+        tg_ids = sorted({int(row.tg_id) for row, _sub in rows})[:200]
+        try:
+            labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in tg_ids], return_exceptions=True)
+            label_map = {tid: (f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)) for tid, lbl in zip(tg_ids, labels)}
+        except Exception:
+            label_map = {}
+        text_lines.append(f"Всего VPN-профилей: <b>{len(rows)}</b>")
+        text_lines.append("")
+        for n, (row, sub) in enumerate(rows[:100], start=1):
+            who = label_map.get(int(row.tg_id)) or f"ID {row.tg_id}"
+            sub_active = bool(sub and getattr(sub, 'is_active', False) and getattr(sub, 'end_at', None) and sub.end_at > now)
+            text_lines.append(
+                f"{n}. {who} | <code>{row.client_ip}</code> | sub {'✅' if sub_active else '—'} | id <code>{row.tg_id}</code>"
+            )
+        if len(rows) > 100:
+            text_lines.append("")
+            text_lines.append(f"Показано: <b>100</b> из <b>{len(rows)}</b>")
+    try:
+        await cb.message.edit_text("\n".join(text_lines), reply_markup=_kb_server_users_menu(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer("\n".join(text_lines), reply_markup=_kb_server_users_menu(), parse_mode="HTML")
         else:
             raise
 
