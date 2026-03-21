@@ -78,6 +78,16 @@ def _load_vpn_servers_admin() -> list[dict]:
     }]
 
 
+def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool = True) -> str:
+    code_u = (code or '').upper()
+    for idx, s in enumerate(servers, start=1):
+        sc = str(s.get('code') or os.environ.get('VPN_CODE', 'NL')).upper()
+        if sc == code_u:
+            name = str(s.get('name') or sc)
+            return f"Server #{idx} — {name}" if include_name else f"#{idx}"
+    return code_u or '—'
+
+
 async def _vpn_seats_by_server() -> dict[str, int]:
     """Return occupied WG slots per server.
 
@@ -877,6 +887,7 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
         for p in peers:
             active_txt = '✅' if p.is_active else '⛔️'
             code = (p.server_code or '—').upper() if p.server_code else '—'
+            srv_label = _server_numbered_label(servers, code)
             vpn_ip = p.client_ip or '—'
             ep = endpoints_by_key.get(p.client_public_key)
             ep_txt = ep if ep else '—'
@@ -885,7 +896,7 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
             if hs_ts > 0:
                 hs_txt = _fmt_dt_short(datetime.fromtimestamp(hs_ts, tz=timezone.utc))
             lines.append(
-                f"• {active_txt} peer#{p.id} | {code} | VPN-IP: <code>{vpn_ip}</code> | endpoint: <code>{ep_txt}</code> | last: {hs_txt}"
+                f"• {active_txt} peer#{p.id} | {srv_label} | VPN-IP: <code>{vpn_ip}</code> | endpoint: <code>{ep_txt}</code> | last: {hs_txt}"
             )
 
     lines.append("")
@@ -1834,12 +1845,12 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         used_map = await _vpn_seats_by_server()
         servers = _load_vpn_servers_admin()
         seat_lines: list[str] = []
-        for s in servers:
+        for idx, s in enumerate(servers, start=1):
             code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
             name = str(s.get("name") or code)
             used = int(used_map.get(code, 0))
             free = max(0, cap - used)
-            seat_lines.append(f"{code} ({name}): занято мест <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
+            seat_lines.append(f"Server #{idx} — {name}: WG-слотов <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
         if seat_lines:
             text += "\n\n👥 <b>Места по локациям</b>\n" + "\n".join(seat_lines)
     except Exception:
