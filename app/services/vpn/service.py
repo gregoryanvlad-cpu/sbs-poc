@@ -139,7 +139,17 @@ class VPNService:
         client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
-        log.info("vpn_create_extra_peer tg_id=%s ip=%s", tg_id, client_ip)
+        inherited_code = None
+        try:
+            active = await self._get_active_peer(session, tg_id)
+            if active and getattr(active, "server_code", None):
+                inherited_code = str(active.server_code).upper()
+        except Exception:
+            inherited_code = None
+        if not inherited_code:
+            inherited_code = (os.environ.get("VPN_CODE") or "NL").upper()
+
+        log.info("vpn_create_extra_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, inherited_code)
         await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
@@ -147,7 +157,7 @@ class VPNService:
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
-            server_code=None,
+            server_code=inherited_code,
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
@@ -239,7 +249,7 @@ class VPNService:
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
-            server_code=None,
+            server_code=(os.environ.get("VPN_CODE") or "NL").upper(),
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
