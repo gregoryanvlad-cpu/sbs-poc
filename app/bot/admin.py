@@ -146,15 +146,15 @@ def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool
 async def _vpn_seats_by_server() -> dict[str, int]:
     """Return occupied WG slots per server from DB.
 
-    We intentionally count active VPN peer rows with active subscriptions from DB,
-    not raw `wg show peers`, because runtime WireGuard can temporarily contain
-    stale/manual peers and must not distort admin capacity, routing or UI.
+    Occupied slot = any active VpnPeer row on that server.
+    This must include family slots, admin extra devices and other additional
+    peers, otherwise admin capacity becomes lower than the real number of
+    configured WireGuard profiles.
     """
-    from app.db.models import VpnPeer, Subscription
+    from app.db.models import VpnPeer
 
     servers = _load_vpn_servers_admin()
     result: dict[str, int] = {}
-    now = datetime.now(timezone.utc)
     default_code = (os.environ.get('VPN_CODE') or 'NL').upper()
     default_code_lit = literal(default_code)
 
@@ -164,13 +164,7 @@ async def _vpn_seats_by_server() -> dict[str, int]:
                 func.coalesce(func.upper(VpnPeer.server_code), default_code_lit).label('code'),
                 func.count(VpnPeer.id).label('cnt'),
             )
-            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
-            .where(
-                VpnPeer.is_active == True,  # noqa: E712
-                Subscription.is_active == True,  # noqa: E712
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
-            )
+            .where(VpnPeer.is_active == True)  # noqa: E712
             .group_by(func.coalesce(func.upper(VpnPeer.server_code), default_code_lit))
         )
         res = await session.execute(q)
@@ -509,7 +503,7 @@ async def admin_menu(cb: CallbackQuery) -> None:
             if cpu is not None and act is not None and tot is not None:
                 vpn_line = (
                     f"🌍 VPN: загрузка CPU ~<b>{cpu:.0f}%</b> | "
-                    f"активных пиров <b>{act}</b>/<b>{tot}</b>"
+                    f"онлайн сейчас <b>{act}</b> | WG-пиров <b>{tot}</b>"
                 )
     except Exception:
         pass
