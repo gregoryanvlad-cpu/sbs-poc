@@ -1977,6 +1977,98 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
     )
 
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:test_peer:2")
+async def admin_vpn_test_peer_server2(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer("Создаю тестовый пир…")
+    except Exception:
+        pass
+
+    from aiogram.types import BufferedInputFile
+
+    servers = _load_vpn_servers_admin()
+    if len(servers) < 2:
+        await cb.message.answer(
+            "⚠️ Server #2 не найден в VPN_SERVERS_JSON.",
+            reply_markup=_kb_admin_back(),
+        )
+        return
+
+    srv = servers[1]
+    code = str(srv.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+    host = str(srv.get("host") or "")
+    user = str(srv.get("user") or "")
+    port = int(srv.get("port") or 22)
+    password = srv.get("password")
+    interface = str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0"))
+    server_public_key = str(srv.get("server_public_key") or "")
+    endpoint = str(srv.get("endpoint") or "")
+    dns = str(srv.get("dns") or os.environ.get("VPN_DNS") or "1.1.1.1")
+
+    if not host or not user or not server_public_key or not endpoint:
+        await cb.message.answer(
+            "⚠️ Server #2 настроен не полностью. Нужны host/user/server_public_key/endpoint.",
+            reply_markup=_kb_admin_back(),
+        )
+        return
+
+    tg_id = int(cb.from_user.id)
+    try:
+        async with session_scope() as session:
+            peer = await vpn_service.ensure_peer_for_server(
+                session,
+                tg_id,
+                server_code=code,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                interface=interface,
+            )
+            try:
+                await vpn_service.ensure_rate_limit_for_server(
+                    tg_id=tg_id,
+                    ip=str(peer.get("client_ip") or ""),
+                    host=host,
+                    port=port,
+                    user=user,
+                    password=password,
+                    interface=interface,
+                )
+            except Exception:
+                pass
+            await session.commit()
+
+        conf_text = vpn_service.build_wg_conf(
+            peer,
+            user_label=f"admin-test-{tg_id}",
+            server_public_key=server_public_key,
+            endpoint=endpoint,
+            dns=dns,
+        )
+        filename = f"server2-test-{tg_id}.conf"
+        await cb.message.answer_document(
+            document=BufferedInputFile(conf_text.encode("utf-8"), filename=filename),
+            caption=(
+                f"🧪 Тестовый WireGuard-конфиг для <b>{_server_numbered_label(servers, code)}</b>\n"
+                f"IP: <code>{peer.get('client_ip')}</code>"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await cb.message.answer(
+            "⚠️ Не удалось создать тестовый пир для Server #2.\n\n"
+            f"Причина: <code>{type(e).__name__}: {str(e)[:350]}</code>",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
