@@ -4,6 +4,7 @@ import asyncio
 import re
 import os
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -15,7 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import func, select, literal, and_, or_
+from sqlalchemy import func, select, literal, and_, or_, delete
 
 from dateutil.relativedelta import relativedelta
 
@@ -24,6 +25,7 @@ from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
 from app.db.models import ReferralEarning, Subscription, User, Payment
 from app.db.models.vpn_peer import VpnPeer
+from app.db.models.family_vpn_profile import FamilyVpnProfile
 from app.db.models.lte_vpn_client import LteVpnClient
 from app.db.models import MessageAudit
 from app.db.models.payout_request import PayoutRequest
@@ -34,11 +36,13 @@ from app.db.session import session_scope
 from app.repo import get_price_rub, set_app_setting_int, get_subscription, extend_subscription, get_app_setting_int
 from app.services.referrals.service import referral_service
 from app.services.vpn.service import vpn_service
+from app.services.vpn.ssh_provider import WireGuardSSHProvider
 from app.services.regionvpn import RegionVpnService
 from app.services.lte_vpn.service import lte_vpn_service
 from app.services.message_audit import audit_send_message
 
 
+log = logging.getLogger(__name__)
 
 
 def _load_vpn_servers_admin() -> list[dict]:
@@ -178,6 +182,51 @@ async def _vpn_seats_by_server() -> dict[str, int]:
     if not servers:
         result.setdefault(default_code, 0)
     return result
+
+
+
+def _kb_admin_self_cleanup_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data="admin:vpn:self_cleanup:do")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+    ])
+
+
+def _providers_for_server_code_admin(code: str | None) -> list[WireGuardSSHProvider]:
+    servers = _load_vpn_servers_admin()
+    code_u = str(code or '').strip().upper()
+    aliases = _server_code_aliases(servers, code_u) if code_u else set()
+    providers: list[WireGuardSSHProvider] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    def _add(host: str | None, port: int | None, user: str | None, password: str | None, interface: str | None) -> None:
+        h = str(host or '').strip()
+        u = str(user or '').strip()
+        iface = str(interface or 'wg0').strip() or 'wg0'
+        prt = int(port or 22)
+        if not h or not u:
+            return
+        key = (h, prt, u, iface)
+        if key in seen:
+            return
+        seen.add(key)
+        providers.append(WireGuardSSHProvider(host=h, port=prt, user=u, password=(password or None), interface=iface))
+
+    for srv in servers:
+        srv_code = str(srv.get('code') or '').strip().upper()
+        if aliases and srv_code not in aliases:
+            continue
+        _add(srv.get('host'), srv.get('port') or 22, srv.get('user'), srv.get('password'), srv.get('interface') or 'wg0')
+
+    # fallback to default single-server env
+    _add(
+        os.environ.get('WG_SSH_HOST') or os.environ.get('VPN_SSH_HOST'),
+        int(os.environ.get('WG_SSH_PORT') or os.environ.get('VPN_SSH_PORT') or 22),
+        os.environ.get('WG_SSH_USER') or os.environ.get('VPN_SSH_USER'),
+        os.environ.get('WG_SSH_PASSWORD') or os.environ.get('VPN_SSH_PASSWORD'),
+        os.environ.get('VPN_INTERFACE') or 'wg0',
+    )
+    return providers
 
 def _region_service() -> RegionVpnService:
     return RegionVpnService(
@@ -3179,6 +3228,113 @@ async def admin_yandex_edit_waiting_links(message: Message, state: FSMContext) -
         f"Пропущено (issued/burned): {skipped}",
         reply_markup=kb_admin_menu(),
     )
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:self_cleanup")
+async def admin_vpn_self_cleanup(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+
+    tg_id = int(cb.from_user.id)
+    async with session_scope() as session:
+        fam_peer_ids = set((await session.execute(
+            select(FamilyVpnProfile.vpn_peer_id).where(
+                FamilyVpnProfile.owner_tg_id == tg_id,
+                FamilyVpnProfile.vpn_peer_id.is_not(None),
+            )
+        )).scalars().all())
+
+        q = select(VpnPeer).where(VpnPeer.tg_id == tg_id).order_by(VpnPeer.id.asc())
+        rows = list((await session.execute(q)).scalars().all())
+
+    personal = [p for p in rows if int(getattr(p, 'id', 0) or 0) not in fam_peer_ids]
+    family_cnt = len([p for p in rows if int(getattr(p, 'id', 0) or 0) in fam_peer_ids])
+    ips = [str(getattr(p, 'client_ip', '') or '') for p in personal[:10] if getattr(p, 'client_ip', None)]
+
+    text = [
+        '🧹 <b>Очистка моих личных WireGuard-профилей</b>',
+        '',
+        f'Ваш TG ID: <code>{tg_id}</code>',
+        f'Личных профилей будет удалено: <b>{len(personal)}</b>',
+        f'Семейных профилей останется: <b>{family_cnt}</b>',
+    ]
+    if ips:
+        text.append('IP личных профилей: ' + ', '.join(f'<code>{ip}</code>' for ip in ips))
+    if len(personal) > 10:
+        text.append(f'И ещё: <b>{len(personal) - 10}</b>')
+    text += [
+        '',
+        '⚠️ Будут удалены именно <b>личные</b> WG-профили из БД и с сервера.',
+        'Семейные профили эта кнопка не трогает.',
+    ]
+    try:
+        await cb.message.edit_text('\n'.join(text), reply_markup=_kb_admin_self_cleanup_confirm(), parse_mode='HTML')
+    except TelegramBadRequest as e:
+        if 'message is not modified' in str(e):
+            await cb.message.answer('\n'.join(text), reply_markup=_kb_admin_self_cleanup_confirm(), parse_mode='HTML')
+        else:
+            raise
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:self_cleanup:do")
+async def admin_vpn_self_cleanup_do(cb: CallbackQuery) -> None:
+    if not is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+
+    tg_id = int(cb.from_user.id)
+    status = await cb.message.edit_text('⏳ Удаляю ваши личные WG-профили...', reply_markup=None)
+
+    removed_db = 0
+    removed_remote = 0
+    remote_fail = 0
+    async with session_scope() as session:
+        fam_peer_ids = set((await session.execute(
+            select(FamilyVpnProfile.vpn_peer_id).where(
+                FamilyVpnProfile.owner_tg_id == tg_id,
+                FamilyVpnProfile.vpn_peer_id.is_not(None),
+            )
+        )).scalars().all())
+
+        q = select(VpnPeer).where(VpnPeer.tg_id == tg_id).order_by(VpnPeer.id.asc())
+        all_rows = list((await session.execute(q)).scalars().all())
+        personal = [p for p in all_rows if int(getattr(p, 'id', 0) or 0) not in fam_peer_ids]
+
+        for peer in personal:
+            removed_here = False
+            for provider in _providers_for_server_code_admin(getattr(peer, 'server_code', None)):
+                try:
+                    await provider.remove_peer(str(peer.client_public_key))
+                    removed_remote += 1
+                    removed_here = True
+                    break
+                except Exception:
+                    log.exception('admin_self_cleanup_remove_remote_failed tg_id=%s peer_id=%s host=%s', tg_id, getattr(peer, 'id', None), getattr(provider, 'host', None))
+            if not removed_here:
+                remote_fail += 1
+
+        peer_ids = [int(p.id) for p in personal if getattr(p, 'id', None)]
+        if peer_ids:
+            await session.execute(delete(VpnPeer).where(VpnPeer.id.in_(peer_ids)))
+            removed_db = len(peer_ids)
+        await session.commit()
+
+    text = [
+        '✅ <b>Личные WG-профили очищены</b>',
+        '',
+        f'Удалено из БД: <b>{removed_db}</b>',
+        f'Удалено с сервера: <b>{removed_remote}</b>',
+    ]
+    if remote_fail:
+        text.append(f'Не удалось снять с сервера автоматически: <b>{remote_fail}</b>')
+    text += [
+        '',
+        'Семейные профили не затронуты.',
+    ]
+    await status.edit_text('\n'.join(text), reply_markup=kb_admin_menu(), parse_mode='HTML')
+    await cb.answer('Готово')
 
 
 # ==========================
