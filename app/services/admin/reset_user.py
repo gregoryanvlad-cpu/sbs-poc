@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 
 from sqlalchemy import delete, select, update
 
@@ -21,11 +23,82 @@ from app.db.models.referral_earning import ReferralEarning
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.app_setting import AppSetting
 from app.services.vpn.service import vpn_service
+from app.services.vpn.ssh_provider import WireGuardSSHProvider
 from app.services.lte_vpn.service import lte_vpn_service
 from app.services.regionvpn.service import RegionVpnService
 from app.core.config import settings
 
 log = logging.getLogger(__name__)
+
+
+def _load_vpn_servers_reset() -> list[dict]:
+    raw = os.environ.get("VPN_SERVERS_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and isinstance(data.get("servers"), list):
+            data = data["servers"]
+        if isinstance(data, list):
+            return [dict(x) for x in data if isinstance(x, dict)]
+    except Exception:
+        log.exception("admin_reset_user_load_servers_failed")
+    return []
+
+
+def _server_aliases(code: str) -> set[str]:
+    code_u = str(code or "").strip().upper()
+    if not code_u:
+        return set()
+    aliases = {code_u, code_u.replace(" ", "")}
+    if code_u in {"NL", "NL1", "SERVER1", "SERVER #1"}:
+        aliases.update({"NL", "NL1", "SERVER1", "SERVER #1"})
+    if code_u in {"NL2", "SERVER2", "SERVER #2"}:
+        aliases.update({"NL2", "SERVER2", "SERVER #2"})
+    return {a for a in aliases if a}
+
+
+def _provider_candidates_for_peer(peer: VpnPeer) -> list[WireGuardSSHProvider]:
+    providers: list[WireGuardSSHProvider] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    def _add(host: str, port: int, user: str, password: str | None, interface: str) -> None:
+        key = (host, int(port), user, interface)
+        if key in seen or not host or not user:
+            return
+        seen.add(key)
+        providers.append(WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface))
+
+    # Current/default server provider.
+    try:
+        _add(
+            host=os.environ.get("WG_SSH_HOST", ""),
+            port=int(os.environ.get("WG_SSH_PORT", "22") or 22),
+            user=os.environ.get("WG_SSH_USER", ""),
+            password=os.environ.get("WG_SSH_PASSWORD") or None,
+            interface=os.environ.get("VPN_INTERFACE", "wg0"),
+        )
+    except Exception:
+        pass
+
+    peer_code = str(getattr(peer, "server_code", "") or "").upper()
+    aliases = _server_aliases(peer_code)
+    for srv in _load_vpn_servers_reset():
+        code = str(srv.get("code") or "").strip().upper()
+        if aliases and code not in aliases:
+            continue
+        try:
+            _add(
+                host=str(srv.get("host") or ""),
+                port=int(srv.get("port") or 22),
+                user=str(srv.get("user") or ""),
+                password=srv.get("password") or None,
+                interface=str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            )
+        except Exception:
+            log.exception("admin_reset_user_bad_server_config peer_code=%s", peer_code)
+
+    return providers
 
 
 class AdminResetUserService:
@@ -91,13 +164,26 @@ class AdminResetUserService:
                 res = await session.execute(peer_query)
                 peers = list(res.scalars().all())
                 for p in peers:
-                    try:
-                        await vpn_service.provider.remove_peer(p.client_public_key)
-                    except Exception:
-                        log.exception(
-                            "admin_reset_user_remove_peer_failed tg_id=%s peer_id=%s",
+                    removed = False
+                    for provider in _provider_candidates_for_peer(p):
+                        try:
+                            await provider.remove_peer(p.client_public_key)
+                            removed = True
+                            break
+                        except Exception:
+                            log.exception(
+                                "admin_reset_user_remove_peer_failed tg_id=%s peer_id=%s host=%s",
+                                tg_id,
+                                getattr(p, "id", None),
+                                getattr(provider, "host", None),
+                            )
+                    if not removed:
+                        log.warning(
+                            "admin_reset_user_peer_not_removed_anywhere tg_id=%s peer_id=%s pub=%s server=%s",
                             tg_id,
                             getattr(p, "id", None),
+                            getattr(p, "client_public_key", None),
+                            getattr(p, "server_code", None),
                         )
             except Exception:
                 log.exception("admin_reset_user_list_peers_failed tg_id=%s", tg_id)
