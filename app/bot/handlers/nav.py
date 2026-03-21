@@ -759,7 +759,7 @@ async def _vpn_seats_by_server_nav() -> dict[str, int]:
             q = (
                 select(
                     func.coalesce(VpnPeer.server_code, default_code_lit).label("code"),
-                    func.count(func.distinct(VpnPeer.tg_id)).label("cnt"),
+                    func.count(VpnPeer.id).label("cnt"),
                 )
                 .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
                 .where(
@@ -778,8 +778,10 @@ async def _vpn_seats_by_server_nav() -> dict[str, int]:
     return result
 
 
-def _vpn_capacity_limit() -> int:
+def _vpn_capacity_limit(server: dict | None = None) -> int:
     try:
+        if server and server.get("max_active") is not None:
+            return max(1, int(server.get("max_active")))
         return max(1, int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40))
     except Exception:
         return 40
@@ -791,7 +793,6 @@ async def _pick_available_vpn_server(*, preferred_code: str | None = None, curre
         return None
 
     used = await _vpn_seats_by_server_nav()
-    cap = _vpn_capacity_limit()
 
     current_code: str | None = None
     if current_tg_id is not None:
@@ -804,6 +805,7 @@ async def _pick_available_vpn_server(*, preferred_code: str | None = None, curre
     def can_use(server: dict) -> bool:
         code = str(server.get("code") or "").upper()
         seats = int(used.get(code, 0))
+        cap = _vpn_capacity_limit(server)
         if current_code == code:
             return True
         return seats < cap
