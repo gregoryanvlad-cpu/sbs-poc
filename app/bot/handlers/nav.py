@@ -706,29 +706,76 @@ async def _trial_visible_for_user(tg_id: int) -> bool:
 
 
 async def _vpn_seats_by_server_nav() -> dict[str, int]:
+    """Return occupied WG slots per server.
+
+    Source of truth is the actual number of WireGuard peers on each configured
+    server. This matches the real profile capacity and is what routing should
+    use when deciding whether a server still has free slots.
+
+    If a server is temporarily unreachable over SSH, we fall back to the old DB
+    based count so allocation logic does not break completely.
+    """
     from app.db.models import VpnPeer, Subscription
 
-    now = utcnow()
-    default_code = (os.environ.get("VPN_CODE") or "NL").upper()
-    default_code_lit = literal(default_code)
-    async with session_scope() as session:
-        q = (
-            select(
-                func.coalesce(VpnPeer.server_code, default_code_lit).label("code"),
-                func.count(func.distinct(VpnPeer.tg_id)).label("cnt"),
+    servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
+    result: dict[str, int] = {}
+
+    async def _fetch(server: dict) -> tuple[str, int | None]:
+        code = str(server.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+        try:
+            st = await vpn_service.get_server_status_for(
+                host=str(server.get("host") or ""),
+                port=int(server.get("port") or 22),
+                user=str(server.get("user") or ""),
+                password=server.get("password"),
+                interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
             )
-            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
-            .where(
-                VpnPeer.is_active == True,  # noqa: E712
-                Subscription.is_active == True,  # noqa: E712
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
+            total = st.get("total_peers")
+            if total is None:
+                return code, None
+            return code, int(total)
+        except Exception:
+            return code, None
+
+    if servers:
+        rows = await asyncio.gather(*[_fetch(s) for s in servers], return_exceptions=False)
+        for code, total in rows:
+            if total is not None:
+                result[code] = int(total)
+
+    missing_codes = {
+        str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+        for s in servers
+        if str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper() not in result
+    }
+    if not servers:
+        missing_codes = {(os.environ.get("VPN_CODE") or "NL").upper()}
+
+    if missing_codes:
+        now = utcnow()
+        default_code = (os.environ.get("VPN_CODE") or "NL").upper()
+        default_code_lit = literal(default_code)
+        async with session_scope() as session:
+            q = (
+                select(
+                    func.coalesce(VpnPeer.server_code, default_code_lit).label("code"),
+                    func.count(func.distinct(VpnPeer.tg_id)).label("cnt"),
+                )
+                .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
+                .where(
+                    VpnPeer.is_active == True,  # noqa: E712
+                    Subscription.is_active == True,  # noqa: E712
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at > now,
+                )
+                .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
             )
-            .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
-        )
-        res = await session.execute(q)
-        rows = res.all()
-    return {str(code).upper(): int(cnt) for code, cnt in rows}
+            res = await session.execute(q)
+            db_rows = {str(code).upper(): int(cnt) for code, cnt in res.all()}
+        for code in missing_codes:
+            result.setdefault(code, int(db_rows.get(code, 0)))
+
+    return result
 
 
 def _vpn_capacity_limit() -> int:
