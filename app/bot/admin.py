@@ -80,9 +80,12 @@ def _load_vpn_servers_admin() -> list[dict]:
 
 def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool = True) -> str:
     code_u = (code or '').upper()
+    aliases = {code_u}
+    if code_u == 'NL':
+        aliases.add('NL1')
     for idx, s in enumerate(servers, start=1):
         sc = str(s.get('code') or os.environ.get('VPN_CODE', 'NL')).upper()
-        if sc == code_u:
+        if sc in aliases:
             name = str(s.get('name') or sc)
             return f"Server #{idx} — {name}" if include_name else f"#{idx}"
     return code_u or '—'
@@ -1837,11 +1840,6 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
 
     # Seats (capacity) by server/location: считаем по БД, поэтому показываем даже если SSH недоступен.
     try:
-        cap = int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40)
-    except Exception:
-        cap = 40
-
-    try:
         used_map = await _vpn_seats_by_server()
         servers = _load_vpn_servers_admin()
         seat_lines: list[str] = []
@@ -1849,6 +1847,10 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
             code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
             name = str(s.get("name") or code)
             used = int(used_map.get(code, 0))
+            try:
+                cap = max(1, int(s.get("max_active") if s.get("max_active") is not None else os.environ.get("VPN_MAX_ACTIVE", "40")))
+            except Exception:
+                cap = 40
             free = max(0, cap - used)
             seat_lines.append(f"Server #{idx} — {name}: WG-слотов <b>{used}</b>/{cap} | свободно: <b>{free}</b>")
         if seat_lines:
