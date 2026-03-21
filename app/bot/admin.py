@@ -2035,7 +2035,7 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         for idx, s in enumerate(servers, start=1):
             code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
             name = str(s.get("name") or code)
-            used = int(used_map.get(code, 0))
+            used = sum(int(used_map.get(alias, 0)) for alias in _server_code_aliases(servers, code))
             try:
                 cap = max(1, int(s.get("max_active") if s.get("max_active") is not None else os.environ.get("VPN_MAX_ACTIVE", "40")))
             except Exception:
