@@ -748,14 +748,12 @@ def _server_code_aliases_nav(servers: list[dict], code: str) -> set[str]:
 async def _vpn_seats_by_server_nav() -> dict[str, int]:
     """Return occupied WG slots per server from DB.
 
-    Routing decisions must be based on active DB profiles with active
-    subscriptions, not on raw runtime peers from `wg show`, because runtime can
-    temporarily include stale/manual peers and otherwise overfill or misroute.
+    Routing must respect every active configured WG profile, including family
+    slots and admin extra devices, so we count active VpnPeer rows directly.
     """
-    from app.db.models import VpnPeer, Subscription
+    from app.db.models import VpnPeer
 
     servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
-    now = utcnow()
     default_code = (os.environ.get("VPN_CODE") or "NL").upper()
     default_code_lit = literal(default_code)
 
@@ -765,13 +763,7 @@ async def _vpn_seats_by_server_nav() -> dict[str, int]:
                 func.coalesce(func.upper(VpnPeer.server_code), default_code_lit).label("code"),
                 func.count(VpnPeer.id).label("cnt"),
             )
-            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
-            .where(
-                VpnPeer.is_active == True,  # noqa: E712
-                Subscription.is_active == True,  # noqa: E712
-                Subscription.end_at.is_not(None),
-                Subscription.end_at > now,
-            )
+            .where(VpnPeer.is_active == True)  # noqa: E712
             .group_by(func.coalesce(func.upper(VpnPeer.server_code), default_code_lit))
         )
         res = await session.execute(q)
