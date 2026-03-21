@@ -1653,6 +1653,107 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
     )
 
 
+
+
+@router.callback_query(lambda c: (c.data or "") in {"admin:sub:gift_days:all", "admin:sub:gift_days:active"})
+async def admin_sub_gift_days_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    mode = "active" if (cb.data or "").endswith(":active") else "all"
+    await state.clear()
+    await state.update_data(gift_days_mode=mode)
+    await state.set_state(AdminGiftDaysFSM.waiting_days)
+
+    title = "активным" if mode == "active" else "всем"
+    text = (
+        f"🎁 <b>Подарить дни {title}</b>\n\n"
+        "Введите количество дней целым числом, например: <code>3</code> или <code>7</code>.\n\n"
+        "⬅️ Для отмены нажмите «Назад»."
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+    await cb.answer()
+
+
+@router.message(AdminGiftDaysFSM.waiting_days)
+async def admin_sub_gift_days_finish(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    raw = re.sub(r"[^0-9]", "", (message.text or "").strip())
+    if not raw:
+        await message.answer("❌ Введите количество дней числом, например: 3", reply_markup=_kb_admin_back())
+        return
+
+    try:
+        days = int(raw)
+    except Exception:
+        await message.answer("❌ Введите количество дней числом, например: 3", reply_markup=_kb_admin_back())
+        return
+
+    if days <= 0 or days > 3650:
+        await message.answer("❌ Укажите от 1 до 3650 дней.", reply_markup=_kb_admin_back())
+        return
+
+    data = await state.get_data()
+    mode = str(data.get("gift_days_mode") or "all")
+    now = _utcnow()
+
+    async with session_scope() as session:
+        if mode == "active":
+            rows = await session.execute(
+                select(Subscription.tg_id).where(
+                    Subscription.is_active == True,
+                    Subscription.end_at.is_not(None),
+                    Subscription.end_at > now,
+                )
+            )
+            target_ids = [int(x) for x in rows.scalars().all()]
+        else:
+            rows = await session.execute(select(User.tg_id))
+            target_ids = [int(x) for x in rows.scalars().all()]
+
+        touched = 0
+        activated = 0
+        for tg_id in target_ids:
+            sub = await session.get(Subscription, tg_id)
+            if not sub:
+                sub = await get_subscription(session, tg_id)
+
+            was_active = bool(sub.is_active and sub.end_at and sub.end_at > now)
+            base = sub.end_at if sub.end_at and sub.end_at > now else now
+            sub.end_at = base + timedelta(days=days)
+            if not sub.start_at:
+                sub.start_at = now
+            sub.is_active = True
+            sub.status = "active"
+            touched += 1
+            if not was_active:
+                activated += 1
+
+        await session.commit()
+
+    await state.clear()
+
+    mode_label = "активным пользователям" if mode == "active" else "всем пользователям"
+    await message.answer(
+        "✅ Дни подарены.\n\n"
+        f"Кому: <b>{mode_label}</b>\n"
+        f"Дней: <b>{days}</b>\n"
+        f"Обработано пользователей: <b>{touched}</b>\n"
+        f"Продлено подписок: <b>{touched}</b>\n"
+        f"Из них были неактивны и стали активны: <b>{activated}</b>",
+        reply_markup=kb_admin_menu(),
+        parse_mode="HTML",
+    )
+
 @router.callback_query(lambda c: c.data == "admin:broadcast:all")
 async def admin_broadcast_all_start(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(cb.from_user.id):
