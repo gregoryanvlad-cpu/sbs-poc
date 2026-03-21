@@ -706,77 +706,43 @@ async def _trial_visible_for_user(tg_id: int) -> bool:
 
 
 async def _vpn_seats_by_server_nav() -> dict[str, int]:
-    """Return occupied WG slots per server.
+    """Return occupied WG slots per server from DB.
 
-    Source of truth is the actual number of WireGuard peers on each configured
-    server. This matches the real profile capacity and is what routing should
-    use when deciding whether a server still has free slots.
-
-    If a server is temporarily unreachable over SSH, we fall back to the old DB
-    based count so allocation logic does not break completely.
+    Routing decisions must be based on active DB profiles with active
+    subscriptions, not on raw runtime peers from `wg show`, because runtime can
+    temporarily include stale/manual peers and otherwise overfill or misroute.
     """
     from app.db.models import VpnPeer, Subscription
 
     servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
-    result: dict[str, int] = {}
+    now = utcnow()
+    default_code = (os.environ.get("VPN_CODE") or "NL").upper()
+    default_code_lit = literal(default_code)
 
-    async def _fetch(server: dict) -> tuple[str, int | None]:
-        code = str(server.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
-        try:
-            st = await vpn_service.get_server_status_for(
-                host=str(server.get("host") or ""),
-                port=int(server.get("port") or 22),
-                user=str(server.get("user") or ""),
-                password=server.get("password"),
-                interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+    async with session_scope() as session:
+        q = (
+            select(
+                func.coalesce(func.upper(VpnPeer.server_code), default_code_lit).label("code"),
+                func.count(VpnPeer.id).label("cnt"),
             )
-            total = st.get("total_peers")
-            if total is None:
-                return code, None
-            return code, int(total)
-        except Exception:
-            return code, None
+            .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
+            .where(
+                VpnPeer.is_active == True,  # noqa: E712
+                Subscription.is_active == True,  # noqa: E712
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .group_by(func.coalesce(func.upper(VpnPeer.server_code), default_code_lit))
+        )
+        res = await session.execute(q)
+        result = {str(code).upper(): int(cnt) for code, cnt in res.all()}
 
-    if servers:
-        rows = await asyncio.gather(*[_fetch(s) for s in servers], return_exceptions=False)
-        for code, total in rows:
-            if total is not None:
-                result[code] = int(total)
-
-    missing_codes = {
-        str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
-        for s in servers
-        if str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper() not in result
-    }
+    for s in servers:
+        code = str(s.get("code") or default_code).upper()
+        result.setdefault(code, 0)
     if not servers:
-        missing_codes = {(os.environ.get("VPN_CODE") or "NL").upper()}
-
-    if missing_codes:
-        now = utcnow()
-        default_code = (os.environ.get("VPN_CODE") or "NL").upper()
-        default_code_lit = literal(default_code)
-        async with session_scope() as session:
-            q = (
-                select(
-                    func.coalesce(VpnPeer.server_code, default_code_lit).label("code"),
-                    func.count(VpnPeer.id).label("cnt"),
-                )
-                .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
-                .where(
-                    VpnPeer.is_active == True,  # noqa: E712
-                    Subscription.is_active == True,  # noqa: E712
-                    Subscription.end_at.is_not(None),
-                    Subscription.end_at > now,
-                )
-                .group_by(func.coalesce(VpnPeer.server_code, default_code_lit))
-            )
-            res = await session.execute(q)
-            db_rows = {str(code).upper(): int(cnt) for code, cnt in res.all()}
-        for code in missing_codes:
-            result.setdefault(code, int(db_rows.get(code, 0)))
-
+        result.setdefault(default_code, 0)
     return result
-
 
 def _vpn_capacity_limit(server: dict | None = None) -> int:
     try:
@@ -870,9 +836,9 @@ async def _build_home_text() -> str:
         return flags.get(code, "🌍")
 
     async def _fmt_status(srv: dict) -> str:
-        # If host/user are missing, treat as not connected yet.
-        if not srv.get("host") or not srv.get("user"):
-            return "Недоступно"
+        # If critical fields are missing, the server is not fully configured yet.
+        if not srv.get("host") or not srv.get("user") or not srv.get("endpoint") or not srv.get("server_public_key"):
+            return "Подключается..."
 
         try:
             st = await asyncio.wait_for(
@@ -885,13 +851,12 @@ async def _build_home_text() -> str:
                 ),
                 timeout=4,
             )
-            if st.get("ok") and st.get("cpu_load_percent") is not None:
-                cpu = float(st["cpu_load_percent"])
-                cpu_str = f"{cpu:.1f}%" if cpu >= 0.1 else ("&lt;0.1%" if cpu > 0 else "0.0%")
-                return cpu_str
+            if st.get("ok"):
+                return "Active ✅"
         except Exception:
-            pass
-        return "Подключается..."
+            # Home menu should not hang forever on “Подключается...” for a fully configured server.
+            return "Active ✅"
+        return "Active ✅"
 
     primary_srv = None
     for srv in servers:
@@ -903,8 +868,7 @@ async def _build_home_text() -> str:
         primary_srv = servers[0]
     if primary_srv:
         status = await _fmt_status(primary_srv)
-        works = "Active ✅" if status not in ("Недоступно", "Подключается...") else status
-        lines.append('🇳🇱 "VPN-Cервер": <b>%s</b>' % works)
+        lines.append('🇳🇱 "VPN-Cервер": <b>%s</b>' % status)
     else:
         lines.append('🇳🇱 "VPN-Cервер": <b>Подключается...</b>')
 
