@@ -105,6 +105,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="📊 Статус VPN", callback_data="admin:vpn:status")
     b.button(text="🕒 WG grace (24ч)", callback_data="admin:vpn:grace")
     b.button(text="➕ Админу доп. устройства", callback_data="admin:vpn:extra")
+    b.button(text="🧹 Очистить мои личные WG", callback_data="admin:vpn:self_cleanup")
     b.button(text="👤 Все пользователи", callback_data="admin:users")
     b.button(text="🔎 Карточка пользователя", callback_data="admin:user:inspect")
     b.button(text="💰 Цена места семьи", callback_data="admin:family_price")
