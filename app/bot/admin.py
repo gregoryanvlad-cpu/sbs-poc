@@ -78,6 +78,54 @@ def _load_vpn_servers_admin() -> list[dict]:
     }]
 
 
+
+
+def _server_code_aliases(servers: list[dict], code: str) -> set[str]:
+    """Return DB aliases for the same logical server code.
+
+    We have legacy data where the first/second server could be stored as
+    NL/NL1/NL2, SERVER1/SERVER2 or SERVER #1/SERVER #2.
+    This helper keeps admin views consistent across those historical values.
+    """
+    code_u = str(code or '').strip().upper()
+    if not code_u:
+        return set()
+
+    aliases = {code_u}
+    compact = code_u.replace(' ', '')
+    aliases.add(compact)
+
+    # Determine server ordinal from configured servers, when possible.
+    ordinal = None
+    for idx, s in enumerate(servers, start=1):
+        if str(s.get('code') or '').strip().upper() == code_u:
+            ordinal = idx
+            break
+
+    if ordinal is None:
+        if code_u.startswith('NL') and code_u[2:].isdigit():
+            ordinal = int(code_u[2:])
+        elif code_u == 'NL':
+            ordinal = 1
+        else:
+            digits = ''.join(ch for ch in code_u if ch.isdigit())
+            if digits:
+                try:
+                    ordinal = int(digits)
+                except Exception:
+                    ordinal = None
+
+    if ordinal is not None:
+        aliases.update({f'SERVER{ordinal}', f'SERVER #{ordinal}', f'NL{ordinal}'})
+        if ordinal == 1:
+            aliases.add('NL')
+
+    if code_u in {'NL', 'NL1'}:
+        aliases.update({'NL', 'NL1', 'SERVER1', 'SERVER #1'})
+    if code_u == 'NL2':
+        aliases.update({'SERVER2', 'SERVER #2'})
+
+    return {a for a in aliases if a}
 def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool = True) -> str:
     code_u = (code or '').upper()
     aliases = {code_u}
@@ -2274,14 +2322,12 @@ async def admin_vpn_server_users_list(cb: CallbackQuery) -> None:
         return
     srv = servers[idx-1]
     code = str(srv.get('code') or os.environ.get('VPN_CODE', 'NL')).upper()
-    aliases = {code}
-    if code == 'NL1':
-        aliases.add('NL')
-    elif code == 'NL':
-        aliases.add('NL1')
+    aliases = _server_code_aliases(servers, code)
 
     from app.db.models.vpn_peer import VpnPeer
     from app.db.models.subscription import Subscription
+    from app.db.models.family_vpn_profile import FamilyVpnProfile
+
     now = datetime.now(timezone.utc)
     async with session_scope() as session:
         q = (
@@ -2289,31 +2335,91 @@ async def admin_vpn_server_users_list(cb: CallbackQuery) -> None:
             .outerjoin(Subscription, Subscription.tg_id == VpnPeer.tg_id)
             .where(VpnPeer.is_active == True, func.coalesce(func.upper(VpnPeer.server_code), literal('NL')).in_(list(aliases)))  # noqa: E712
             .order_by(VpnPeer.tg_id.asc(), VpnPeer.id.asc())
-            .limit(200)
+            .limit(500)
         )
         rows = (await session.execute(q)).all()
+        peer_ids = [int(row.id) for row, _sub in rows]
+        family_rows = []
+        if peer_ids:
+            family_rows = list((await session.execute(
+                select(FamilyVpnProfile).where(FamilyVpnProfile.vpn_peer_id.in_(peer_ids))
+            )).scalars().all())
 
     text_lines = [f"🗂 <b>Пользователи { _server_numbered_label(servers, code) }</b>", ""]
     if not rows:
         text_lines.append("Сейчас на этом сервере нет активных VPN-профилей в БД.")
     else:
-        tg_ids = sorted({int(row.tg_id) for row, _sub in rows})[:200]
+        tg_ids = sorted({int(row.tg_id) for row, _sub in rows})[:300]
         try:
             labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in tg_ids], return_exceptions=True)
             label_map = {tid: (f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)) for tid, lbl in zip(tg_ids, labels)}
         except Exception:
             label_map = {}
-        text_lines.append(f"Всего VPN-профилей: <b>{len(rows)}</b>")
+
+        family_by_peer_id = {int(fp.vpn_peer_id): fp for fp in family_rows if getattr(fp, 'vpn_peer_id', None)}
+        by_user: dict[int, dict] = {}
+        family_total = 0
+        for row, sub in rows:
+            tg_id = int(row.tg_id)
+            bucket = by_user.setdefault(tg_id, {
+                'rows': [],
+                'active_sub': False,
+                'family_profiles': [],
+                'personal_profiles': [],
+            })
+            bucket['rows'].append(row)
+            if sub and getattr(sub, 'is_active', False) and getattr(sub, 'end_at', None) and sub.end_at > now:
+                bucket['active_sub'] = True
+            fp = family_by_peer_id.get(int(row.id))
+            if fp is not None:
+                bucket['family_profiles'].append((row, fp))
+                family_total += 1
+            else:
+                bucket['personal_profiles'].append(row)
+
+        extra_total = 0
+        for info in by_user.values():
+            personal_cnt = len(info['personal_profiles'])
+            if personal_cnt > 1:
+                extra_total += personal_cnt - 1
+
+        text_lines.append(f"Пользователей: <b>{len(by_user)}</b>")
+        text_lines.append(f"Всего WG-профилей: <b>{len(rows)}</b>")
+        text_lines.append(f"Семейных профилей: <b>{family_total}</b>")
+        text_lines.append(f"Доп. устройств: <b>{extra_total}</b>")
         text_lines.append("")
-        for n, (row, sub) in enumerate(rows[:100], start=1):
-            who = label_map.get(int(row.tg_id)) or f"ID {row.tg_id}"
-            sub_active = bool(sub and getattr(sub, 'is_active', False) and getattr(sub, 'end_at', None) and sub.end_at > now)
+
+        items = sorted(by_user.items(), key=lambda kv: (-(len(kv[1]['rows'])), kv[0]))
+        for n, (tg_id, info) in enumerate(items[:100], start=1):
+            who = label_map.get(tg_id) or f"ID {tg_id}"
+            personal_cnt = len(info['personal_profiles'])
+            family_cnt = len(info['family_profiles'])
+            parts = []
+            if personal_cnt > 0:
+                parts.append(f"личных: {personal_cnt}")
+            if family_cnt > 0:
+                parts.append(f"семейных: {family_cnt}")
+            details = ', '.join(parts) if parts else 'профилей: 0'
+
+            personal_ips = [r.client_ip for r in info['personal_profiles'][:3]]
+            family_desc = []
+            for _r, fp in sorted(info['family_profiles'], key=lambda x: int(x[1].slot_no or 0))[:3]:
+                slot_no = int(fp.slot_no or 0)
+                label = (fp.label or '').strip()
+                family_desc.append(f"#{slot_no}{' ' + label if label else ''}".strip())
+            detail_tail = []
+            if personal_ips:
+                detail_tail.append("IP: " + ', '.join(f"<code>{ip}</code>" for ip in personal_ips))
+            if family_desc:
+                detail_tail.append("Семья: " + ', '.join(family_desc))
+            tail = f" | {' | '.join(detail_tail)}" if detail_tail else ''
+
             text_lines.append(
-                f"{n}. {who} | <code>{row.client_ip}</code> | sub {'✅' if sub_active else '—'} | id <code>{row.tg_id}</code>"
+                f"{n}. {who} | {details} | sub {'✅' if info['active_sub'] else '—'} | id <code>{tg_id}</code>{tail}"
             )
-        if len(rows) > 100:
+        if len(items) > 100:
             text_lines.append("")
-            text_lines.append(f"Показано: <b>100</b> из <b>{len(rows)}</b>")
+            text_lines.append(f"Показано: <b>100</b> из <b>{len(items)}</b> пользователей")
     try:
         await cb.message.edit_text("\n".join(text_lines), reply_markup=_kb_server_users_menu(), parse_mode="HTML")
     except TelegramBadRequest as e:
