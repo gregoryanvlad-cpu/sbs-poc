@@ -139,7 +139,7 @@ async def _vpn_seats_by_server() -> dict[str, int]:
             q = (
                 select(
                     func.coalesce(VpnPeer.server_code, default_code_lit).label('code'),
-                    func.count(func.distinct(VpnPeer.tg_id)).label('cnt'),
+                    func.count(VpnPeer.id).label('cnt'),
                 )
                 .join(Subscription, Subscription.tg_id == VpnPeer.tg_id)
                 .where(
@@ -1994,6 +1994,7 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
 
     peer_rows: dict[str, VpnPeer] = {}
     subs_by_tg: dict[int, Subscription] = {}
+    servers = _load_vpn_servers_admin()
 
     async with session_scope() as session:
         res = await session.execute(
@@ -2037,8 +2038,13 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
         age_s = "—" if age is None else f"{int(age)}s"
         shown += 1
         who = tg_label.get(int(row.tg_id)) or f"ID {row.tg_id}"
+        code = (row.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+        srv_label = _server_numbered_label(servers, code)
         # keep tg_id in the end for unambiguous matching
-        lines.append(f"{shown}. {who} | <code>{row.client_public_key[:8]}…</code> | {row.client_ip} | sub {sub_state} | hs {age_s} | id <code>{row.tg_id}</code>")
+        lines.append(
+            f"{shown}. {who} | {srv_label} | <code>{row.client_public_key[:8]}…</code> | "
+            f"{row.client_ip} | sub {sub_state} | hs {age_s} | id <code>{row.tg_id}</code>"
+        )
         if shown >= 25:
             break
 
