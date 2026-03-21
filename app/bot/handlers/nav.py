@@ -893,9 +893,16 @@ async def _build_home_text() -> str:
             pass
         return "Подключается..."
 
-    nl_srv = next((srv for srv in servers if str(srv.get("code") or "").upper() == "NL"), None)
-    if nl_srv:
-        status = await _fmt_status(nl_srv)
+    primary_srv = None
+    for srv in servers:
+        code = str(srv.get("code") or "").upper()
+        if code in ("NL", "NL1"):
+            primary_srv = srv
+            break
+    if primary_srv is None and servers:
+        primary_srv = servers[0]
+    if primary_srv:
+        status = await _fmt_status(primary_srv)
         works = "Active ✅" if status not in ("Недоступно", "Подключается...") else status
         lines.append('🇳🇱 "VPN-Cервер": <b>%s</b>' % works)
     else:
