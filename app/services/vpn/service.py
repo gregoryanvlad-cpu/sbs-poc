@@ -211,13 +211,14 @@ class VPNService:
                 canonical_for_alias[str(alias).upper()] = code
             canonical_for_alias.setdefault(code, code)
 
+        code_expr = func.coalesce(func.upper(VpnPeer.server_code), default_code)
         q = (
             select(
-                func.coalesce(func.upper(VpnPeer.server_code), literal(default_code)).label("code"),
+                code_expr.label("code"),
                 func.count(VpnPeer.id).label("cnt"),
             )
             .where(VpnPeer.is_active == True)  # noqa: E712
-            .group_by(func.coalesce(func.upper(VpnPeer.server_code), literal(default_code)))
+            .group_by(code_expr)
         )
         res = await session.execute(q)
         for raw_code, cnt in res.all():
