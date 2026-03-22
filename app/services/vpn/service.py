@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
-from sqlalchemy import select, text
+from sqlalchemy import select, text, func, literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.vpn_peer import VpnPeer
