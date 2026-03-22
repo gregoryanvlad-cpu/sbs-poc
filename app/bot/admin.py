@@ -144,12 +144,11 @@ def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool
 
 
 async def _vpn_seats_by_server() -> dict[str, int]:
-    """Return occupied WG slots per server from DB.
+    """Return occupied WG slots per server using strict WG peer counts.
 
-    Occupied slot = any active VpnPeer row on that server.
-    This must include family slots, admin extra devices and other additional
-    peers, otherwise admin capacity becomes lower than the real number of
-    configured WireGuard profiles.
+    Admin capacity must reflect the real peer count on WireGuard. We therefore
+    start with DB counts and then, when SSH is available, raise each server
+    occupancy up to the actual peer count returned by wg show.
     """
     from app.db.models import VpnPeer
 
@@ -173,6 +172,26 @@ async def _vpn_seats_by_server() -> dict[str, int]:
     for s in servers:
         code = str(s.get('code') or default_code).upper()
         result.setdefault(code, 0)
+
+    for s in servers:
+        code = str(s.get('code') or default_code).upper()
+        host = str(s.get('host') or '').strip()
+        user = str(s.get('user') or '').strip()
+        if not host or not user:
+            continue
+        try:
+            st = await vpn_service.get_server_status_for(
+                host=host,
+                port=int(s.get('port') or 22),
+                user=user,
+                password=s.get('password'),
+                interface=str(s.get('interface') or os.environ.get('VPN_INTERFACE', 'wg0')),
+            )
+            if st.get('ok') and st.get('total_peers') is not None:
+                result[code] = max(int(result.get(code, 0)), int(st.get('total_peers') or 0))
+        except Exception:
+            pass
+
     if not servers:
         result.setdefault(default_code, 0)
     return result
