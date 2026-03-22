@@ -4,6 +4,7 @@ import asyncio
 import re
 import os
 import json
+import html
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
