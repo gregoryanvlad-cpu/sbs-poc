@@ -510,6 +510,7 @@ def _load_vpn_servers() -> list[dict]:
                 "server_public_key": os.environ.get("VPN_SERVER_PUBLIC_KEY"),
                 "endpoint": os.environ.get("VPN_ENDPOINT"),
                 "dns": os.environ.get("VPN_DNS", "1.1.1.1"),
+                "tc_dev": os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
             },
             {"code": "DE", "name": "VPN-Германия"},
             {"code": "TR", "name": "VPN-Турция"},
@@ -531,6 +532,7 @@ def _load_vpn_servers() -> list[dict]:
                 "server_public_key": s.get("server_public_key") or s.get("server_public") or s.get("public_key"),
                 "endpoint": s.get("endpoint"),
                 "dns": s.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1"),
+                "tc_dev": s.get("tc_dev") or s.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
             }
         )
     return out
@@ -2107,6 +2109,7 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
                     user=str(srv["user"]),
                     password=srv.get("password"),
                     interface=str(srv.get("interface") or "wg0"),
+                    tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
                 )
             except Exception:
                 pass
@@ -2322,6 +2325,7 @@ async def _start_vpn_migration_watch(
                                 user=str(old_srv["user"]),
                                 password=old_srv.get("password"),
                                 interface=str(old_srv.get("interface") or "wg0"),
+                                tc_dev=str(old_srv.get("tc_dev") or old_srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
                             )
                         except Exception:
                             pass
@@ -2499,6 +2503,7 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
                 user=str(srv["user"]),
                 password=srv.get("password"),
                 interface=str(srv.get("interface") or "wg0"),
+                tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
             )
             try:
                 await vpn_service.ensure_rate_limit_for_server(
@@ -2509,6 +2514,7 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
                     user=str(srv["user"]),
                     password=srv.get("password"),
                     interface=str(srv.get("interface") or "wg0"),
+                    tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
                 )
             except Exception:
                 pass
