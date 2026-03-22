@@ -2144,15 +2144,27 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
             try:
                 peer = await vpn_svc.create_extra_peer(session, tg_id)
                 try:
-                    await vpn_svc.ensure_rate_limit(tg_id=tg_id, ip=str(peer.get("client_ip") or ""))
+                    if peer.get("host") and peer.get("user"):
+                        await vpn_svc.ensure_rate_limit_for_server(
+                            tg_id=tg_id,
+                            ip=str(peer.get("client_ip") or ""),
+                            host=str(peer.get("host") or ""),
+                            port=int(peer.get("port") or 22),
+                            user=str(peer.get("user") or ""),
+                            password=peer.get("password"),
+                            interface=str(peer.get("interface") or "wg0"),
+                            tc_dev=str(peer.get("tc_dev") or ""),
+                        )
+                    else:
+                        await vpn_svc.ensure_rate_limit(tg_id=tg_id, ip=str(peer.get("client_ip") or ""))
                 except Exception:
                     pass
                 conf_text = vpn_svc.build_wg_conf(
                     peer,
                     user_label=str(tg_id),
-                    server_public_key=vpn_svc.server_pub,
-                    endpoint=vpn_svc.endpoint,
-                    dns=vpn_svc.dns,
+                    server_public_key=str(peer.get("server_public_key") or vpn_svc.server_pub),
+                    endpoint=str(peer.get("endpoint") or vpn_svc.endpoint),
+                    dns=str(peer.get("dns") or vpn_svc.dns),
                 )
                 filename = f"admin-{tg_id}-extra-{int(peer.get('peer_id') or 0)}.conf"
                 await message.answer_document(
