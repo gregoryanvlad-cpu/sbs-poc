@@ -2182,9 +2182,7 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
     await state.clear()
     tail = ""
     if created == 0 and last_error:
-        tail = f"
-
-⚠️ Ошибка: <code>{html.quote(str(last_error)[:300])}</code>"
+        tail = f"\n\n⚠️ Ошибка: <code>{html.quote(str(last_error)[:300])}</code>"
     await message.answer(
         f"✅ Создано конфигов: <b>{created}</b> из <b>{n}</b>.{tail}",
         reply_markup=kb_admin_menu(),
