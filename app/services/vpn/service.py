@@ -807,33 +807,60 @@ class VPNService:
 
 
     async def get_recent_peer_handshakes(self, window_seconds: int = 180) -> list[dict[str, Any]]:
-        """List recent peers by latest handshake.
+        """List recent peers by latest handshake across all configured servers.
 
         Returns a list of dicts:
-          {public_key, handshake_ts, age_seconds}
+          {public_key, handshake_ts, age_seconds, server_code}
         for peers with handshake within window_seconds.
 
         This is used by admin UI to map active peers to user profiles.
         """
-        try:
-            hs = await self.provider.get_latest_handshakes()
-        except Exception as e:
-            log.warning("vpn_recent_handshakes_unavailable: %s", e)
-            return []
-
+        servers = self._load_vpn_servers()
         now_ts = int(utcnow().timestamp())
-        items: list[dict[str, Any]] = []
         w = max(1, int(window_seconds))
-        for k, ts in hs.items():
-            if not ts or ts <= 0:
-                continue
-            age = now_ts - int(ts)
-            if age < 0:
-                age = 0
-            if age <= w:
-                items.append({"public_key": k, "handshake_ts": int(ts), "age_seconds": int(age)})
 
-        # Sort most recent first
+        merged: dict[str, dict[str, Any]] = {}
+
+        for server in servers:
+            code = str(server.get("code") or os.environ.get("VPN_CODE") or "NL").strip().upper()
+            host = str(server.get("host") or os.environ.get("WG_SSH_HOST") or "").strip()
+            user = str(server.get("user") or os.environ.get("WG_SSH_USER") or "").strip()
+            if not host or not user:
+                continue
+            try:
+                provider = self._provider_for(
+                    host=host,
+                    port=int(server.get("port") or os.environ.get("WG_SSH_PORT", "22") or 22),
+                    user=user,
+                    password=server.get("password") if server.get("password") is not None else os.environ.get("WG_SSH_PASSWORD"),
+                    interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE") or "wg0"),
+                    tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+                    tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+                )
+                hs = await provider.get_latest_handshakes()
+            except Exception as e:
+                log.warning("vpn_recent_handshakes_unavailable(%s): %s", code or host, e)
+                continue
+
+            for k, ts in hs.items():
+                if not ts or ts <= 0:
+                    continue
+                age = now_ts - int(ts)
+                if age < 0:
+                    age = 0
+                if age > w:
+                    continue
+                item = {
+                    "public_key": k,
+                    "handshake_ts": int(ts),
+                    "age_seconds": int(age),
+                    "server_code": code,
+                }
+                prev = merged.get(k)
+                if prev is None or int(item["handshake_ts"]) > int(prev.get("handshake_ts", 0) or 0):
+                    merged[k] = item
+
+        items = list(merged.values())
         items.sort(key=lambda x: x.get("handshake_ts", 0), reverse=True)
         return items
 
