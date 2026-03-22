@@ -2140,6 +2140,7 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
 
     created = 0
     async with session_scope() as session:
+        last_error = None
         for _ in range(n):
             try:
                 peer = await vpn_svc.create_extra_peer(session, tg_id)
@@ -2172,14 +2173,20 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
                     caption="WireGuard конфиг (доп. устройство).",
                 )
                 created += 1
-            except Exception:
-                pass
+            except Exception as e:
+                last_error = str(e)
+                log.exception("admin_vpn_extra_failed tg_id=%s", tg_id)
 
         await session.commit()
 
     await state.clear()
+    tail = ""
+    if created == 0 and last_error:
+        tail = f"
+
+⚠️ Ошибка: <code>{html.quote(str(last_error)[:300])}</code>"
     await message.answer(
-        f"✅ Создано конфигов: <b>{created}</b> из <b>{n}</b>.",
+        f"✅ Создано конфигов: <b>{created}</b> из <b>{n}</b>.{tail}",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
