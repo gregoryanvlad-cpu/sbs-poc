@@ -3342,14 +3342,60 @@ async def on_family_share_slot(cb: CallbackQuery) -> None:
             if row and row.is_active and not prof.is_paused:
                 peer_dict = vpn_service._row_to_peer_dict(row)  # type: ignore
             elif row and not prof.is_paused:
-                # best-effort re-enable if it was disabled (family group active)
+                # Family-slot restore policy:
+                # - within 24h from revoked_at: the SAME peer may be restored,
+                #   but only on its original server and only if that server still has free capacity;
+                # - after 24h (or if restore within grace is impossible due to capacity):
+                #   the old peer is fully removed from its original server and a NEW peer is issued
+                #   on any server with free capacity.
+                old_code = str(getattr(row, "server_code", None) or os.environ.get("VPN_CODE") or "NL1").upper()
+                within_grace = False
                 try:
-                    await vpn_service.provider.add_peer(row.client_public_key, row.client_ip, tg_id=tg_id)
-                    row.is_active = True
-                    row.revoked_at = None
-                    peer_dict = vpn_service._row_to_peer_dict(row)  # type: ignore
+                    rv = getattr(row, "revoked_at", None)
+                    if rv is not None:
+                        within_grace = (utcnow() - rv) <= timedelta(hours=24)
                 except Exception:
-                    peer_dict = None
+                    within_grace = False
+
+                if within_grace:
+                    try:
+                        preferred = await vpn_service._pick_server_for_extra_peer(session, inherited_code=old_code)
+                        preferred_code = str(preferred.get("code") or "").upper()
+                    except Exception:
+                        preferred_code = ""
+                    if preferred_code == old_code:
+                        try:
+                            old_server = None
+                            for s in (vpn_service._load_vpn_servers() or []):
+                                if str(s.get("code") or "").upper() == old_code:
+                                    old_server = s
+                                    break
+                            if old_server:
+                                provider = vpn_service._provider_for(
+                                    host=str(old_server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
+                                    port=int(old_server.get("port") or 22),
+                                    user=str(old_server.get("user") or os.environ.get("WG_SSH_USER") or ""),
+                                    password=old_server.get("password"),
+                                    interface=str(old_server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                                    tc_dev=str(old_server.get("tc_dev") or old_server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+                                    tc_parent_rate_mbit=int(old_server.get("tc_parent_rate_mbit") or old_server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+                                )
+                                await provider.add_peer(row.client_public_key, row.client_ip, tg_id=tg_id)
+                                row.is_active = True
+                                row.revoked_at = None
+                                row.rotation_reason = None
+                                peer_dict = vpn_service._row_to_peer_dict(row)  # type: ignore
+                        except Exception:
+                            peer_dict = None
+
+                if not peer_dict:
+                    try:
+                        await vpn_service.remove_peer_for_server(session, row.client_public_key, old_code)
+                    except Exception:
+                        pass
+                    row.is_active = False
+                    row.revoked_at = utcnow()
+                    row.rotation_reason = row.rotation_reason or f"family_slot_{slot_no}_expired_replace"
 
         if not peer_dict and not prof.is_paused:
             # Create a new extra peer (same tg_id, unique IP)
