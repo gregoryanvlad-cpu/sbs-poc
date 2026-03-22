@@ -56,6 +56,7 @@ class VPNService:
             user=os.environ["WG_SSH_USER"],
             password=pwd,
             interface=os.environ.get("VPN_INTERFACE", "wg0"),
+            tc_dev=os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
         )
 
         self.server_pub = os.environ["VPN_SERVER_PUBLIC_KEY"]
@@ -63,8 +64,8 @@ class VPNService:
         self.dns = os.environ.get("VPN_DNS", "1.1.1.1")
 
         # Cache of providers for multi-location servers.
-        # Keyed by (host, port, user, interface).
-        self._providers: dict[Tuple[str, int, str, str], WireGuardSSHProvider] = {}
+        # Keyed by (host, port, user, interface, tc_dev).
+        self._providers: dict[Tuple[str, int, str, str, str], WireGuardSSHProvider] = {}
 
     def _provider_for(
         self,
@@ -74,12 +75,14 @@ class VPNService:
         user: str,
         password: str | None,
         interface: str,
+        tc_dev: str | None = None,
     ) -> WireGuardSSHProvider:
         """Get a cached SSH provider for a given server."""
-        key = (host, int(port), user, interface)
+        tc_dev_norm = (tc_dev or "").strip()
+        key = (host, int(port), user, interface, tc_dev_norm)
         p = self._providers.get(key)
         if p is None:
-            p = WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface)
+            p = WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface, tc_dev=tc_dev_norm or None)
             self._providers[key] = p
         return p
 
@@ -277,6 +280,7 @@ class VPNService:
         user: str,
         password: str | None,
         interface: str,
+        tc_dev: str | None = None,
     ) -> Dict[str, Any]:
         """Create/restore an active peer for a specific server.
 
@@ -300,7 +304,7 @@ class VPNService:
         if active:
             return self._row_to_peer_dict(active)
 
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
 
         # Try restore last inactive for this server
         q = (
@@ -414,6 +418,7 @@ class VPNService:
                         user=str(srv.get("user")),
                         password=srv.get("password"),
                         interface=str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                        tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
                     )
                     await provider.add_peer(p.client_public_key, p.client_ip, tg_id=tg_id)
                 else:
@@ -442,8 +447,9 @@ class VPNService:
         user: str,
         password: str | None,
         interface: str,
+        tc_dev: str | None = None,
     ) -> None:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
         await provider.tc_apply_limit_for_ip(ip=ip, tg_id=tg_id)
 
     async def remove_peer_for_server(
@@ -455,8 +461,9 @@ class VPNService:
         user: str,
         password: str | None,
         interface: str,
+        tc_dev: str | None = None,
     ) -> None:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
         await provider.remove_peer(public_key)
 
     async def get_peer_handshake_for_server(
@@ -468,8 +475,9 @@ class VPNService:
         user: str,
         password: str | None,
         interface: str,
+        tc_dev: str | None = None,
     ) -> int:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
         return await provider.get_peer_latest_handshake(public_key)
 
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
@@ -601,6 +609,7 @@ class VPNService:
                 user=user,
                 password=password,
                 interface=interface,
+                tc_dev=None,
             )
             cpu = await provider.get_cpu_load_percent(sample_seconds=1)
             active = await provider.get_active_peers(window_seconds=180)
