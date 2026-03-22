@@ -31,9 +31,9 @@ class WireGuardSSHProvider:
         self._tc_enabled = str(os.environ.get("WG_TC_ENABLED", os.environ.get("VPN_TC_ENABLED", "1"))).strip().lower() not in {"0", "false", "no", "off"}
         self._tc_dev = (os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or "eth0").strip() or "eth0"
         try:
-            self._tc_rate_mbit = int((os.environ.get("WG_TC_RATE_MBIT") or os.environ.get("VPN_TC_RATE_MBIT") or "25").strip() or "25")
+            self._tc_rate_mbit = int((os.environ.get("WG_TC_RATE_MBIT") or os.environ.get("VPN_TC_RATE_MBIT") or "30").strip() or "30")
         except Exception:
-            self._tc_rate_mbit = 25
+            self._tc_rate_mbit = 30
 
         key_b64 = os.environ.get("WG_SSH_PRIVATE_KEY_B64")
         if key_b64:
@@ -99,7 +99,7 @@ class WireGuardSSHProvider:
         await self._run(
             f"{WG_BIN} set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
         )
-        # Best-effort: keep all users on the same 25 Mbit plan.
+        # Best-effort: keep all users on the same 30 Mbit plan.
         try:
             await self.tc_apply_limit_for_ip(ip=client_ip, tg_id=int(tg_id or 0))
         except Exception:
