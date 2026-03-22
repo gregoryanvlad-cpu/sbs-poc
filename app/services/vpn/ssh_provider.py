@@ -12,7 +12,7 @@ ENV_PATH = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class WireGuardSSHProvider:
-    def __init__(self, host: str, port: int, user: str, password: Optional[str], interface: str = "wg0"):
+    def __init__(self, host: str, port: int, user: str, password: Optional[str], interface: str = "wg0", tc_dev: Optional[str] = None):
         self.host = host
         self.port = port
         self.user = user
@@ -29,7 +29,7 @@ class WireGuardSSHProvider:
         # Best-effort per-user bandwidth limit for WireGuard users.
         # Enabled by default so paid users and trial users have identical conditions.
         self._tc_enabled = str(os.environ.get("WG_TC_ENABLED", os.environ.get("VPN_TC_ENABLED", "1"))).strip().lower() not in {"0", "false", "no", "off"}
-        self._tc_dev = (os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or "eth0").strip() or "eth0"
+        self._tc_dev = (tc_dev or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or "eth0").strip() or "eth0"
         try:
             self._tc_rate_mbit = int((os.environ.get("WG_TC_RATE_MBIT") or os.environ.get("VPN_TC_RATE_MBIT") or "30").strip() or "30")
         except Exception:
