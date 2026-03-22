@@ -746,18 +746,26 @@ def _server_code_aliases_nav(servers: list[dict], code: str) -> set[str]:
 
 
 async def _vpn_seats_by_server_nav() -> dict[str, int]:
-    """Return occupied WG slots per server using strict WG peer counts.
+    """Return occupied WG slots per configured server code.
 
-    The real capacity limiter is the number of peers configured on the server,
-    not only active DB rows. We therefore start with DB counts and then, when
-    SSH is available, raise each server occupancy up to the actual WireGuard
-    peer total reported by the server.
+    Legacy rows can store aliases for the same server (NL/NL1/SERVER1). We
+    normalize them into the configured code first, then reconcile with the real
+    WireGuard peer total from SSH.
     """
     from app.db.models import VpnPeer
 
     servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
     default_code = (os.environ.get("VPN_CODE") or "NL").upper()
     default_code_lit = literal(default_code)
+
+    canonical_for_alias: dict[str, str] = {}
+    for s in servers:
+        code = str(s.get("code") or default_code).upper()
+        for alias in _server_code_aliases_nav(servers, code):
+            canonical_for_alias[str(alias).upper()] = code
+        canonical_for_alias.setdefault(code, code)
+
+    result: dict[str, int] = {str(s.get("code") or default_code).upper(): 0 for s in servers}
 
     async with session_scope() as session:
         q = (
@@ -769,11 +777,10 @@ async def _vpn_seats_by_server_nav() -> dict[str, int]:
             .group_by(func.coalesce(func.upper(VpnPeer.server_code), default_code_lit))
         )
         res = await session.execute(q)
-        result = {str(code).upper(): int(cnt) for code, cnt in res.all()}
-
-    for s in servers:
-        code = str(s.get("code") or default_code).upper()
-        result.setdefault(code, 0)
+        for raw_code, cnt in res.all():
+            raw = str(raw_code or default_code).upper()
+            canonical = canonical_for_alias.get(raw, raw)
+            result[canonical] = int(result.get(canonical, 0)) + int(cnt or 0)
 
     for s in servers:
         code = str(s.get("code") or default_code).upper()
@@ -820,7 +827,7 @@ async def _pick_available_vpn_server(*, preferred_code: str | None = None, curre
 
     def can_use(server: dict) -> bool:
         code = str(server.get("code") or "").upper()
-        seats = sum(int(used.get(alias, 0)) for alias in _server_code_aliases_nav(servers, code))
+        seats = int(used.get(code, 0))
         cap = _vpn_capacity_limit(server)
         if current_code == code:
             return True
