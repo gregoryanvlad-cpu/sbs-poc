@@ -101,6 +101,30 @@ class WireGuardSSHProvider:
                 await asyncio.sleep(0.5)
         raise last
 
+    async def _wg_quick_save(self) -> None:
+        """Persist runtime WireGuard peers when SaveConfig=true is enabled on the server."""
+        try:
+            await self._run(f"sudo wg-quick save {self.interface}")
+        except Exception:
+            log.warning("wg_quick_save_failed interface=%s", self.interface)
+
+    async def _get_peer_ip_by_public_key(self, public_key: str) -> str | None:
+        if not public_key:
+            return None
+        out = await self._run_output(f"{WG_BIN} show {self.interface} allowed-ips", check=False)
+        if not out:
+            return None
+        want = public_key.strip()
+        for ln in out.splitlines():
+            parts = ln.strip().split()
+            if len(parts) < 2:
+                continue
+            if parts[0].strip() != want:
+                continue
+            raw_ip = parts[1].split(',')[0].strip()
+            return raw_ip.split('/')[0].strip() or None
+        return None
+
     async def add_peer(self, public_key: str, client_ip: str, *, tg_id: int | None = None) -> None:
         await self._run(
             f"{WG_BIN} set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
@@ -110,14 +134,26 @@ class WireGuardSSHProvider:
             await self.tc_apply_limit_for_ip(ip=client_ip, tg_id=int(tg_id or 0))
         except Exception:
             log.exception("wg_tc_apply_limit_failed ip=%s tg_id=%s", client_ip, tg_id)
+        await self._wg_quick_save()
 
     async def remove_peer(self, public_key: str) -> None:
+        peer_ip = None
+        try:
+            peer_ip = await self._get_peer_ip_by_public_key(public_key)
+        except Exception:
+            peer_ip = None
         try:
             await self._run(
                 f"{WG_BIN} set {self.interface} peer {public_key} remove"
             )
         except Exception:
             log.warning("WG remove failed (ignored)")
+        try:
+            if peer_ip:
+                await self.tc_clear_limit_for_ip(ip=peer_ip)
+        except Exception:
+            log.exception("wg_tc_clear_limit_failed ip=%s", peer_ip)
+        await self._wg_quick_save()
 
 
     async def list_peers(self) -> list[str]:
@@ -278,22 +314,26 @@ class WireGuardSSHProvider:
             pass
         return 0x0999
 
+    def _tc_ifb_dev(self) -> str:
+        return f"ifb-{self.interface}"
+
     async def _tc_init(self) -> None:
         if not self._tc_enabled:
             return
-        dev = self._tc_dev
+        wg_dev = self.interface
+        ifb_dev = self._tc_ifb_dev()
         parent = max(1, int(self._tc_parent_rate_mbit))
         cmd = (
             "sudo modprobe ifb || true; "
-            "sudo ip link add ifb0 type ifb 2>/dev/null || true; "
-            "sudo ip link set dev ifb0 up 2>/dev/null || true; "
-            f"sudo tc qdisc add dev {dev} handle ffff: ingress 2>/dev/null || true; "
-            f"sudo tc filter replace dev {dev} parent ffff: protocol ip u32 match u32 0 0 "
-            "action mirred egress redirect dev ifb0 2>/dev/null || true; "
-            f"sudo tc qdisc add dev {dev} root handle 1: htb default 999 r2q 10 2>/dev/null || true; "
-            f"sudo tc class replace dev {dev} parent 1: classid 1:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true; "
-            "sudo tc qdisc add dev ifb0 root handle 2: htb default 999 r2q 10 2>/dev/null || true; "
-            f"sudo tc class replace dev ifb0 parent 2: classid 2:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true"
+            f"sudo ip link add {ifb_dev} type ifb 2>/dev/null || true; "
+            f"sudo ip link set dev {ifb_dev} up 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {wg_dev} root handle 1: htb default 999 r2q 10 2>/dev/null || true; "
+            f"sudo tc class replace dev {wg_dev} parent 1: classid 1:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {wg_dev} handle ffff: ingress 2>/dev/null || true; "
+            f"sudo tc filter replace dev {wg_dev} parent ffff: protocol ip u32 match u32 0 0 "
+            f"action mirred egress redirect dev {ifb_dev} 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {ifb_dev} root handle 2: htb default 999 r2q 10 2>/dev/null || true; "
+            f"sudo tc class replace dev {ifb_dev} parent 2: classid 2:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true"
         )
         await self._run(cmd)
 
@@ -304,23 +344,43 @@ class WireGuardSSHProvider:
         if not ip:
             return
         await self._tc_init()
-        dev = self._tc_dev
+        wg_dev = self.interface
+        ifb_dev = self._tc_ifb_dev()
         rate = max(1, int(self._tc_rate_mbit))
         cls = self._tc_class_for_ip(ip)
         cls_hex = format(cls, 'x')
         cmd = (
-            # Best-effort cleanup of any previous class/filter for this peer classid.
-            f"sudo tc filter del dev {dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
-            f"sudo tc filter del dev ifb0 parent 2: protocol ip prio 10 2>/dev/null || true; "
-            f"sudo tc class del dev {dev} classid 1:{cls_hex} 2>/dev/null || true; "
-            f"sudo tc class del dev ifb0 classid 2:{cls_hex} 2>/dev/null || true; "
-            f"sudo tc qdisc del dev ifb0 parent 2:{cls_hex} 2>/dev/null || true; "
-            # Keep outbound shape on WAN too, mirroring NL1 historical setup.
-            f"sudo tc class replace dev {dev} parent 1:1 classid 1:{cls_hex} htb rate {rate}mbit ceil {rate}mbit burst 1600b cburst 1600b 2>/dev/null || true; "
-            f"sudo tc filter replace dev {dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls_hex} 2>/dev/null || true; "
-            # Main per-peer shaping on ifb0, matching working NL1 pattern.
-            f"sudo tc class replace dev ifb0 parent 2:1 classid 2:{cls_hex} htb rate {rate}mbit ceil {rate}mbit burst 256Kb cburst 1593b 2>/dev/null || true; "
-            f"sudo tc qdisc add dev ifb0 parent 2:{cls_hex} fq_codel 2>/dev/null || true; "
-            f"sudo tc filter add dev ifb0 protocol ip parent 2: prio 10 u32 match ip dst {ip}/32 flowid 2:{cls_hex} 2>/dev/null || true"
+            f"sudo tc filter del dev {wg_dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc filter del dev {ifb_dev} parent 2: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc qdisc del dev {wg_dev} parent 1:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc qdisc del dev {ifb_dev} parent 2:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class del dev {wg_dev} classid 1:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class del dev {ifb_dev} classid 2:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class replace dev {wg_dev} parent 1:1 classid 1:{cls_hex} htb rate {rate}mbit ceil {rate}mbit burst 1600b cburst 1600b 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {wg_dev} parent 1:{cls_hex} fq_codel 2>/dev/null || true; "
+            f"sudo tc filter replace dev {wg_dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class replace dev {ifb_dev} parent 2:1 classid 2:{cls_hex} htb rate {rate}mbit ceil {rate}mbit burst 256Kb cburst 1593b 2>/dev/null || true; "
+            f"sudo tc qdisc add dev {ifb_dev} parent 2:{cls_hex} fq_codel 2>/dev/null || true; "
+            f"sudo tc filter replace dev {ifb_dev} protocol ip parent 2: prio {cls} u32 match ip src {ip}/32 flowid 2:{cls_hex} 2>/dev/null || true"
+        )
+        await self._run(cmd)
+
+    async def tc_clear_limit_for_ip(self, *, ip: str) -> None:
+        if not self._tc_enabled:
+            return
+        ip = (ip or "").strip()
+        if not ip:
+            return
+        wg_dev = self.interface
+        ifb_dev = self._tc_ifb_dev()
+        cls = self._tc_class_for_ip(ip)
+        cls_hex = format(cls, 'x')
+        cmd = (
+            f"sudo tc filter del dev {wg_dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc filter del dev {ifb_dev} parent 2: protocol ip prio {cls} 2>/dev/null || true; "
+            f"sudo tc qdisc del dev {wg_dev} parent 1:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc qdisc del dev {ifb_dev} parent 2:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class del dev {wg_dev} classid 1:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class del dev {ifb_dev} classid 2:{cls_hex} 2>/dev/null || true"
         )
         await self._run(cmd)
