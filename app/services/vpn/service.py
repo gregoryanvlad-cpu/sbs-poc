@@ -864,5 +864,75 @@ class VPNService:
         items.sort(key=lambda x: x.get("handshake_ts", 0), reverse=True)
         return items
 
+    async def get_used_peer_stats(self) -> list[dict[str, Any]]:
+        """List peers that have evidence of real VPN usage across all configured servers.
+
+        A peer is considered "used" when at least one of these is true on any server:
+          - latest handshake timestamp > 0
+          - received bytes > 0
+          - sent bytes > 0
+        """
+        servers = self._load_vpn_servers()
+        now_ts = int(utcnow().timestamp())
+        merged: dict[str, dict[str, Any]] = {}
+
+        for server in servers:
+            code = str(server.get("code") or os.environ.get("VPN_CODE") or "NL").strip().upper()
+            host = str(server.get("host") or os.environ.get("WG_SSH_HOST") or "").strip()
+            user = str(server.get("user") or os.environ.get("WG_SSH_USER") or "").strip()
+            if not host or not user:
+                continue
+            try:
+                provider = self._provider_for(
+                    host=host,
+                    port=int(server.get("port") or os.environ.get("WG_SSH_PORT", "22") or 22),
+                    user=user,
+                    password=server.get("password") if server.get("password") is not None else os.environ.get("WG_SSH_PASSWORD"),
+                    interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE") or "wg0"),
+                    tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+                    tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+                )
+                hs = await provider.get_latest_handshakes()
+                transfers = await provider.get_peer_transfers()
+            except Exception as e:
+                log.warning("vpn_used_peer_stats_unavailable(%s): %s", code or host, e)
+                continue
+
+            keys = set(hs.keys()) | set(transfers.keys())
+            for key in keys:
+                hts = int(hs.get(key, 0) or 0)
+                tr = transfers.get(key) or {}
+                rx = int(tr.get("rx_bytes", 0) or 0)
+                tx = int(tr.get("tx_bytes", 0) or 0)
+                total = rx + tx
+                if hts <= 0 and total <= 0:
+                    continue
+                age = None
+                if hts > 0:
+                    age = now_ts - hts
+                    if age < 0:
+                        age = 0
+                item = {
+                    "public_key": key,
+                    "server_code": code,
+                    "handshake_ts": hts,
+                    "age_seconds": age,
+                    "rx_bytes": rx,
+                    "tx_bytes": tx,
+                    "total_bytes": total,
+                }
+                prev = merged.get(key)
+                if prev is None:
+                    merged[key] = item
+                    continue
+                prev_hs = int(prev.get("handshake_ts", 0) or 0)
+                prev_total = int(prev.get("total_bytes", 0) or 0)
+                if hts > prev_hs or (hts == prev_hs and total > prev_total):
+                    merged[key] = item
+
+        items = list(merged.values())
+        items.sort(key=lambda x: (int(x.get("handshake_ts", 0) or 0), int(x.get("total_bytes", 0) or 0)), reverse=True)
+        return items
+
 
 vpn_service = VPNService()
