@@ -12,7 +12,7 @@ ENV_PATH = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class WireGuardSSHProvider:
-    def __init__(self, host: str, port: int, user: str, password: Optional[str], interface: str = "wg0", tc_dev: Optional[str] = None):
+    def __init__(self, host: str, port: int, user: str, password: Optional[str], interface: str = "wg0", tc_dev: Optional[str] = None, tc_parent_rate_mbit: Optional[int] = None):
         self.host = host
         self.port = port
         self.user = user
@@ -34,6 +34,12 @@ class WireGuardSSHProvider:
             self._tc_rate_mbit = int((os.environ.get("WG_TC_RATE_MBIT") or os.environ.get("VPN_TC_RATE_MBIT") or "30").strip() or "30")
         except Exception:
             self._tc_rate_mbit = 30
+        try:
+            if tc_parent_rate_mbit is None:
+                tc_parent_rate_mbit = int((os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or "1000").strip() or "1000")
+            self._tc_parent_rate_mbit = max(int(tc_parent_rate_mbit), self._tc_rate_mbit)
+        except Exception:
+            self._tc_parent_rate_mbit = max(self._tc_rate_mbit, 1000)
 
         key_b64 = os.environ.get("WG_SSH_PRIVATE_KEY_B64")
         if key_b64:
@@ -112,6 +118,13 @@ class WireGuardSSHProvider:
             )
         except Exception:
             log.warning("WG remove failed (ignored)")
+
+
+    async def list_peers(self) -> list[str]:
+        out = await self._run_output(f"{WG_BIN} show {self.interface} peers", check=False)
+        if not out:
+            return []
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
     async def get_total_peers(self) -> int:
         out = await self._run_output(f"{WG_BIN} show {self.interface} peers")
@@ -260,6 +273,7 @@ class WireGuardSSHProvider:
         if not self._tc_enabled:
             return
         dev = self._tc_dev
+        parent = max(1, int(self._tc_parent_rate_mbit))
         cmd = (
             "sudo modprobe ifb || true; "
             "sudo ip link add ifb0 type ifb 2>/dev/null || true; "
@@ -268,9 +282,9 @@ class WireGuardSSHProvider:
             f"sudo tc filter add dev {dev} parent ffff: protocol ip u32 match u32 0 0 "
             "action mirred egress redirect dev ifb0 2>/dev/null || true; "
             f"sudo tc qdisc add dev {dev} root handle 1: htb default 999 r2q 10 2>/dev/null || true; "
-            f"sudo tc class add dev {dev} parent 1: classid 1:1 htb rate 1gbit ceil 1gbit 2>/dev/null || true; "
+            f"sudo tc class add dev {dev} parent 1: classid 1:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true; "
             "sudo tc qdisc add dev ifb0 root handle 2: htb default 999 r2q 10 2>/dev/null || true; "
-            "sudo tc class add dev ifb0 parent 2: classid 2:1 htb rate 1gbit ceil 1gbit 2>/dev/null || true"
+            f"sudo tc class add dev ifb0 parent 2: classid 2:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true"
         )
         await self._run(cmd)
 
