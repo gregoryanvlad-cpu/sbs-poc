@@ -58,6 +58,7 @@ class VPNService:
             password=pwd,
             interface=os.environ.get("VPN_INTERFACE", "wg0"),
             tc_dev=os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
+            tc_parent_rate_mbit=int((os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or "1000").strip() or "1000"),
         )
 
         self.server_pub = os.environ["VPN_SERVER_PUBLIC_KEY"]
@@ -65,8 +66,8 @@ class VPNService:
         self.dns = os.environ.get("VPN_DNS", "1.1.1.1")
 
         # Cache of providers for multi-location servers.
-        # Keyed by (host, port, user, interface, tc_dev).
-        self._providers: dict[Tuple[str, int, str, str, str], WireGuardSSHProvider] = {}
+        # Keyed by (host, port, user, interface, tc_dev, tc_parent_rate_mbit).
+        self._providers: dict[Tuple[str, int, str, str, str, int], WireGuardSSHProvider] = {}
 
     def _provider_for(
         self,
@@ -77,13 +78,15 @@ class VPNService:
         password: str | None,
         interface: str,
         tc_dev: str | None = None,
+        tc_parent_rate_mbit: int | None = None,
     ) -> WireGuardSSHProvider:
         """Get a cached SSH provider for a given server."""
         tc_dev_norm = (tc_dev or "").strip()
-        key = (host, int(port), user, interface, tc_dev_norm)
+        parent_rate = int(tc_parent_rate_mbit or 1000)
+        key = (host, int(port), user, interface, tc_dev_norm, parent_rate)
         p = self._providers.get(key)
         if p is None:
-            p = WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface, tc_dev=tc_dev_norm or None)
+            p = WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface, tc_dev=tc_dev_norm or None, tc_parent_rate_mbit=parent_rate)
             self._providers[key] = p
         return p
 
@@ -153,6 +156,7 @@ class VPNService:
             "password": os.environ.get("WG_SSH_PASSWORD"),
             "interface": os.environ.get("VPN_INTERFACE", "wg0"),
             "tc_dev": os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
+            "tc_parent_rate_mbit": int((os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or "1000").strip() or "1000"),
             "server_public_key": os.environ.get("VPN_SERVER_PUBLIC_KEY"),
             "endpoint": os.environ.get("VPN_ENDPOINT"),
             "dns": os.environ.get("VPN_DNS", "1.1.1.1"),
@@ -307,6 +311,7 @@ class VPNService:
             password=server.get("password"),
             interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
             tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
         )
 
         log.info("vpn_create_extra_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
@@ -586,6 +591,7 @@ class VPNService:
                         password=srv.get("password"),
                         interface=str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
                         tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+                        tc_parent_rate_mbit=int(srv.get("tc_parent_rate_mbit") or srv.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
                     )
                     await provider.add_peer(p.client_public_key, p.client_ip, tg_id=tg_id)
                 else:
@@ -615,8 +621,9 @@ class VPNService:
         password: str | None,
         interface: str,
         tc_dev: str | None = None,
+        tc_parent_rate_mbit: int | None = None,
     ) -> None:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev, tc_parent_rate_mbit=tc_parent_rate_mbit)
         await provider.tc_apply_limit_for_ip(ip=ip, tg_id=tg_id)
 
     async def remove_peer_for_server(
@@ -629,8 +636,9 @@ class VPNService:
         password: str | None,
         interface: str,
         tc_dev: str | None = None,
+        tc_parent_rate_mbit: int | None = None,
     ) -> None:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev, tc_parent_rate_mbit=tc_parent_rate_mbit)
         await provider.remove_peer(public_key)
 
     async def get_peer_handshake_for_server(
@@ -643,8 +651,9 @@ class VPNService:
         password: str | None,
         interface: str,
         tc_dev: str | None = None,
+        tc_parent_rate_mbit: int | None = None,
     ) -> int:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev)
+        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev, tc_parent_rate_mbit=tc_parent_rate_mbit)
         return await provider.get_peer_latest_handshake(public_key)
 
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
