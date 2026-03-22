@@ -264,10 +264,19 @@ class WireGuardSSHProvider:
             usage = 100.0
         return round(usage, 1)
 
-    def _tc_class_for_tg(self, tg_id: int) -> int:
-        base = 10
-        span = 65000 - base
-        return base + (int(tg_id) % span)
+    def _tc_class_for_ip(self, ip: str) -> int:
+        """Map client IP to a stable 16-bit class minor like the NL1 server.
+
+        For 10.66.A.B -> 0xAABB. This matches the working shape/filter pattern
+        already present on the first server and keeps class IDs tc-safe.
+        """
+        try:
+            parts = [int(x) for x in (ip or '').strip().split('.')]
+            if len(parts) == 4:
+                return ((parts[2] & 0xFF) << 8) | (parts[3] & 0xFF)
+        except Exception:
+            pass
+        return 0x0999
 
     async def _tc_init(self) -> None:
         if not self._tc_enabled:
@@ -279,12 +288,12 @@ class WireGuardSSHProvider:
             "sudo ip link add ifb0 type ifb 2>/dev/null || true; "
             "sudo ip link set dev ifb0 up 2>/dev/null || true; "
             f"sudo tc qdisc add dev {dev} handle ffff: ingress 2>/dev/null || true; "
-            f"sudo tc filter add dev {dev} parent ffff: protocol ip u32 match u32 0 0 "
+            f"sudo tc filter replace dev {dev} parent ffff: protocol ip u32 match u32 0 0 "
             "action mirred egress redirect dev ifb0 2>/dev/null || true; "
             f"sudo tc qdisc add dev {dev} root handle 1: htb default 999 r2q 10 2>/dev/null || true; "
-            f"sudo tc class add dev {dev} parent 1: classid 1:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true; "
+            f"sudo tc class replace dev {dev} parent 1: classid 1:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true; "
             "sudo tc qdisc add dev ifb0 root handle 2: htb default 999 r2q 10 2>/dev/null || true; "
-            f"sudo tc class add dev ifb0 parent 2: classid 2:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true"
+            f"sudo tc class replace dev ifb0 parent 2: classid 2:1 htb rate {parent}mbit ceil {parent}mbit 2>/dev/null || true"
         )
         await self._run(cmd)
 
@@ -297,16 +306,21 @@ class WireGuardSSHProvider:
         await self._tc_init()
         dev = self._tc_dev
         rate = max(1, int(self._tc_rate_mbit))
-        cls = self._tc_class_for_tg(int(tg_id))
+        cls = self._tc_class_for_ip(ip)
+        cls_hex = format(cls, 'x')
         cmd = (
+            # Best-effort cleanup of any previous class/filter for this peer classid.
             f"sudo tc filter del dev {dev} parent 1: protocol ip prio {cls} 2>/dev/null || true; "
-            f"sudo tc filter del dev ifb0 parent 2: protocol ip prio {cls} 2>/dev/null || true; "
-            f"sudo tc class del dev {dev} classid 1:{cls} 2>/dev/null || true; "
-            f"sudo tc class del dev ifb0 classid 2:{cls} 2>/dev/null || true; "
-            f"sudo tc class add dev {dev} parent 1:1 classid 1:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
-            f"sudo tc filter add dev {dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls} 2>/dev/null || true; "
-            "sudo ip link show ifb0 >/dev/null 2>&1 || true; "
-            f"sudo tc class add dev ifb0 parent 2:1 classid 2:{cls} htb rate {rate}mbit ceil {rate}mbit 2>/dev/null || true; "
-            f"sudo tc filter add dev ifb0 protocol ip parent 2: prio {cls} u32 match ip src {ip}/32 flowid 2:{cls} 2>/dev/null || true"
+            f"sudo tc filter del dev ifb0 parent 2: protocol ip prio 10 2>/dev/null || true; "
+            f"sudo tc class del dev {dev} classid 1:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc class del dev ifb0 classid 2:{cls_hex} 2>/dev/null || true; "
+            f"sudo tc qdisc del dev ifb0 parent 2:{cls_hex} 2>/dev/null || true; "
+            # Keep outbound shape on WAN too, mirroring NL1 historical setup.
+            f"sudo tc class replace dev {dev} parent 1:1 classid 1:{cls_hex} htb rate {rate}mbit ceil {rate}mbit burst 1600b cburst 1600b 2>/dev/null || true; "
+            f"sudo tc filter replace dev {dev} protocol ip parent 1: prio {cls} u32 match ip dst {ip}/32 flowid 1:{cls_hex} 2>/dev/null || true; "
+            # Main per-peer shaping on ifb0, matching working NL1 pattern.
+            f"sudo tc class replace dev ifb0 parent 2:1 classid 2:{cls_hex} htb rate {rate}mbit ceil {rate}mbit burst 256Kb cburst 1593b 2>/dev/null || true; "
+            f"sudo tc qdisc add dev ifb0 parent 2:{cls_hex} fq_codel 2>/dev/null || true; "
+            f"sudo tc filter add dev ifb0 protocol ip parent 2: prio 10 u32 match ip dst {ip}/32 flowid 2:{cls_hex} 2>/dev/null || true"
         )
         await self._run(cmd)
