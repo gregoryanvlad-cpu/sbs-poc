@@ -973,6 +973,7 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
                     user=str(user_),
                     password=srv.get('password'),
                     interface=str(srv.get('interface') or 'wg0'),
+                    tc_dev=str(srv.get('tc_dev') or srv.get('wg_tc_dev') or os.environ.get('WG_TC_DEV') or os.environ.get('VPN_TC_DEV') or ''),
                 )
                 try:
                     eps = await prov.get_peer_endpoints()
@@ -2301,7 +2302,7 @@ async def admin_vpn_test_peer_server2_reset(cb: CallbackQuery) -> None:
             .order_by(VpnPeer.id.desc())
         )
         rows = list((await session.execute(q)).scalars().all())
-        provider = vpn_service._provider_for(host=host, port=port, user=user, password=password, interface=interface)
+        provider = vpn_service._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""))
         for row in rows:
             try:
                 await provider.remove_peer(row.client_public_key)
