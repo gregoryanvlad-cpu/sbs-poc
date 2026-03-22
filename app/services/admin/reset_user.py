@@ -62,12 +62,13 @@ def _provider_candidates_for_peer(peer: VpnPeer) -> list[WireGuardSSHProvider]:
     providers: list[WireGuardSSHProvider] = []
     seen: set[tuple[str, int, str, str]] = set()
 
-    def _add(host: str, port: int, user: str, password: str | None, interface: str) -> None:
-        key = (host, int(port), user, interface)
+    def _add(host: str, port: int, user: str, password: str | None, interface: str, tc_dev: str | None = None) -> None:
+        tc_dev_norm = (tc_dev or "").strip()
+        key = (host, int(port), user, interface, tc_dev_norm)
         if key in seen or not host or not user:
             return
         seen.add(key)
-        providers.append(WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface))
+        providers.append(WireGuardSSHProvider(host=host, port=int(port), user=user, password=password, interface=interface, tc_dev=tc_dev_norm or None))
 
     # Current/default server provider.
     try:
@@ -77,6 +78,7 @@ def _provider_candidates_for_peer(peer: VpnPeer) -> list[WireGuardSSHProvider]:
             user=os.environ.get("WG_SSH_USER", ""),
             password=os.environ.get("WG_SSH_PASSWORD") or None,
             interface=os.environ.get("VPN_INTERFACE", "wg0"),
+            tc_dev=os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
         )
     except Exception:
         pass
@@ -94,6 +96,7 @@ def _provider_candidates_for_peer(peer: VpnPeer) -> list[WireGuardSSHProvider]:
                 user=str(srv.get("user") or ""),
                 password=srv.get("password") or None,
                 interface=str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
             )
         except Exception:
             log.exception("admin_reset_user_bad_server_config peer_code=%s", peer_code)
