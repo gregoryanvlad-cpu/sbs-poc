@@ -45,6 +45,26 @@ from app.services.message_audit import audit_send_message
 
 log = logging.getLogger(__name__)
 
+def _fmt_bytes_short(num: int) -> str:
+    try:
+        n = int(num or 0)
+    except Exception:
+        n = 0
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(n)
+    idx = 0
+    while v >= 1024.0 and idx < len(units) - 1:
+        v /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(v)} {units[idx]}"
+    if v >= 100:
+        return f"{v:.0f} {units[idx]}"
+    if v >= 10:
+        return f"{v:.1f} {units[idx]}"
+    return f"{v:.2f} {units[idx]}"
+
+
 
 def _load_vpn_servers_admin() -> list[dict]:
     """Load VPN servers from the same env format as the user menu.
@@ -2338,6 +2358,137 @@ async def admin_vpn_test_peer_server2_reset(cb: CallbackQuery) -> None:
         reply_markup=_kb_admin_back(),
         parse_mode="HTML",
     )
+
+@router.callback_query(lambda c: c.data == "admin:vpn:usage")
+async def admin_vpn_usage(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    used = await vpn_service.get_used_peer_stats()
+    if not used:
+        text = (
+            "📈 <b>Кто пользовался VPN</b>\n\n"
+            "Пока не найдено peer'ов с handshake или трафиком на текущих серверах."
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+            else:
+                raise
+        return
+
+    keys = [x.get("public_key") for x in used if x.get("public_key")][:500]
+    peer_rows: dict[str, VpnPeer] = {}
+    subs_by_tg: dict[int, Subscription] = {}
+    servers = _load_vpn_servers_admin()
+
+    async with session_scope() as session:
+        res = await session.execute(select(VpnPeer).where(VpnPeer.client_public_key.in_(keys)))
+        for row in res.scalars().all():
+            peer_rows[row.client_public_key] = row
+
+        tg_ids = sorted({int(row.tg_id) for row in peer_rows.values()})
+        if tg_ids:
+            res2 = await session.execute(select(Subscription).where(Subscription.tg_id.in_(tg_ids)))
+            for sub in res2.scalars().all():
+                subs_by_tg[int(sub.tg_id)] = sub
+
+    user_stats: dict[int, dict] = {}
+    unknown_count = 0
+    server_counts: dict[str, int] = {}
+
+    for item in used:
+        key = item.get("public_key")
+        row = peer_rows.get(key)
+        code = str((item.get("server_code") or (row.server_code if row else None) or "NL")).upper()
+        server_counts[code] = int(server_counts.get(code, 0) or 0) + 1
+        if not row:
+            unknown_count += 1
+            continue
+        tid = int(row.tg_id)
+        st = user_stats.setdefault(tid, {
+            "tg_id": tid,
+            "peer_count": 0,
+            "total_bytes": 0,
+            "latest_hs": 0,
+            "servers": set(),
+            "has_active_sub": False,
+        })
+        st["peer_count"] += 1
+        st["total_bytes"] += int(item.get("total_bytes", 0) or 0)
+        st["latest_hs"] = max(int(st.get("latest_hs", 0) or 0), int(item.get("handshake_ts", 0) or 0))
+        st["servers"].add(code)
+        sub = subs_by_tg.get(tid)
+        if sub and bool(getattr(sub, "is_active", False)):
+            st["has_active_sub"] = True
+
+    tg_label: dict[int, str] = {}
+    try:
+        unique_tg_ids = sorted(user_stats.keys())[:100]
+        labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in unique_tg_ids], return_exceptions=True)
+        for tid, lbl in zip(unique_tg_ids, labels):
+            tg_label[tid] = f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)
+    except Exception:
+        pass
+
+    users = list(user_stats.values())
+    users.sort(key=lambda x: (int(x.get("latest_hs", 0) or 0), int(x.get("total_bytes", 0) or 0)), reverse=True)
+
+    lines = ["📈 <b>Кто пользовался VPN</b>", ""]
+    lines.append(f"Пользователей с признаками использования: <b>{len(users)}</b>")
+    lines.append(f"Peer'ов с handshake/трафиком на серверах: <b>{len(used)}</b>")
+    if server_counts:
+        parts = []
+        for code, cnt in sorted(server_counts.items(), key=lambda x: x[0]):
+            parts.append(f"{_server_numbered_label(servers, code)} — <b>{cnt}</b>")
+        lines.append("По серверам: " + " | ".join(parts))
+    if unknown_count:
+        lines.append(f"Не сопоставилось с БД: <b>{unknown_count}</b>")
+    lines.append("")
+
+    for idx, st in enumerate(users[:50], start=1):
+        tid = int(st["tg_id"])
+        who = tg_label.get(tid) or f"ID {tid}"
+        hs = int(st.get("latest_hs", 0) or 0)
+        last_seen = "—"
+        if hs > 0:
+            try:
+                last_seen = _fmt_dt_short(datetime.fromtimestamp(hs, tz=timezone.utc))
+            except Exception:
+                last_seen = str(hs)
+        server_labels = ", ".join(_server_numbered_label(servers, c) for c in sorted(st.get("servers") or [])) or "—"
+        sub_state = "✅" if st.get("has_active_sub") else "—"
+        lines.append(
+            f"{idx}. {who} | peers <b>{int(st.get('peer_count', 0) or 0)}</b> | "
+            f"трафик <b>{_fmt_bytes_short(int(st.get('total_bytes', 0) or 0))}</b> | "
+            f"последнее использование <b>{last_seen}</b> | sub {sub_state} | id <code>{tid}</code>"
+        )
+        lines.append(f"   Серверы: {server_labels}")
+
+    if len(users) > 50:
+        lines.append("")
+        lines.append(f"Показаны первые 50 из {len(users)} пользователей.")
+
+    lines.append("")
+    lines.append("<i>Отчёт строится по текущим peer'ам на серверах: handshake &gt; 0 или есть трафик.</i>")
+
+    text = "\n".join(lines)
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
+
 
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
 async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
