@@ -4,6 +4,7 @@ import base64
 import ipaddress
 import logging
 import os
+import json
 from datetime import timedelta
 from typing import Any, Dict, Optional, Tuple
 
@@ -128,11 +129,155 @@ class VPNService:
 
         raise RuntimeError("No free VPN client IPs available")
 
+    def _load_vpn_servers(self) -> list[dict]:
+        raw = (os.environ.get("VPN_SERVERS_JSON") or os.environ.get("VPN_SERVERS") or "").strip()
+        out: list[dict] = []
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict) and "servers" in data:
+                    data = data["servers"]
+                if isinstance(data, list):
+                    out = [x for x in data if isinstance(x, dict)]
+            except Exception:
+                out = []
+        if out:
+            return out
+        code = (os.environ.get("VPN_CODE") or "NL").upper()
+        return [{
+            "code": code,
+            "name": os.environ.get("VPN_NAME") or code,
+            "host": os.environ.get("WG_SSH_HOST"),
+            "port": int(os.environ.get("WG_SSH_PORT", "22") or 22),
+            "user": os.environ.get("WG_SSH_USER"),
+            "password": os.environ.get("WG_SSH_PASSWORD"),
+            "interface": os.environ.get("VPN_INTERFACE", "wg0"),
+            "tc_dev": os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV"),
+            "server_public_key": os.environ.get("VPN_SERVER_PUBLIC_KEY"),
+            "endpoint": os.environ.get("VPN_ENDPOINT"),
+            "dns": os.environ.get("VPN_DNS", "1.1.1.1"),
+            "max_active": int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40),
+        }]
+
+    def _server_aliases(self, servers: list[dict], code: str) -> set[str]:
+        code_u = str(code or "").strip().upper()
+        if not code_u:
+            return set()
+        aliases = {code_u, code_u.replace(" ", "")}
+        ordinal = None
+        for idx, s in enumerate(servers, start=1):
+            if str(s.get("code") or "").strip().upper() == code_u:
+                ordinal = idx
+                break
+        if ordinal is None:
+            if code_u.startswith("NL") and code_u[2:].isdigit():
+                ordinal = int(code_u[2:])
+            elif code_u == "NL":
+                ordinal = 1
+            else:
+                digits = "".join(ch for ch in code_u if ch.isdigit())
+                if digits:
+                    try:
+                        ordinal = int(digits)
+                    except Exception:
+                        ordinal = None
+        if ordinal is not None:
+            aliases.update({f"SERVER{ordinal}", f"SERVER #{ordinal}", f"NL{ordinal}"})
+            if ordinal == 1:
+                aliases.add("NL")
+        if code_u in {"NL", "NL1"}:
+            aliases.update({"NL", "NL1", "SERVER1", "SERVER #1"})
+        if code_u == "NL2":
+            aliases.update({"SERVER2", "SERVER #2"})
+        return {a for a in aliases if a}
+
+    def _server_capacity(self, server: dict | None) -> int:
+        try:
+            if server and server.get("max_active") is not None:
+                return max(1, int(server.get("max_active")))
+            return max(1, int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40))
+        except Exception:
+            return 40
+
+    async def _vpn_seats_by_server(self, session: AsyncSession) -> dict[str, int]:
+        servers = self._load_vpn_servers()
+        default_code = (os.environ.get("VPN_CODE") or "NL").upper()
+        canonical_for_alias: dict[str, str] = {}
+        result: dict[str, int] = {}
+        for s in servers:
+            code = str(s.get("code") or default_code).upper()
+            result[code] = 0
+            for alias in self._server_aliases(servers, code):
+                canonical_for_alias[str(alias).upper()] = code
+            canonical_for_alias.setdefault(code, code)
+
+        q = (
+            select(
+                func.coalesce(func.upper(VpnPeer.server_code), literal(default_code)).label("code"),
+                func.count(VpnPeer.id).label("cnt"),
+            )
+            .where(VpnPeer.is_active == True)  # noqa: E712
+            .group_by(func.coalesce(func.upper(VpnPeer.server_code), literal(default_code)))
+        )
+        res = await session.execute(q)
+        for raw_code, cnt in res.all():
+            raw = str(raw_code or default_code).upper()
+            canonical = canonical_for_alias.get(raw, raw)
+            result[canonical] = int(result.get(canonical, 0)) + int(cnt or 0)
+
+        for s in servers:
+            code = str(s.get("code") or default_code).upper()
+            host = str(s.get("host") or "").strip()
+            user = str(s.get("user") or "").strip()
+            if not host or not user:
+                continue
+            try:
+                st = await self.get_server_status_for(
+                    host=host,
+                    port=int(s.get("port") or 22),
+                    user=user,
+                    password=s.get("password"),
+                    interface=str(s.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+                )
+                if st.get("ok") and st.get("total_peers") is not None:
+                    result[code] = max(int(result.get(code, 0)), int(st.get("total_peers") or 0))
+            except Exception:
+                pass
+        if not servers:
+            result.setdefault(default_code, 0)
+        return result
+
+    async def _pick_server_for_extra_peer(self, session: AsyncSession, *, inherited_code: str | None = None) -> dict:
+        servers = self._load_vpn_servers()
+        if not servers:
+            raise RuntimeError("No VPN servers configured")
+        used = await self._vpn_seats_by_server(session)
+
+        def can_use(server: dict) -> bool:
+            code = str(server.get("code") or "").upper()
+            seats = int(used.get(code, 0))
+            cap = self._server_capacity(server)
+            return seats < cap
+
+        if inherited_code:
+            inherited_code = inherited_code.upper()
+            for s in servers:
+                if str(s.get("code") or "").upper() == inherited_code and can_use(s):
+                    return s
+
+        for s in servers:
+            if can_use(s):
+                return s
+        raise RuntimeError("All VPN servers are full")
+
     async def create_extra_peer(self, session: AsyncSession, tg_id: int) -> Dict[str, Any]:
         """Create an additional active peer for the same tg_id.
 
         Intended for admin-only usage (multiple devices for the same admin).
         Does not deactivate existing peers.
+        In multi-location mode, the extra peer is created on the current server
+        only if that server still has free capacity; otherwise the next server
+        with free seats is used.
         """
         try:
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
@@ -152,15 +297,26 @@ class VPNService:
         if not inherited_code:
             inherited_code = (os.environ.get("VPN_CODE") or "NL").upper()
 
-        log.info("vpn_create_extra_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, inherited_code)
-        await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+        server = await self._pick_server_for_extra_peer(session, inherited_code=inherited_code)
+        server_code = str(server.get("code") or inherited_code or os.environ.get("VPN_CODE") or "NL").upper()
+        provider = self._provider_for(
+            host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
+            port=int(server.get("port") or 22),
+            user=str(server.get("user") or os.environ.get("WG_SSH_USER") or ""),
+            password=server.get("password"),
+            interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+        )
+
+        log.info("vpn_create_extra_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
             tg_id=tg_id,
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
-            server_code=inherited_code,
+            server_code=server_code,
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
@@ -174,6 +330,16 @@ class VPNService:
             "public_key": client_pub,
             "client_private_key_enc": row.client_private_key_enc,
             "client_private_key_plain": client_priv,
+            "server_code": server_code,
+            "server_public_key": str(server.get("server_public_key") or self.server_pub),
+            "endpoint": str(server.get("endpoint") or self.endpoint),
+            "dns": str(server.get("dns") or self.dns),
+            "host": str(server.get("host") or ""),
+            "port": int(server.get("port") or 22),
+            "user": str(server.get("user") or ""),
+            "password": server.get("password"),
+            "interface": str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            "tc_dev": str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
         }
 
     async def _get_active_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
