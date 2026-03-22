@@ -144,18 +144,26 @@ def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool
 
 
 async def _vpn_seats_by_server() -> dict[str, int]:
-    """Return occupied WG slots per server using strict WG peer counts.
+    """Return occupied WG slots per configured server code.
 
-    Admin capacity must reflect the real peer count on WireGuard. We therefore
-    start with DB counts and then, when SSH is available, raise each server
-    occupancy up to the actual peer count returned by wg show.
+    Legacy DB rows may contain aliases like NL/NL1/SERVER1 for the same first
+    server. We therefore normalize DB counts into the configured server code and
+    only then reconcile them with the real `wg show` peer count from SSH.
     """
     from app.db.models import VpnPeer
 
     servers = _load_vpn_servers_admin()
-    result: dict[str, int] = {}
     default_code = (os.environ.get('VPN_CODE') or 'NL').upper()
     default_code_lit = literal(default_code)
+
+    canonical_for_alias: dict[str, str] = {}
+    for s in servers:
+        code = str(s.get('code') or default_code).upper()
+        for alias in _server_code_aliases(servers, code):
+            canonical_for_alias[str(alias).upper()] = code
+        canonical_for_alias.setdefault(code, code)
+
+    result: dict[str, int] = {str(s.get('code') or default_code).upper(): 0 for s in servers}
 
     async with session_scope() as session:
         q = (
@@ -167,11 +175,10 @@ async def _vpn_seats_by_server() -> dict[str, int]:
             .group_by(func.coalesce(func.upper(VpnPeer.server_code), default_code_lit))
         )
         res = await session.execute(q)
-        result = {str(code).upper(): int(cnt) for code, cnt in res.all()}
-
-    for s in servers:
-        code = str(s.get('code') or default_code).upper()
-        result.setdefault(code, 0)
+        for raw_code, cnt in res.all():
+            raw = str(raw_code or default_code).upper()
+            canonical = canonical_for_alias.get(raw, raw)
+            result[canonical] = int(result.get(canonical, 0)) + int(cnt or 0)
 
     for s in servers:
         code = str(s.get('code') or default_code).upper()
@@ -2048,7 +2055,7 @@ async def admin_vpn_status(cb: CallbackQuery) -> None:
         for idx, s in enumerate(servers, start=1):
             code = str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
             name = str(s.get("name") or code)
-            used = sum(int(used_map.get(alias, 0)) for alias in _server_code_aliases(servers, code))
+            used = int(used_map.get(code, 0))
             try:
                 cap = max(1, int(s.get("max_active") if s.get("max_active") is not None else os.environ.get("VPN_MAX_ACTIVE", "40")))
             except Exception:
