@@ -238,14 +238,15 @@ def _providers_for_server_code_admin(code: str | None) -> list[WireGuardSSHProvi
             continue
         _add(srv.get('host'), srv.get('port') or 22, srv.get('user'), srv.get('password'), srv.get('interface') or 'wg0')
 
-    # fallback to default single-server env
-    _add(
-        os.environ.get('WG_SSH_HOST') or os.environ.get('VPN_SSH_HOST'),
-        int(os.environ.get('WG_SSH_PORT') or os.environ.get('VPN_SSH_PORT') or 22),
-        os.environ.get('WG_SSH_USER') or os.environ.get('VPN_SSH_USER'),
-        os.environ.get('WG_SSH_PASSWORD') or os.environ.get('VPN_SSH_PASSWORD'),
-        os.environ.get('VPN_INTERFACE') or 'wg0',
-    )
+    # fallback to default single-server env ONLY when multi-server JSON is absent
+    if not servers:
+        _add(
+            os.environ.get('WG_SSH_HOST') or os.environ.get('VPN_SSH_HOST'),
+            int(os.environ.get('WG_SSH_PORT') or os.environ.get('VPN_SSH_PORT') or 22),
+            os.environ.get('WG_SSH_USER') or os.environ.get('VPN_SSH_USER'),
+            os.environ.get('WG_SSH_PASSWORD') or os.environ.get('VPN_SSH_PASSWORD'),
+            os.environ.get('VPN_INTERFACE') or 'wg0',
+        )
     return providers
 
 def _region_service() -> RegionVpnService:
