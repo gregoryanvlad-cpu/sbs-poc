@@ -225,6 +225,33 @@ class WireGuardSSHProvider:
                 res[key] = ep
         return res
 
+    async def get_peer_transfers(self) -> dict[str, dict[str, int]]:
+        """Return transfer counters for peers.
+
+        Output of `wg show <iface> transfer`:
+          <pubkey>	<rx_bytes>	<tx_bytes>
+        """
+        out = await self._run_output(f"{WG_BIN} show {self.interface} transfer", check=False)
+        res: dict[str, dict[str, int]] = {}
+        if not out:
+            return res
+        for ln in out.splitlines():
+            parts = ln.strip().split()
+            if len(parts) < 3:
+                continue
+            key = parts[0].strip()
+            try:
+                rx = int(parts[1])
+            except Exception:
+                rx = 0
+            try:
+                tx = int(parts[2])
+            except Exception:
+                tx = 0
+            if key:
+                res[key] = {"rx_bytes": rx, "tx_bytes": tx}
+        return res
+
     async def has_peer(self, public_key: str) -> bool:
         """Check if a peer exists on the interface (best-effort)."""
         if not public_key:
