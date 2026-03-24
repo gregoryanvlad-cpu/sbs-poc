@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -15,6 +16,30 @@ from app.db.models.payout_request import PayoutRequest
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
+
+
+def _percent_override_for_tg_id(tg_id: int) -> int | None:
+    raw = (getattr(settings, "referral_percent_overrides_json", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        val = data.get(str(int(tg_id)))
+        if val is None:
+            val = data.get(int(tg_id)) if isinstance(data, dict) else None
+        if val is None:
+            return None
+        pct = int(val)
+        if pct < 0:
+            return 0
+        if pct > 100:
+            return 100
+        return pct
+    except Exception:
+        return None
 
 def _level_percent(active_referrals: int) -> int:
     """3-level commission:
@@ -44,6 +69,9 @@ class ReferralService:
         return int(cnt or 0)
 
     async def current_percent(self, session, tg_id: int) -> int:
+        override = _percent_override_for_tg_id(int(tg_id))
+        if override is not None:
+            return int(override)
         return _level_percent(await self.count_active_referrals(session, tg_id))
 
     async def get_balance(self, session, tg_id: int) -> tuple[int, int]:
@@ -352,7 +380,8 @@ class ReferralService:
             session.add(referral)
             await session.flush()
 
-        percent = _level_percent(await self.count_active_referrals(session, referrer_id))
+        override = _percent_override_for_tg_id(int(referrer_id))
+        percent = int(override) if override is not None else _level_percent(await self.count_active_referrals(session, referrer_id))
         pay_amount = int(payment.amount or 0)
         earned = int(round(pay_amount * percent / 100.0))
 
@@ -384,35 +413,6 @@ class ReferralService:
         await session.flush()
 
         percent = _level_percent(await self.count_active_referrals(session, referrer_id))
-        pay_amount = int(payment.amount or 0)
-        earned = int(round(pay_amount * percent / 100.0))
-
-        # Idempotency: one earning per (payment_id, referrer)
-        exists = await session.scalar(
-            select(ReferralEarning.id).where(
-                ReferralEarning.payment_id == payment.id,
-                ReferralEarning.referrer_tg_id == referrer_id,
-            ).limit(1)
-        )
-        if exists:
-            return
-
-        hold_days = int(getattr(settings, "referral_hold_days", 7) or 7)
-        available_at = (payment.paid_at or _utcnow()) + timedelta(days=hold_days)
-
-        session.add(
-            ReferralEarning(
-                referrer_tg_id=referrer_id,
-                referred_tg_id=payer_id,
-                payment_id=payment.id,
-                payment_amount_rub=pay_amount,
-                percent=percent,
-                earned_rub=earned,
-                status="pending" if hold_days else "available",
-                available_at=available_at if hold_days else None,
-            )
-        )
-        await session.flush()
 
     # Backward-compat: nav.py calls on_successful_payment(session, payment)
     async def on_successful_payment(self, session, payment: Payment) -> None:
