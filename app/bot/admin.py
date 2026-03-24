@@ -45,6 +45,24 @@ from app.services.message_audit import audit_send_message
 
 log = logging.getLogger(__name__)
 
+
+def _split_html_lines(lines: list[str], *, limit: int = 3500) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for line in lines:
+        extra = len(line) + (1 if cur else 0)
+        if cur and cur_len + extra > limit:
+            parts.append("\n".join(cur))
+            cur = [line]
+            cur_len = len(line)
+            continue
+        cur.append(line)
+        cur_len += extra
+    if cur:
+        parts.append("\n".join(cur))
+    return parts
+
 def _fmt_bytes_short(num: int) -> str:
     try:
         n = int(num or 0)
@@ -2446,10 +2464,11 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
 
     tg_label: dict[int, str] = {}
     try:
-        unique_tg_ids = sorted(user_stats.keys())[:100]
+        unique_tg_ids = sorted(user_stats.keys())[:200]
         labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in unique_tg_ids], return_exceptions=True)
         for tid, lbl in zip(unique_tg_ids, labels):
-            tg_label[tid] = f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)
+            raw_lbl = f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)
+            tg_label[tid] = html.escape(raw_lbl, quote=False)
     except Exception:
         pass
 
@@ -2468,7 +2487,7 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         lines.append(f"Не сопоставилось с БД: <b>{unknown_count}</b>")
     lines.append("")
 
-    for idx, st in enumerate(users[:30], start=1):
+    for idx, st in enumerate(users[:20], start=1):
         tid = int(st["tg_id"])
         who = tg_label.get(tid) or f"ID {tid}"
         hs = int(st.get("latest_hs", 0) or 0)
@@ -2487,21 +2506,34 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         )
         lines.append(f"   Серверы: {server_labels}")
 
-    if len(users) > 30:
+    if len(users) > 20:
         lines.append("")
-        lines.append(f"Показаны первые 30 из {len(users)} пользователей.")
+        lines.append(f"Показаны первые 20 из {len(users)} пользователей.")
 
     lines.append("")
     lines.append("<i>Отчёт строится по текущим peer'ам на серверах: handshake &gt; 0 или есть трафик.</i>")
 
-    text = "\n".join(lines)
+    parts = _split_html_lines(lines, limit=3500)
+    if not parts:
+        parts = ["📈 <b>Кто пользовался VPN</b>\n\nНет данных."]
+
     try:
-        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        await cb.message.edit_text(parts[0], reply_markup=_kb_admin_back(), parse_mode="HTML")
     except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        msg = str(e).lower()
+        if "message is not modified" in msg:
+            try:
+                await cb.answer()
+            except Exception:
+                pass
+        elif "message_too_long" in msg or "message is too long" in msg or "can't parse entities" in msg:
+            await cb.message.answer(parts[0], reply_markup=_kb_admin_back(), parse_mode="HTML")
         else:
             raise
+
+    for extra in parts[1:]:
+        await cb.message.answer(extra, parse_mode="HTML")
+
 
 
 @router.callback_query(lambda c: c.data == "admin:vpn:active_profiles")
