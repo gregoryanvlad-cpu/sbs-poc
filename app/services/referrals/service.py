@@ -10,6 +10,7 @@ from sqlalchemy import case, func, select
 
 from app.core.config import settings
 from app.db.models import Payment, Referral, ReferralEarning, User
+from app.db.models.app_setting import AppSetting
 from app.db.models.payout_request import PayoutRequest
 
 
@@ -19,7 +20,16 @@ def _utcnow() -> datetime:
 
 
 
-def _percent_override_for_tg_id(tg_id: int) -> int | None:
+def _clamp_percent(value: int) -> int:
+    pct = int(value)
+    if pct < 0:
+        return 0
+    if pct > 100:
+        return 100
+    return pct
+
+
+def _percent_override_from_settings(tg_id: int) -> int | None:
     raw = (getattr(settings, "referral_percent_overrides_json", "") or "").strip()
     if not raw:
         return None
@@ -32,14 +42,19 @@ def _percent_override_for_tg_id(tg_id: int) -> int | None:
             val = data.get(int(tg_id)) if isinstance(data, dict) else None
         if val is None:
             return None
-        pct = int(val)
-        if pct < 0:
-            return 0
-        if pct > 100:
-            return 100
-        return pct
+        return _clamp_percent(int(val))
     except Exception:
         return None
+
+
+def _next_level_info(active_referrals: int) -> tuple[int | None, int | None]:
+    active = int(active_referrals or 0)
+    if active < 4:
+        return 11, 4
+    if active < 10:
+        return 17, 10
+    return None, None
+
 
 def _level_percent(active_referrals: int) -> int:
     """3-level commission:
@@ -68,11 +83,52 @@ class ReferralService:
         )
         return int(cnt or 0)
 
+    async def get_percent_override(self, session, tg_id: int) -> int | None:
+        key = f"referral_percent_override:{int(tg_id)}"
+        row = await session.get(AppSetting, key)
+        if row is not None and getattr(row, "int_value", None) is not None:
+            return _clamp_percent(int(row.int_value))
+        return _percent_override_from_settings(int(tg_id))
+
+    async def set_percent_override(self, session, *, tg_id: int, percent: int | None) -> None:
+        key = f"referral_percent_override:{int(tg_id)}"
+        row = await session.get(AppSetting, key)
+        if percent is None:
+            if row is not None:
+                await session.delete(row)
+                await session.flush()
+            return
+        pct = _clamp_percent(int(percent))
+        if row is None:
+            row = AppSetting(key=key, int_value=pct)
+            session.add(row)
+        else:
+            row.int_value = pct
+        row.touch()
+        await session.flush()
+
     async def current_percent(self, session, tg_id: int) -> int:
-        override = _percent_override_for_tg_id(int(tg_id))
+        override = await self.get_percent_override(session, int(tg_id))
         if override is not None:
             return int(override)
         return _level_percent(await self.count_active_referrals(session, tg_id))
+
+    async def percent_progress(self, session, tg_id: int) -> dict[str, int | bool | None]:
+        active = await self.count_active_referrals(session, tg_id)
+        override = await self.get_percent_override(session, int(tg_id))
+        current = int(override) if override is not None else _level_percent(active)
+        next_percent, next_target = _next_level_info(active)
+        left = None
+        if next_target is not None:
+            left = max(0, int(next_target) - int(active))
+        return {
+            "current_percent": int(current),
+            "active_referrals": int(active),
+            "has_override": bool(override is not None),
+            "next_percent": None if override is not None else next_percent,
+            "next_target_active": None if override is not None else next_target,
+            "referrals_left_to_next": None if override is not None else left,
+        }
 
     async def get_balance(self, session, tg_id: int) -> tuple[int, int]:
         """Returns (pending_sum, available_sum) in RUB integers."""
@@ -380,7 +436,7 @@ class ReferralService:
             session.add(referral)
             await session.flush()
 
-        override = _percent_override_for_tg_id(int(referrer_id))
+        override = await self.get_percent_override(session, int(referrer_id))
         percent = int(override) if override is not None else _level_percent(await self.count_active_referrals(session, referrer_id))
         pay_amount = int(payment.amount or 0)
         earned = int(round(pay_amount * percent / 100.0))
@@ -412,7 +468,6 @@ class ReferralService:
         )
         await session.flush()
 
-        percent = _level_percent(await self.count_active_referrals(session, referrer_id))
 
     # Backward-compat: nav.py calls on_successful_payment(session, payment)
     async def on_successful_payment(self, session, payment: Payment) -> None:
