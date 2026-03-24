@@ -105,6 +105,7 @@ class Settings:
     # Referrals
     referral_hold_days: int = 7
     referral_min_payout_rub: int = 50
+    referral_percent_overrides_json: str = ""
 
     # PoiskKino (ex-openmoviedb)
     poiskkino_base_url: str = "https://api.poiskkino.dev"
@@ -223,6 +224,7 @@ def _load_settings() -> Settings:
         # Referrals
         referral_hold_days=int(os.getenv("REFERRAL_HOLD_DAYS", "7")),
         referral_min_payout_rub=int(os.getenv("REFERRAL_MIN_PAYOUT_RUB", "50")),
+        referral_percent_overrides_json=os.getenv("REFERRAL_PERCENT_OVERRIDES_JSON", ""),
 
         # PoiskKino
         poiskkino_base_url=os.getenv("POISKKINO_BASE_URL", "https://api.poiskkino.dev").strip(),
