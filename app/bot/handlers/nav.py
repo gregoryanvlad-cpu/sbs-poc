@@ -551,7 +551,7 @@ async def _next_vpn_bundle_filename_global(session) -> str:
     n = int(n) + 1
     await set_app_setting_int(session, 'vpn_conf_serial', n)
     # Keep exactly the requested casing
-    return f'sbsVPN{n}.conf'
+    return f'wg{n}.conf'
 
 
 async def _get_or_assign_vpn_bundle_filename_for_peer(session, peer_id: int | None) -> str:
@@ -565,7 +565,7 @@ async def _get_or_assign_vpn_bundle_filename_for_peer(session, peer_id: int | No
         serial = int(serial) + 1
         await set_app_setting_int(session, 'vpn_conf_serial', serial)
         await set_app_setting_int(session, key, int(serial))
-    return f"sbsVPN{int(serial)}.conf"
+    return f"wg{int(serial)}.conf"
 
 
 def _reset_vpn_bundle_counter(tg_id: int) -> None:
@@ -3276,6 +3276,7 @@ def _family_forward_instructions_text() -> str:
 2) Откройте файл <code>.conf</code> или сохраните его в память устройства.
 3) В WireGuard нажмите <b>+</b> → <b>Импорт из файла</b>.
 4) Выберите присланный файл и включите профиль.
+5) Если WireGuard пишет <b>«Неправильное имя»</b>, переименуйте файл в короткое имя латиницей, например <code>wg.conf</code>, и импортируйте снова.
 
 <b>Windows</b>
 1) Установите <b>WireGuard</b> для Windows.
@@ -3417,7 +3418,7 @@ async def on_family_share_slot(cb: CallbackQuery) -> None:
 
     # Build and send config (no QR)
     conf_text = vpn_service.build_wg_conf(peer_dict, user_label=f"family:{tg_id}:{slot_no}")
-    conf_file = BufferedInputFile(conf_text.encode(), filename=f"FamilyVPN{slot_no}.conf")
+    conf_file = BufferedInputFile(conf_text.encode(), filename=f"wgf{slot_no}.conf")
     await cb.message.answer_document(
         conf_file,
         caption=(
