@@ -59,6 +59,22 @@ router = Router()
 TG_PROXY_URL = "https://t.me/proxy?server=mt.masterpix.org&port=443&secret=7ix9qzx1rb59pdRm9E7ivEp4cC5hcHBsZS5jb20"
 
 
+async def _mark_purchase_notified_once(session, *, provider_payment_id: str | None, payment_id: int | None) -> bool:
+    """Return True only for the first successful admin notification for this payment."""
+    marker = (provider_payment_id or "").strip() or (f"db:{int(payment_id)}" if payment_id is not None else "")
+    if not marker:
+        return True
+    key = f"purchase_admin_notified:{marker}"
+    try:
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": key})
+    except Exception:
+        pass
+    if await get_app_setting_int(session, key, default=0):
+        return False
+    await set_app_setting_int(session, key, 1)
+    return True
+
+
 def kb_tgproxy() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1590,20 +1606,26 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                     sub.end_at = new_end
                     sub.is_active = True
                     sub.status = "active"
+                    should_notify_admins = await _mark_purchase_notified_once(
+                        session,
+                        provider_payment_id=provider_tid,
+                        payment_id=getattr(pay, "id", None),
+                    )
                     await session.commit()
 
                     # Admin notification about new purchase (best-effort)
-                    try:
-                        await _notify_admins_new_purchase(
-                            bot,
-                            buyer_tg_id=tg_id,
-                            amount_rub=int(pay.amount),
-                            months=add_months,
-                            provider=str(pay.provider or "platega"),
-                            new_end_at=new_end,
-                        )
-                    except Exception:
-                        pass
+                    if should_notify_admins:
+                        try:
+                            await _notify_admins_new_purchase(
+                                bot,
+                                buyer_tg_id=tg_id,
+                                amount_rub=int(pay.amount),
+                                months=add_months,
+                                provider=str(pay.provider or "platega"),
+                                new_end_at=new_end,
+                            )
+                        except Exception:
+                            pass
 
                     try:
                         await bot.send_message(
@@ -1931,20 +1953,26 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                 # do not fail payment flow
                 new_invite_link = None
 
+            should_notify_admins = await _mark_purchase_notified_once(
+                session,
+                provider_payment_id=pay.provider_payment_id,
+                payment_id=getattr(pay, "id", None),
+            )
             await session.commit()
 
             # Admin notification about new purchase (best-effort)
-            try:
-                await _notify_admins_new_purchase(
-                    cb.bot,
-                    buyer_tg_id=cb.from_user.id,
-                    amount_rub=int(pay.amount),
-                    months=add_months,
-                    provider=str(pay.provider or "platega"),
-                    new_end_at=new_end,
-                )
-            except Exception:
-                pass
+            if should_notify_admins:
+                try:
+                    await _notify_admins_new_purchase(
+                        cb.bot,
+                        buyer_tg_id=cb.from_user.id,
+                        amount_rub=int(pay.amount),
+                        months=add_months,
+                        provider=str(pay.provider or "platega"),
+                        new_end_at=new_end,
+                    )
+                except Exception:
+                    pass
 
             await cb.answer("Оплата подтверждена")
             kb = InlineKeyboardMarkup(
