@@ -136,7 +136,12 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
             .order_by(YandexMembership.id.desc())
             .limit(1)
         )
-        if ym and ym.invite_link:
+        if (
+            ym
+            and ym.invite_link
+            and getattr(ym, "removed_at", None) is None
+            and (ym.coverage_end_at is None or ym.coverage_end_at > now)
+        ):
             invite_link = ym.invite_link
         else:
             try:
