@@ -7,7 +7,6 @@ from app.core.config import settings
 from app.db.models.yandex_membership import YandexMembership
 from app.db.models.user import User
 from app.db.session import session_scope
-from app.services.yandex.provider import build_provider
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ class YandexGuardService:
     """
 
     def __init__(self) -> None:
-        self.provider = build_provider()
+        self.provider = None
 
     async def verify_join(
         self,
@@ -33,6 +32,14 @@ class YandexGuardService:
         expected_login = (expected_login or "").lower().strip().lstrip("@")
         if not expected_login:
             return
+
+        if self.provider is None:
+            try:
+                from app.services.yandex.provider import build_provider
+                self.provider = build_provider()
+            except Exception:
+                log.warning("YandexGuard: legacy provider unavailable; join verification skipped")
+                return
 
         snapshot = await self.provider.probe(storage_state_path=yandex_account_storage)
 
