@@ -2152,7 +2152,7 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
     qr_img.save(buf, format="PNG")
     buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode(), filename=filename)
+    conf_file = BufferedInputFile(conf_text.encode(), filename="wg.conf")
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
     msg_conf = await cb.bot.send_document(
@@ -2539,7 +2539,7 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     qr_img.save(buf, format="PNG")
     buf.seek(0)
 
-    conf_file = BufferedInputFile(conf_text.encode(), filename=filename)
+    conf_file = BufferedInputFile(conf_text.encode(), filename="wg.conf")
     qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
 
     msg_conf = await cb.message.answer_document(
