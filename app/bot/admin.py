@@ -479,6 +479,11 @@ class AdminReferralOwnerFSM(StatesGroup):
     waiting_referred = State()
 
 
+class AdminReferralPercentFSM(StatesGroup):
+    waiting_target = State()
+    waiting_percent = State()
+
+
 class AdminPriceFSM(StatesGroup):
     waiting_price = State()
 
@@ -2370,7 +2375,16 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
     except Exception:
         pass
 
-    used = await vpn_service.get_used_peer_stats()
+    try:
+        used = await vpn_service.get_used_peer_stats()
+    except Exception:
+        log.exception("admin_vpn_usage_failed")
+        await cb.message.answer(
+            "❌ Не удалось собрать статистику по VPN. Проверь SSH-доступы до серверов и логи.",
+            reply_markup=_kb_admin_back(),
+        )
+        return
+
     if not used:
         text = (
             "📈 <b>Кто пользовался VPN</b>\n\n"
@@ -2454,7 +2468,7 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         lines.append(f"Не сопоставилось с БД: <b>{unknown_count}</b>")
     lines.append("")
 
-    for idx, st in enumerate(users[:50], start=1):
+    for idx, st in enumerate(users[:30], start=1):
         tid = int(st["tg_id"])
         who = tg_label.get(tid) or f"ID {tid}"
         hs = int(st.get("latest_hs", 0) or 0)
@@ -2473,9 +2487,9 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         )
         lines.append(f"   Серверы: {server_labels}")
 
-    if len(users) > 50:
+    if len(users) > 30:
         lines.append("")
-        lines.append(f"Показаны первые 50 из {len(users)} пользователей.")
+        lines.append(f"Показаны первые 30 из {len(users)} пользователей.")
 
     lines.append("")
     lines.append("<i>Отчёт строится по текущим peer'ам на серверах: handshake &gt; 0 или есть трафик.</i>")
@@ -3108,6 +3122,114 @@ async def admin_ref_wait_new_owner(message: Message, state: FSMContext) -> None:
         f"Реферал: <b>{ref_lbl}</b>\n"
         f"Был у: <b>{prev_lbl}</b>\n"
         f"Теперь у: <b>{await _format_user_label(message.bot, int(new_owner_id))}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_menu(),
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:ref:percent")
+async def admin_ref_percent_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.set_state(AdminReferralPercentFSM.waiting_target)
+    await cb.message.edit_text(
+        "🎯 <b>Изменить % реферальных отчислений</b>\n\n"
+        "Отправь TG ID пользователя или @username, для которого нужно изменить процент.",
+        reply_markup=_kb_ref_manage(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.message(AdminReferralPercentFSM.waiting_target)
+async def admin_ref_percent_wait_target(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    target_id = await _resolve_tg_id_from_text(message.bot, message.text or "")
+    if not target_id:
+        await message.answer("❌ Не получилось распознать пользователя. Пришли TG ID (цифры) или @username")
+        return
+
+    async with session_scope() as session:
+        progress = await referral_service.percent_progress(session, int(target_id))
+
+    await state.update_data(target_tg_id=int(target_id))
+    await state.set_state(AdminReferralPercentFSM.waiting_percent)
+
+    current_pct = int(progress.get("current_percent", 0) or 0)
+    has_override = bool(progress.get("has_override"))
+    hint = "Сейчас у пользователя персональные условия." if has_override else "Сейчас у пользователя обычная лестница уровней."
+    await message.answer(
+        "🎯 <b>Изменить % реферальных отчислений</b>\n\n"
+        f"Пользователь: <code>{int(target_id)}</code>\n"
+        f"Текущий процент: <b>{current_pct}%</b>\n"
+        f"{hint}\n\n"
+        "Отправь новый процент числом от 0 до 100.\n"
+        "Чтобы вернуть стандартную лестницу, отправь <code>reset</code> или <code>сброс</code>.",
+        parse_mode="HTML",
+        reply_markup=_kb_ref_manage(),
+    )
+
+
+@router.message(AdminReferralPercentFSM.waiting_percent)
+async def admin_ref_percent_wait_percent(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    target_tg_id = int(data.get("target_tg_id") or 0)
+    if not target_tg_id:
+        await state.clear()
+        await message.answer("❌ Сессия сбилась. Открой управление рефералами заново.", reply_markup=kb_admin_menu())
+        return
+
+    raw = (message.text or "").strip().lower()
+    reset_words = {"reset", "сброс", "очистить", "clear", "default", "по умолчанию"}
+    percent_value = None
+    if raw not in reset_words:
+        try:
+            percent_value = int(raw)
+        except Exception:
+            await message.answer("❌ Пришли число от 0 до 100 или reset/сброс для возврата к стандартной лестнице.")
+            return
+        if percent_value < 0 or percent_value > 100:
+            await message.answer("❌ Процент должен быть от 0 до 100.")
+            return
+
+    async with session_scope() as session:
+        await referral_service.set_percent_override(session, tg_id=int(target_tg_id), percent=percent_value)
+        progress = await referral_service.percent_progress(session, int(target_tg_id))
+        await session.commit()
+
+    await state.clear()
+
+    if percent_value is None:
+        status_line = "Персональные условия сняты. Пользователь снова на стандартной лестнице."
+    else:
+        status_line = f"Установлен персональный процент: <b>{int(percent_value)}%</b>."
+
+    next_line = "Следующий уровень: <b>персональные условия</b>"
+    if not bool(progress.get("has_override")):
+        next_percent = progress.get("next_percent")
+        next_target = progress.get("next_target_active")
+        left = progress.get("referrals_left_to_next")
+        if next_percent is None or next_target is None:
+            next_line = "Следующий уровень: <b>максимальный достигнут</b>"
+        else:
+            next_line = (
+                f"Следующий уровень: <b>{int(next_percent)}%</b> при <b>{int(next_target)}</b> активных рефералах "
+                f"(осталось <b>{int(left or 0)}</b>)"
+            )
+
+    await message.answer(
+        "✅ <b>Готово</b>\n\n"
+        f"Пользователь: <code>{int(target_tg_id)}</code>\n"
+        f"{status_line}\n"
+        f"Текущий процент: <b>{int(progress.get('current_percent', 0) or 0)}%</b>\n"
+        f"{next_line}",
         parse_mode="HTML",
         reply_markup=kb_admin_menu(),
     )
