@@ -95,6 +95,41 @@ async def _send_html_chunks(message: Message, parts: list[str], *, reply_markup=
             sent_any = True
 
 
+async def _send_plain_chunks(message: Message, parts: list[str], *, reply_markup=None, edit_first: bool = False) -> None:
+    sent_any = False
+    for idx, raw in enumerate(parts):
+        chunk = (raw or '').strip() or '—'
+        chunk = chunk[:3500]
+        try:
+            if idx == 0 and edit_first:
+                await message.edit_text(chunk, reply_markup=reply_markup)
+            else:
+                await message.answer(chunk, reply_markup=reply_markup if (idx == 0 and not edit_first) else None)
+            sent_any = True
+            continue
+        except TelegramBadRequest as e:
+            msg = str(e).lower()
+            if 'message is not modified' in msg:
+                sent_any = True
+                continue
+            if 'message_too_long' not in msg and 'message is too long' not in msg:
+                raise
+        subparts = [chunk[i:i+2000] for i in range(0, len(chunk), 2000)] or ['—']
+        for sub_idx, sub in enumerate(subparts):
+            try:
+                if idx == 0 and edit_first and not sent_any and sub_idx == 0:
+                    await message.edit_text(sub, reply_markup=reply_markup)
+                else:
+                    await message.answer(sub, reply_markup=reply_markup if (idx == 0 and sub_idx == 0 and not edit_first) else None)
+                sent_any = True
+            except TelegramBadRequest:
+                try:
+                    await message.answer(sub[:1500])
+                    sent_any = True
+                except Exception:
+                    pass
+
+
 def _fmt_bytes_short(num: int) -> str:
     try:
         n = int(num or 0)
@@ -2435,122 +2470,128 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         )
         return
 
-    if not used:
-        text = (
-            "📈 <b>Кто пользовался VPN</b>\n\n"
-            "Пока не найдено peer'ов с handshake или трафиком на текущих серверах."
-        )
-        try:
-            await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
-        except TelegramBadRequest as e:
-            if "message is not modified" in str(e):
-                await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
-            else:
-                raise
-        return
-
-    keys = [x.get("public_key") for x in used if x.get("public_key")][:500]
-    peer_rows: dict[str, VpnPeer] = {}
-    subs_by_tg: dict[int, Subscription] = {}
-    servers = _load_vpn_servers_admin()
-
-    async with session_scope() as session:
-        res = await session.execute(select(VpnPeer).where(VpnPeer.client_public_key.in_(keys)))
-        for row in res.scalars().all():
-            peer_rows[row.client_public_key] = row
-
-        tg_ids = sorted({int(row.tg_id) for row in peer_rows.values()})
-        if tg_ids:
-            res2 = await session.execute(select(Subscription).where(Subscription.tg_id.in_(tg_ids)))
-            for sub in res2.scalars().all():
-                subs_by_tg[int(sub.tg_id)] = sub
-
-    user_stats: dict[int, dict] = {}
-    unknown_count = 0
-    server_counts: dict[str, int] = {}
-
-    for item in used:
-        key = item.get("public_key")
-        row = peer_rows.get(key)
-        code = str((item.get("server_code") or (row.server_code if row else None) or "NL")).upper()
-        server_counts[code] = int(server_counts.get(code, 0) or 0) + 1
-        if not row:
-            unknown_count += 1
-            continue
-        tid = int(row.tg_id)
-        st = user_stats.setdefault(tid, {
-            "tg_id": tid,
-            "peer_count": 0,
-            "total_bytes": 0,
-            "latest_hs": 0,
-            "servers": set(),
-            "has_active_sub": False,
-        })
-        st["peer_count"] += 1
-        st["total_bytes"] += int(item.get("total_bytes", 0) or 0)
-        st["latest_hs"] = max(int(st.get("latest_hs", 0) or 0), int(item.get("handshake_ts", 0) or 0))
-        st["servers"].add(code)
-        sub = subs_by_tg.get(tid)
-        if sub and bool(getattr(sub, "is_active", False)):
-            st["has_active_sub"] = True
-
-    tg_label: dict[int, str] = {}
     try:
-        unique_tg_ids = sorted(user_stats.keys())[:200]
-        labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in unique_tg_ids], return_exceptions=True)
-        for tid, lbl in zip(unique_tg_ids, labels):
-            raw_lbl = f"ID {tid}" if isinstance(lbl, Exception) else str(lbl)
-            tg_label[tid] = html.escape(raw_lbl, quote=False)
+        servers = _load_vpn_servers_admin()
+        if not used:
+            await _send_plain_chunks(
+                cb.message,
+                [
+                    "📈 Кто пользовался VPN\n\nПока не найдено peer'ов с handshake или трафиком на текущих серверах.",
+                ],
+                reply_markup=_kb_admin_back(),
+                edit_first=False,
+            )
+            return
+
+        keys = [x.get("public_key") for x in used if x.get("public_key")][:1000]
+        peer_rows: dict[str, VpnPeer] = {}
+        subs_by_tg: dict[int, Subscription] = {}
+
+        async with session_scope() as session:
+            if keys:
+                res = await session.execute(select(VpnPeer).where(VpnPeer.client_public_key.in_(keys)))
+                for row in res.scalars().all():
+                    peer_rows[row.client_public_key] = row
+
+            tg_ids = sorted({int(row.tg_id) for row in peer_rows.values()})
+            if tg_ids:
+                res2 = await session.execute(select(Subscription).where(Subscription.tg_id.in_(tg_ids)))
+                for sub in res2.scalars().all():
+                    subs_by_tg[int(sub.tg_id)] = sub
+
+        user_stats: dict[int, dict] = {}
+        unknown_count = 0
+        server_counts: dict[str, int] = {}
+
+        for item in used:
+            key = item.get("public_key")
+            row = peer_rows.get(key)
+            code = str((item.get("server_code") or (getattr(row, 'server_code', None) if row else None) or "NL")).upper()
+            server_counts[code] = int(server_counts.get(code, 0) or 0) + 1
+            if not row:
+                unknown_count += 1
+                continue
+            tid = int(row.tg_id)
+            st = user_stats.setdefault(tid, {
+                "tg_id": tid,
+                "peer_count": 0,
+                "total_bytes": 0,
+                "latest_hs": 0,
+                "servers": set(),
+                "has_active_sub": False,
+            })
+            st["peer_count"] += 1
+            st["total_bytes"] += int(item.get("total_bytes", 0) or 0)
+            st["latest_hs"] = max(int(st.get("latest_hs", 0) or 0), int(item.get("handshake_ts", 0) or 0))
+            st["servers"].add(code)
+            sub = subs_by_tg.get(tid)
+            if sub and bool(getattr(sub, "is_active", False)):
+                st["has_active_sub"] = True
+
+        users = list(user_stats.values())
+        users.sort(key=lambda x: (int(x.get("latest_hs", 0) or 0), int(x.get("total_bytes", 0) or 0)), reverse=True)
+
+        tg_label: dict[int, str] = {}
+        try:
+            unique_tg_ids = [int(x["tg_id"]) for x in users[:50]]
+            labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in unique_tg_ids], return_exceptions=True)
+            for tid, lbl in zip(unique_tg_ids, labels):
+                if isinstance(lbl, Exception):
+                    tg_label[tid] = f"ID {tid}"
+                else:
+                    tg_label[tid] = str(lbl).replace("\n", " ").strip() or f"ID {tid}"
+        except Exception:
+            pass
+
+        summary_lines = ["📈 Кто пользовался VPN", ""]
+        summary_lines.append(f"Пользователей с признаками использования: {len(users)}")
+        summary_lines.append(f"Peer'ов с handshake/трафиком на серверах: {len(used)}")
+        if server_counts:
+            parts = []
+            for code, cnt in sorted(server_counts.items(), key=lambda x: x[0]):
+                parts.append(f"{_server_numbered_label(servers, code)} — {cnt}")
+            summary_lines.append("По серверам: " + " | ".join(parts))
+        if unknown_count:
+            summary_lines.append(f"Не сопоставилось с БД: {unknown_count}")
+        summary_lines.append("")
+
+        detail_lines: list[str] = []
+        for idx, st in enumerate(users[:20], start=1):
+            tid = int(st["tg_id"])
+            who = tg_label.get(tid) or f"ID {tid}"
+            hs = int(st.get("latest_hs", 0) or 0)
+            last_seen = "—"
+            if hs > 0:
+                try:
+                    last_seen = _fmt_dt_short(datetime.fromtimestamp(hs, tz=timezone.utc))
+                except Exception:
+                    last_seen = str(hs)
+            server_labels = ", ".join(_server_numbered_label(servers, c) for c in sorted(st.get("servers") or [])) or "—"
+            sub_state = "active" if st.get("has_active_sub") else "—"
+            detail_lines.extend([
+                f"{idx}. {who}",
+                f"   peers: {int(st.get('peer_count', 0) or 0)} | traffic: {_fmt_bytes_short(int(st.get('total_bytes', 0) or 0))} | sub: {sub_state}",
+                f"   last handshake: {last_seen}",
+                f"   servers: {server_labels}",
+                f"   id: {tid}",
+                "",
+            ])
+
+        if len(users) > 20:
+            detail_lines.append(f"Показаны первые 20 из {len(users)} пользователей.")
+            detail_lines.append("")
+        detail_lines.append("Отчёт строится по текущим peer'ам на серверах: handshake > 0 или есть трафик.")
+
+        parts = _split_html_lines([re.sub(r"[<>]", "", x) for x in (summary_lines + detail_lines)], limit=2800)
+        if not parts:
+            parts = ["📈 Кто пользовался VPN\n\nНет данных."]
+        await _send_plain_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=False)
     except Exception:
-        pass
-
-    users = list(user_stats.values())
-    users.sort(key=lambda x: (int(x.get("latest_hs", 0) or 0), int(x.get("total_bytes", 0) or 0)), reverse=True)
-
-    lines = ["📈 <b>Кто пользовался VPN</b>", ""]
-    lines.append(f"Пользователей с признаками использования: <b>{len(users)}</b>")
-    lines.append(f"Peer'ов с handshake/трафиком на серверах: <b>{len(used)}</b>")
-    if server_counts:
-        parts = []
-        for code, cnt in sorted(server_counts.items(), key=lambda x: x[0]):
-            parts.append(f"{_server_numbered_label(servers, code)} — <b>{cnt}</b>")
-        lines.append("По серверам: " + " | ".join(parts))
-    if unknown_count:
-        lines.append(f"Не сопоставилось с БД: <b>{unknown_count}</b>")
-    lines.append("")
-
-    for idx, st in enumerate(users[:10], start=1):
-        tid = int(st["tg_id"])
-        who = tg_label.get(tid) or f"ID {tid}"
-        hs = int(st.get("latest_hs", 0) or 0)
-        last_seen = "—"
-        if hs > 0:
-            try:
-                last_seen = _fmt_dt_short(datetime.fromtimestamp(hs, tz=timezone.utc))
-            except Exception:
-                last_seen = str(hs)
-        server_labels = ", ".join(_server_numbered_label(servers, c) for c in sorted(st.get("servers") or [])) or "—"
-        sub_state = "✅" if st.get("has_active_sub") else "—"
-        lines.append(
-            f"{idx}. {who}\n"
-            f"   peers: <b>{int(st.get('peer_count', 0) or 0)}</b> | трафик: <b>{_fmt_bytes_short(int(st.get('total_bytes', 0) or 0))}</b> | sub {sub_state}\n"
-            f"   последний handshake: <b>{last_seen}</b>\n"
-            f"   серверы: {server_labels}\n"
-            f"   id: <code>{tid}</code>"
+        log.exception("admin_vpn_usage_render_failed")
+        await cb.message.answer(
+            "❌ Кнопка статистики VPN упала уже на этапе вывода. Логи сохранил. Попробуй ещё раз после выката фикса.",
+            reply_markup=_kb_admin_back(),
         )
-        lines.append("")
-
-    if len(users) > 10:
-        lines.append(f"Показаны первые 10 из {len(users)} пользователей.")
-        lines.append("")
-
-    lines.append("<i>Отчёт строится по текущим peer'ам на серверах: handshake &gt; 0 или есть трафик.</i>")
-
-    parts = _split_html_lines(lines, limit=2500)
-    if not parts:
-        parts = ["📈 <b>Кто пользовался VPN</b>\n\nНет данных."]
-
-    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
 
 
 
