@@ -2528,10 +2528,17 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
 
     async with session_scope() as session:
         res = await session.execute(
-            select(VpnPeer).where(VpnPeer.client_public_key.in_(keys), VpnPeer.is_active == True)  # noqa: E712
+            select(VpnPeer)
+            .where(VpnPeer.client_public_key.in_(keys))
+            .order_by(VpnPeer.id.desc())
         )
         for row in res.scalars().all():
-            peer_rows[row.client_public_key] = row
+            existing = peer_rows.get(row.client_public_key)
+            if existing is None:
+                peer_rows[row.client_public_key] = row
+                continue
+            if bool(getattr(row, "is_active", False)) and not bool(getattr(existing, "is_active", False)):
+                peer_rows[row.client_public_key] = row
 
         tg_ids = sorted({row.tg_id for row in peer_rows.values()})
         if tg_ids:
@@ -2565,15 +2572,16 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
         row = peer_rows[k]
         sub = subs_by_tg.get(int(row.tg_id))
         sub_state = "✅" if (sub and bool(getattr(sub, "is_active", False))) else "—"
+        db_state = "✅" if bool(getattr(row, "is_active", False)) else "⚠️"
         age_s = "—" if age is None else f"{int(age)}s"
         shown += 1
         who = tg_label.get(int(row.tg_id)) or f"ID {row.tg_id}"
-        code = (row.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+        code = (item.get("server_code") or row.server_code or os.environ.get("VPN_CODE", "NL")).upper()
         srv_label = _server_numbered_label(servers, code)
         # keep tg_id in the end for unambiguous matching
         lines.append(
             f"{shown}. {who} | {srv_label} | <code>{row.client_public_key[:8]}…</code> | "
-            f"{row.client_ip} | sub {sub_state} | hs {age_s} | id <code>{row.tg_id}</code>"
+            f"{row.client_ip} | sub {sub_state} | db {db_state} | hs {age_s} | id <code>{row.tg_id}</code>"
         )
         if shown >= 25:
             break
