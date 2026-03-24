@@ -97,9 +97,10 @@ class Settings:
     yandex_invite_min_remaining_days: int = 30
     yandex_reinvite_max: int = 1
     yandex_max_strikes: int = 2
-    yandex_provider: str = "mock"  # mock | playwright (позже)
+    # Legacy compatibility only; the current Yandex flow is manual invite based.
+    yandex_provider: str = "manual"
 
-    # where to store Playwright storage_state json files
+    # Legacy path kept only for backward compatibility with old scripts.
     yandex_cookies_dir: str = "/data/yandex"
 
     # Referrals
@@ -218,7 +219,7 @@ def _load_settings() -> Settings:
         yandex_invite_min_remaining_days=int(os.getenv("YANDEX_INVITE_MIN_REMAINING_DAYS", "30")),
         yandex_reinvite_max=int(os.getenv("YANDEX_REINVITE_MAX", "1")),
         yandex_max_strikes=int(os.getenv("YANDEX_MAX_STRIKES", "2")),
-        yandex_provider=os.getenv("YANDEX_PROVIDER", "mock").strip().lower(),
+        yandex_provider=os.getenv("YANDEX_PROVIDER", "manual").strip().lower(),
         yandex_cookies_dir=os.getenv("YANDEX_COOKIES_DIR", "/data/yandex").strip(),
 
         # Referrals
