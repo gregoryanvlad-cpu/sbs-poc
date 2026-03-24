@@ -107,7 +107,10 @@ async def yandex_copy_invite(cb: CallbackQuery) -> None:
 
     try:
         await cb.message.answer(
-            "📋 Скопируй ссылку приглашения:\n\n" f"<code>{link}</code>",
+            "📋 Скопируй ссылку приглашения:\n\n"
+            f"<code>{link}</code>\n\n"
+            "⚠️ <b>Важно:</b> открой эту ссылку <b>сразу сейчас</b>.\n"
+            "Ссылка-приглашение действует ограниченное время и позже может устареть.",
             parse_mode="HTML",
         )
     except Exception:
@@ -175,9 +178,11 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
 
     sent = await cb.message.answer(
         "✅ Приглашение готово.\n\n"
-        "Нажми кнопку ниже и прими приглашение.\n"
-        "Если не успел — ссылка всегда доступна в 🟡 Yandex Plus.",
+        "⚠️ <b>Важно:</b> перейди по ссылке <b>прямо сейчас</b>.\n"
+        "Ссылка-приглашение действует ограниченное время и позже может устареть.\n\n"
+        "Нажми кнопку ниже и сразу прими приглашение.",
         reply_markup=_kb_open_invite(invite_link),
+        parse_mode="HTML",
     )
 
     async def _auto_back() -> None:
