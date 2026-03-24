@@ -173,7 +173,9 @@ async def on_yandex_login_confirm(cb: CallbackQuery) -> None:
             if existing.invite_link and existing.status in ("awaiting_join", "pending"):
                 await cb.message.answer(
                     "У тебя уже есть активное приглашение ✅\n\n"
-                    f"Логин: <code>{existing.yandex_login}</code>",
+                    f"Логин: <code>{existing.yandex_login}</code>\n\n"
+                    "⚠️ <b>Важно:</b> открой приглашение <b>сразу сейчас</b>.\n"
+                    "Ссылка действует ограниченное время и может устареть, если отложить.",
                     reply_markup=_kb_open_invite(existing.invite_link),
                     parse_mode="HTML",
                 )
@@ -247,7 +249,9 @@ async def on_yandex_login_confirm(cb: CallbackQuery) -> None:
         "✅ Логин подтверждён!\n\n"
         f"Логин: <code>{login}</code>\n"
         "Статус: ⏳ <b>Ожидание вступления</b>\n\n"
-        "Нажми кнопку ниже и прими приглашение в семейную подписку.",
+        "⚠️ <b>Важно:</b> перейди по ссылке и вступи в семейную подписку <b>сразу сейчас</b>.\n"
+        "Ссылка действует ограниченное время и если отложить, позже может понадобиться новая.\n\n"
+        "Нажми кнопку ниже и сразу прими приглашение.",
         reply_markup=_kb_open_invite(invite_link),
         parse_mode="HTML",
     )
