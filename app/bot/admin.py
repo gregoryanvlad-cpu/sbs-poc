@@ -63,6 +63,38 @@ def _split_html_lines(lines: list[str], *, limit: int = 3500) -> list[str]:
         parts.append("\n".join(cur))
     return parts
 
+async def _send_html_chunks(message: Message, parts: list[str], *, reply_markup=None, edit_first: bool = True) -> None:
+    sent_any = False
+    for idx, raw in enumerate(parts):
+        chunk = (raw or '').strip() or '—'
+        try:
+            if idx == 0 and edit_first:
+                await message.edit_text(chunk, reply_markup=reply_markup, parse_mode="HTML")
+            else:
+                await message.answer(chunk, reply_markup=reply_markup if (idx == 0 and not edit_first) else None, parse_mode="HTML")
+            sent_any = True
+            continue
+        except TelegramBadRequest as e:
+            msg = str(e).lower()
+            if 'message is not modified' in msg:
+                sent_any = True
+                continue
+            if 'message_too_long' not in msg and 'message is too long' not in msg and "can't parse entities" not in msg:
+                raise
+        plain = re.sub(r"</?[^>]+>", "", chunk).strip() or '—'
+        subparts = [plain[i:i+2500] for i in range(0, len(plain), 2500)] or ['—']
+        for sub_idx, sub in enumerate(subparts):
+            if idx == 0 and edit_first and not sent_any and sub_idx == 0:
+                try:
+                    await message.edit_text(sub, reply_markup=reply_markup)
+                    sent_any = True
+                    continue
+                except TelegramBadRequest:
+                    pass
+            await message.answer(sub, reply_markup=reply_markup if (idx == 0 and sub_idx == 0 and not edit_first) else None)
+            sent_any = True
+
+
 def _fmt_bytes_short(num: int) -> str:
     try:
         n = int(num or 0)
@@ -2487,7 +2519,7 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         lines.append(f"Не сопоставилось с БД: <b>{unknown_count}</b>")
     lines.append("")
 
-    for idx, st in enumerate(users[:20], start=1):
+    for idx, st in enumerate(users[:10], start=1):
         tid = int(st["tg_id"])
         who = tg_label.get(tid) or f"ID {tid}"
         hs = int(st.get("latest_hs", 0) or 0)
@@ -2500,39 +2532,25 @@ async def admin_vpn_usage(cb: CallbackQuery) -> None:
         server_labels = ", ".join(_server_numbered_label(servers, c) for c in sorted(st.get("servers") or [])) or "—"
         sub_state = "✅" if st.get("has_active_sub") else "—"
         lines.append(
-            f"{idx}. {who} | peers <b>{int(st.get('peer_count', 0) or 0)}</b> | "
-            f"трафик <b>{_fmt_bytes_short(int(st.get('total_bytes', 0) or 0))}</b> | "
-            f"последнее использование <b>{last_seen}</b> | sub {sub_state} | id <code>{tid}</code>"
+            f"{idx}. {who}\n"
+            f"   peers: <b>{int(st.get('peer_count', 0) or 0)}</b> | трафик: <b>{_fmt_bytes_short(int(st.get('total_bytes', 0) or 0))}</b> | sub {sub_state}\n"
+            f"   последний handshake: <b>{last_seen}</b>\n"
+            f"   серверы: {server_labels}\n"
+            f"   id: <code>{tid}</code>"
         )
-        lines.append(f"   Серверы: {server_labels}")
-
-    if len(users) > 20:
         lines.append("")
-        lines.append(f"Показаны первые 20 из {len(users)} пользователей.")
 
-    lines.append("")
+    if len(users) > 10:
+        lines.append(f"Показаны первые 10 из {len(users)} пользователей.")
+        lines.append("")
+
     lines.append("<i>Отчёт строится по текущим peer'ам на серверах: handshake &gt; 0 или есть трафик.</i>")
 
-    parts = _split_html_lines(lines, limit=3500)
+    parts = _split_html_lines(lines, limit=2500)
     if not parts:
         parts = ["📈 <b>Кто пользовался VPN</b>\n\nНет данных."]
 
-    try:
-        await cb.message.edit_text(parts[0], reply_markup=_kb_admin_back(), parse_mode="HTML")
-    except TelegramBadRequest as e:
-        msg = str(e).lower()
-        if "message is not modified" in msg:
-            try:
-                await cb.answer()
-            except Exception:
-                pass
-        elif "message_too_long" in msg or "message is too long" in msg or "can't parse entities" in msg:
-            await cb.message.answer(parts[0], reply_markup=_kb_admin_back(), parse_mode="HTML")
-        else:
-            raise
-
-    for extra in parts[1:]:
-        await cb.message.answer(extra, parse_mode="HTML")
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
 
 
 
