@@ -1169,9 +1169,10 @@ async def on_nav(cb: CallbackQuery) -> None:
                 await session.commit()
             code = await referral_service.ensure_ref_code(session, user)
 
-            active_cnt = await referral_service.count_active_referrals(session, cb.from_user.id)
+            progress = await referral_service.percent_progress(session, cb.from_user.id)
+            active_cnt = int(progress.get("active_referrals", 0) or 0)
             pending_sum, avail_sum = await referral_service.get_balance(session, cb.from_user.id)
-            pct = await referral_service.current_percent(session, cb.from_user.id)
+            pct = int(progress.get("current_percent", 0) or 0)
             inviter_id = await referral_service.get_inviter_tg_id(session, tg_id=cb.from_user.id)
             refs = await referral_service.list_referrals_summary(session, tg_id=cb.from_user.id, limit=15)
 
