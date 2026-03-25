@@ -105,18 +105,66 @@ async def extend_subscription(
     *,
     period_days: int | None = None,
     period_months: int | None = None,
+    months: int | None = None,
+    days_legacy: int | None = None,
+    amount_rub: int | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    provider_payment_id: str | None = None,
 ) -> Subscription:
+    """Extend user subscription.
+
+    Supports both the new argument names (period_days/period_months)
+    and the legacy names still used by handlers/admin flows
+    (months/days_legacy + payment metadata).
+    """
     sub = await get_subscription(session, tg_id)
     now = utcnow()
-    days = int(period_days or 0)
+
+    # Backward-compatible argument resolution.
+    days = int(period_days or days_legacy or 0)
+    resolved_months = int(period_months if period_months is not None else (months or 0))
     if days <= 0:
-        months = int(period_months or settings.period_months or 1)
-        days = 30 * max(1, months)
+        months_for_days = resolved_months or int(settings.period_months or 1)
+        days = 30 * max(1, months_for_days)
+
     base = sub.end_at if (sub.end_at and sub.end_at > now) else now
     sub.start_at = sub.start_at or now
     sub.end_at = base + timedelta(days=days)
     sub.is_active = True
     sub.status = "active"
+
+    # Legacy compatibility: a lot of flows still expect extend_subscription()
+    # to also persist a payment row, so keep that behavior when metadata is passed.
+    if any(v is not None for v in (amount_rub, provider, status, provider_payment_id)):
+        existing_payment = None
+        if provider_payment_id:
+            existing_payment = await session.scalar(
+                select(Payment).where(Payment.provider_payment_id == provider_payment_id).limit(1)
+            )
+        if existing_payment is None:
+            payment = Payment(
+                tg_id=int(tg_id),
+                amount=int(amount_rub or 0),
+                currency="RUB",
+                provider=str(provider or "mock"),
+                status=str(status or "success"),
+                period_days=int(days),
+                period_months=max(0, resolved_months),
+                provider_payment_id=provider_payment_id,
+            )
+            session.add(payment)
+        else:
+            existing_payment.tg_id = int(tg_id)
+            existing_payment.amount = int(amount_rub if amount_rub is not None else existing_payment.amount)
+            existing_payment.currency = "RUB"
+            if provider is not None:
+                existing_payment.provider = str(provider)
+            if status is not None:
+                existing_payment.status = str(status)
+            existing_payment.period_days = int(days)
+            existing_payment.period_months = max(0, resolved_months)
+
     return sub
 
 
@@ -140,7 +188,7 @@ async def set_subscription_expired(session: AsyncSession, tg_id: int) -> None:
         sub.status = "expired"
 
 
-async def deactivate_peers(session: AsyncSession, tg_id: int) -> None:
+async def deactivate_peers(session: AsyncSession, tg_id: int, reason: str | None = None) -> None:
     now = utcnow()
     await session.execute(
         update(VpnPeer)
