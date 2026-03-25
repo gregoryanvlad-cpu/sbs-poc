@@ -17,7 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import func, select, literal, and_, or_, delete
+from sqlalchemy import func, select, literal, and_, or_, delete, text
 
 from dateutil.relativedelta import relativedelta
 
@@ -272,13 +272,14 @@ async def _vpn_seats_by_server() -> dict[str, int]:
     result: dict[str, int] = {str(s.get('code') or default_code).upper(): 0 for s in servers}
 
     async with session_scope() as session:
+        code_expr = func.coalesce(func.upper(VpnPeer.server_code), default_code_lit)
         q = (
             select(
-                func.coalesce(func.upper(VpnPeer.server_code), default_code_lit).label('code'),
+                code_expr.label('code'),
                 func.count(VpnPeer.id).label('cnt'),
             )
             .where(VpnPeer.is_active == True)  # noqa: E712
-            .group_by(func.coalesce(func.upper(VpnPeer.server_code), default_code_lit))
+            .group_by(text("1"))
         )
         res = await session.execute(q)
         for raw_code, cnt in res.all():
@@ -2294,7 +2295,7 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
     await state.clear()
     tail = ""
     if created == 0 and last_error:
-        tail = f"\n\n⚠️ Ошибка: <code>{html.quote(str(last_error)[:300])}</code>"
+        tail = f"\n\n⚠️ Ошибка: <code>{html.escape(str(last_error)[:300])}</code>"
     await message.answer(
         f"✅ Создано конфигов: <b>{created}</b> из <b>{n}</b>.{tail}",
         reply_markup=kb_admin_menu(),
