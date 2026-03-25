@@ -267,5 +267,38 @@ class YandexService:
         await session.flush()
         return notifications
 
+    async def force_issue_new_invite(self, session, *, tg_id: int) -> str:
+        """Issue a fresh invite immediately for an active subscriber on explicit user request."""
+        now = utcnow()
+        sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
+        if not sub or not sub.end_at or _ensure_tz(sub.end_at) <= now:
+            raise RuntimeError('Subscription is not active')
+
+        membership = await session.scalar(
+            select(YandexMembership)
+            .where(YandexMembership.tg_id == tg_id)
+            .order_by(YandexMembership.id.desc())
+            .limit(1)
+        )
+        if not membership:
+            raise RuntimeError('Membership not found')
+
+        acc, slot = await _pick_slot_for_issue(session, now=now)
+        slot.status = 'issued'
+        slot.issued_to_tg_id = tg_id
+        slot.issued_at = now
+
+        membership.yandex_account_id = acc.id
+        membership.invite_slot_id = slot.id
+        membership.account_label = acc.label
+        membership.slot_index = int(slot.slot_index)
+        membership.invite_link = slot.invite_link
+        membership.invite_issued_at = now
+        membership.coverage_end_at = _ensure_tz(sub.end_at)
+        membership.status = 'issued'
+        membership.updated_at = now
+        await session.flush()
+        return slot.invite_link
+
 
 yandex_service = YandexService()
