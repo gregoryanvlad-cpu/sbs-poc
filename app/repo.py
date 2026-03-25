@@ -120,8 +120,8 @@ async def extend_subscription(
     return sub
 
 
-async def list_expired_subscriptions(session: AsyncSession) -> list[Subscription]:
-    now = utcnow()
+async def list_expired_subscriptions(session: AsyncSession, now: datetime | None = None) -> list[Subscription]:
+    now = now or utcnow()
     return (
         await session.execute(
             select(Subscription).where(
