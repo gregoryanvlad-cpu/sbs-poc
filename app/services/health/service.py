@@ -196,9 +196,14 @@ class HealthService:
         warn = 0
         async with session_scope() as session:
             db_counts_raw = await session.execute(
-                select(func.coalesce(func.upper(VpnPeer.server_code), "NL1"), func.count()).where(VpnPeer.is_active == True).group_by(func.coalesce(func.upper(VpnPeer.server_code), "NL1"))
+                select(VpnPeer.server_code, func.count())
+                .where(VpnPeer.is_active == True)
+                .group_by(VpnPeer.server_code)
             )
-            db_counts = {str(code): int(cnt) for code, cnt in db_counts_raw.all()}
+            db_counts: dict[str, int] = {}
+            for code, cnt in db_counts_raw.all():
+                norm = (str(code).upper() if code else "NL1")
+                db_counts[norm] = db_counts.get(norm, 0) + int(cnt or 0)
         async def one(server: dict[str, Any]) -> tuple[str, str]:
             code = str(server.get("code") or "").upper() or "?"
             title = f"{code} ({server.get('name') or code})"
@@ -248,14 +253,17 @@ class HealthService:
             status = "fail"
         return CheckResult("wg", "WireGuard серверы", status, "SSH/WG/лимиты/места по NL/FR", lines)
 
-    async def _run_ssh_output(self, host: str, port: int, user: str, password: str | None, cmd: str, timeout: int = 15) -> str:
-        key_b64 = os.environ.get("WG_SSH_PRIVATE_KEY_B64")
+    async def _run_ssh_output(self, host: str, port: int, user: str, password: str | None, cmd: str, timeout: int = 15, key_env_names: tuple[str, ...] = ("WG_SSH_PRIVATE_KEY_B64",)) -> str:
         key_obj = None
-        if key_b64:
+        for env_name in key_env_names:
+            key_b64 = (os.environ.get(env_name) or "").strip()
+            if not key_b64:
+                continue
             try:
                 import base64
                 key_text = base64.b64decode(key_b64.encode()).decode()
                 key_obj = asyncssh.import_private_key(key_text.strip())
+                break
             except Exception:
                 key_obj = None
         conn = await asyncssh.connect(host, port=port, username=user, password=password if not key_obj else None, client_keys=[key_obj] if key_obj else None, known_hosts=None, connect_timeout=10, login_timeout=10)
@@ -274,17 +282,17 @@ class HealthService:
         lines: list[str] = [f"host={host} user={user} log={settings.lte_access_log_path}"]
         status = "ok"
         try:
-            svc = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, "systemctl is-active xray")
+            svc = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, "systemctl is-active xray", key_env_names=("LTE_SSH_PRIVATE_KEY_B64", "WG_SSH_PRIVATE_KEY_B64"))
             lines.append(f"xray.service: {svc or 'unknown'}")
             if svc.strip() != "active":
                 status = "fail"
-            size = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, f"stat -c '%s' {settings.lte_access_log_path} 2>/dev/null || echo 0")
+            size = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, f"stat -c '%s' {settings.lte_access_log_path} 2>/dev/null || echo 0", key_env_names=("LTE_SSH_PRIVATE_KEY_B64", "WG_SSH_PRIVATE_KEY_B64"))
             lines.append(f"access.log size: {size or '0'} bytes")
-            tail = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, f"tail -n 3 {settings.lte_access_log_path} 2>/dev/null || true")
+            tail = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, f"tail -n 3 {settings.lte_access_log_path} 2>/dev/null || true", key_env_names=("LTE_SSH_PRIVATE_KEY_B64", "WG_SSH_PRIVATE_KEY_B64"))
             if tail:
                 lines.append("Последние строки access.log:")
                 lines.extend([f"  {ln}" for ln in tail.splitlines()[:3]])
-            ss = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, "ss -tn state established '( sport = :443 or dport = :443 )' | tail -n +2 | wc -l")
+            ss = await self._run_ssh_output(host, settings.lte_ssh_port, user, password, "ss -tn state established '( sport = :443 or dport = :443 )' | tail -n +2 | wc -l", key_env_names=("LTE_SSH_PRIVATE_KEY_B64", "WG_SSH_PRIVATE_KEY_B64"))
             lines.append(f"ESTABLISHED :443: {ss or '0'}")
         except Exception as e:
             status = "fail"
