@@ -9,12 +9,31 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Update, Message, CallbackQuery
 
 from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import session_scope
+from app.db.models.app_setting import AppSetting
 from app.db.models.message_audit import MessageAudit
-from app.repo import get_app_setting_int, set_app_setting_int
 
 log = logging.getLogger(__name__)
+
+
+async def get_app_setting_int(session: AsyncSession, key: str, default: int | None = None) -> int | None:
+    row = await session.get(AppSetting, key)
+    if row is None or row.int_value is None:
+        return default
+    return int(row.int_value)
+
+
+async def set_app_setting_int(session: AsyncSession, key: str, value: int | None) -> None:
+    row = await session.get(AppSetting, key)
+    if row is None:
+        row = AppSetting(key=key, int_value=value)
+        row.touch()
+        session.add(row)
+    else:
+        row.int_value = value
+        row.touch()
 
 
 class CorrelationIdMiddleware(BaseMiddleware):
@@ -44,7 +63,6 @@ class RateLimitMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        # only for callback queries
         cb = getattr(event, "data", None)
         from_user = getattr(event, "from_user", None)
         if cb and from_user:
@@ -58,12 +76,7 @@ class RateLimitMiddleware(BaseMiddleware):
 
 
 class ActivitySeenMiddleware(BaseMiddleware):
-    """Marks outgoing notifications as "seen" when user interacts.
-
-    Telegram bots can't reliably know if a user *read* a message.
-    This is a best-effort approximation: when the user sends a message or
-    clicks any bot button, we mark their last un-seen notifications as seen.
-    """
+    """Marks outgoing notifications as seen when user interacts."""
 
     async def __call__(
         self,
@@ -81,7 +94,6 @@ class ActivitySeenMiddleware(BaseMiddleware):
             now = datetime.now(timezone.utc)
             try:
                 async with session_scope() as session:
-                    # Track user activity counters (best-effort; stored in app_settings).
                     try:
                         ts_key = f"ua:last_interaction_ts:{tg_id}"
                         await set_app_setting_int(session, ts_key, int(now.timestamp()))
