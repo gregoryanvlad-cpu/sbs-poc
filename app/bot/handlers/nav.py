@@ -1287,6 +1287,12 @@ async def on_nav(cb: CallbackQuery) -> None:
         # Если ссылка уже есть — показываем кнопку открыть.
         if ym and ym.invite_link:
             buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
+            try:
+                cov = getattr(ym, 'coverage_end_at', None)
+                if cov and sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
+                    buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
+            except Exception:
+                pass
             # Главное — ссылка всегда доступна здесь.
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
@@ -1318,6 +1324,34 @@ async def on_nav(cb: CallbackQuery) -> None:
 
         await _safe_cb_answer(cb)
         return
+
+@router.callback_query(lambda c: c.data == "yandex:issue_now")
+async def on_yandex_issue_now(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer('Подписка не активна', show_alert=True)
+            return
+        try:
+            from app.services.yandex.service import yandex_service
+            link = await yandex_service.force_issue_new_invite(session, tg_id=tg_id)
+            await session.commit()
+        except Exception:
+            await cb.answer('Не удалось выпустить новое приглашение. Попробуйте позже.', show_alert=True)
+            return
+    await cb.message.answer(
+        '🟡 <b>Yandex Plus</b>\n\nМы выпустили для вас новое приглашение уже сейчас. Откройте его сразу, чтобы старая ссылка не успела устареть.',
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text='🔗 Открыть новое приглашение', url=link)],
+                [InlineKeyboardButton(text='🟡 Открыть раздел Yandex Plus', callback_data='nav:yandex')],
+            ]
+        ),
+    )
+    await cb.answer('Новое приглашение выдано')
+
 
     if where == "faq":
         text = (
@@ -1513,6 +1547,9 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                         grp.active_until = base + relativedelta(months=1)
                         grp.seats_total = seats
                         await _ensure_family_profiles(session, tg_id, seats)
+                        await _restore_family_peers_within_grace(session, tg_id)
+                        await set_app_setting_int(session, f"family_grace_started_ts:{tg_id}", None)
+                        await set_app_setting_int(session, f"family_grace_seats:{tg_id}", None)
                         pay.status = "success"
                         await session.commit()
                         try:
@@ -1546,7 +1583,7 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
 
                     if (pay.provider or "") == "platega_lte":
                         sub = await get_subscription(session, tg_id)
-                        await lte_vpn_service.get_or_create_client(tg_id, subscription_end_at=sub.end_at, force_rotate=False)
+                        await lte_vpn_service.activate_paid_month(tg_id)
                         pay.status = "success"
                         await session.commit()
                         try:
@@ -2969,6 +3006,79 @@ async def _ensure_family_profiles(session, owner_tg_id: int, seats_total: int) -
     await session.flush()
 
 
+async def _restore_family_peers_within_grace(session, owner_tg_id: int) -> int:
+    from app.db.models import FamilyVpnProfile, VpnPeer
+    restored = 0
+    try:
+        from app.services.vpn.service import vpn_service
+    except Exception:
+        return 0
+    rows = list((await session.execute(select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == owner_tg_id, FamilyVpnProfile.vpn_peer_id.is_not(None)))).scalars().all())
+    for prof in rows:
+        peer = await session.get(VpnPeer, int(prof.vpn_peer_id or 0))
+        if not peer or peer.is_active:
+            continue
+        try:
+            rv = getattr(peer, 'revoked_at', None)
+            if rv is None or (utcnow() - rv) > timedelta(hours=24):
+                continue
+            old_code = str(getattr(peer, 'server_code', None) or os.environ.get('VPN_CODE') or 'NL1').upper()
+            preferred = await vpn_service._pick_server_for_extra_peer(session, inherited_code=old_code)
+            preferred_code = str(preferred.get('code') or '').upper()
+            if preferred_code != old_code:
+                continue
+            old_server = None
+            for srv in (vpn_service._load_vpn_servers() or []):
+                if str(srv.get('code') or '').upper() == old_code:
+                    old_server = srv
+                    break
+            if not old_server:
+                continue
+            provider = vpn_service._provider_for(
+                host=str(old_server.get('host') or os.environ.get('WG_SSH_HOST') or ''),
+                port=int(old_server.get('port') or 22),
+                user=str(old_server.get('user') or os.environ.get('WG_SSH_USER') or ''),
+                password=old_server.get('password'),
+                interface=str(old_server.get('interface') or os.environ.get('VPN_INTERFACE', 'wg0')),
+                tc_dev=str(old_server.get('tc_dev') or old_server.get('wg_tc_dev') or os.environ.get('WG_TC_DEV') or os.environ.get('VPN_TC_DEV') or ''),
+                tc_parent_rate_mbit=int(old_server.get('tc_parent_rate_mbit') or old_server.get('wg_tc_parent_rate_mbit') or os.environ.get('WG_TC_PARENT_RATE_MBIT') or os.environ.get('VPN_TC_PARENT_RATE_MBIT') or 1000),
+            )
+            await provider.add_peer(peer.client_public_key, peer.client_ip, tg_id=owner_tg_id)
+            peer.is_active = True
+            peer.revoked_at = None
+            peer.rotation_reason = None
+            restored += 1
+        except Exception:
+            continue
+    if restored:
+        await set_app_setting_int(session, f'family_grace_started_ts:{owner_tg_id}', None)
+        await set_app_setting_int(session, f'family_grace_seats:{owner_tg_id}', None)
+    return restored
+
+
+@router.callback_query(lambda c: c.data == 'family:renew')
+async def on_family_renew(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    async with session_scope() as session:
+        grp = await _get_or_create_family_group(session, tg_id)
+        target = int(await get_app_setting_int(session, f'family_grace_seats:{tg_id}', default=int(grp.seats_total or 0)) or int(grp.seats_total or 0))
+        target = max(0, min(FAMILY_MAX_SEATS, target))
+        await set_app_setting_int(session, f'family_seats_target:{tg_id}', target)
+        price = await _get_family_seat_price(session, tg_id)
+        await session.commit()
+    if target <= 0:
+        await cb.answer('Не удалось определить количество мест для продления', show_alert=True)
+        return
+    text = (
+        '👨‍👩‍👧‍👦 <b>Продление семейной группы</b>\n\n'
+        f'Будет продлено мест: <b>{target}</b>\n'
+        f'Цена: <b>{price} ₽</b> за место в месяц.\n\n'
+        'Если оплатить в течение 24 часов после окончания семейной группы, старые конфиги будут восстановлены без замены.'
+    )
+    await cb.message.edit_text(text, reply_markup=_family_seats_kb(current=target, target=target), parse_mode='HTML')
+    await _safe_cb_answer(cb)
+
+
 def _family_manage_kb(*, can_manage: bool, has_seats: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if can_manage:
@@ -3214,6 +3324,9 @@ async def on_family_pay(cb: CallbackQuery) -> None:
         grp.active_until = base + relativedelta(months=1)
         grp.seats_total = seats
         await _ensure_family_profiles(session, tg_id, seats)
+        await _restore_family_peers_within_grace(session, tg_id)
+        await set_app_setting_int(session, f"family_grace_started_ts:{tg_id}", None)
+        await set_app_setting_int(session, f"family_grace_seats:{tg_id}", None)
         await session.commit()
 
     kb = InlineKeyboardMarkup(
