@@ -41,6 +41,7 @@ from app.services.vpn.ssh_provider import WireGuardSSHProvider
 from app.services.regionvpn import RegionVpnService
 from app.services.lte_vpn.service import lte_vpn_service
 from app.services.message_audit import audit_send_message
+from app.services.health import health_service
 
 
 log = logging.getLogger(__name__)
@@ -770,6 +771,69 @@ async def admin_users_page(cb: CallbackQuery) -> None:
 # ADMIN: VPN STATUS / ACTIVE PROFILES + REFERRALS MENU
 # ==========================
 
+
+
+
+def _kb_admin_diag() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Быстрая проверка", callback_data="admin:diag:quick")],
+            [InlineKeyboardButton(text="🧪 Полная диагностика", callback_data="admin:diag:full")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+        ]
+    )
+
+
+def _kb_admin_diag_refresh(full: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:diag:{'full' if full else 'quick'}")],
+            [InlineKeyboardButton(text="⚡ Быстрая проверка", callback_data="admin:diag:quick"), InlineKeyboardButton(text="🧪 Полная", callback_data="admin:diag:full")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+        ]
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:diag")
+async def admin_diag_menu(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    text = (
+        "🩺 <b>Проверка системы</b>\n\n"
+        "Доступны два режима:\n"
+        "⚡ Быстрая — основные контуры и критичные ошибки.\n"
+        "🧪 Полная — максимум live-проверок по DB, WG, LTE, Yandex, family grace, напоминаниям и аномалиям.\n\n"
+        "Диагностика read-only: ничего не чинит автоматически, только проверяет."
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_diag(), parse_mode="HTML")
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=_kb_admin_diag(), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data in {"admin:diag:quick", "admin:diag:full"})
+async def admin_diag_run(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    full = cb.data.endswith(':full')
+    try:
+        await cb.answer("Проверяю систему…")
+    except Exception:
+        pass
+    try:
+        results = await health_service.run(full=full)
+        text = health_service.render_summary(results, full=full)
+        parts = _split_html_lines(text.splitlines(), limit=3500)
+        await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_diag_refresh(full=full), edit_first=False)
+    except Exception:
+        log.exception("admin_diag_failed")
+        await cb.message.answer(
+            "❌ Диагностика упала. Проверь логи последнего деплоя.",
+            reply_markup=_kb_admin_diag_refresh(full=full),
+        )
 
 def _kb_admin_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
