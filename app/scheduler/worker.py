@@ -253,7 +253,7 @@ async def run_scheduler() -> None:
                     await _job_trial_reengagement_notifications(bot)
                     await _job_family_group_expiring_notifications(bot)
                     await _job_lte_expiring_notifications(bot)
-                    await _job_expire_family_groups()
+                    await _job_expire_family_groups(bot)
                     await _job_winback_discount_campaign(bot)
                     # Make pending referral earnings available when hold expires.
                     try:
@@ -318,7 +318,7 @@ async def _job_family_group_expiring_notifications(bot: Bot) -> None:
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
-                            [InlineKeyboardButton(text="💳 Оплатить", callback_data="family:seats")],
+                            [InlineKeyboardButton(text="💳 Продлить семейную группу", callback_data="family:renew")],
                             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
                         ]
                     ),
@@ -334,8 +334,8 @@ async def _job_family_group_expiring_notifications(bot: Bot) -> None:
             await session.commit()
 
 
-async def _job_expire_family_groups() -> None:
-    """Disable family VPN peers when family group coverage ends."""
+async def _job_expire_family_groups(bot: Bot) -> None:
+    """Handle family-group expiry with 24h grace, warning and final purge."""
     now = _utcnow()
     async with session_scope() as session:
         q = (
@@ -354,32 +354,110 @@ async def _job_expire_family_groups() -> None:
         except Exception:
             vpn_service = None
 
+        changed = False
+        notify_items: list[tuple[int, int]] = []
+        purge_notify: list[int] = []
+
         for g in groups:
             owner = int(g.owner_tg_id)
-            # find all family profiles with peers
-            profs = list(
-                (await session.execute(
-                    select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == owner, FamilyVpnProfile.vpn_peer_id.is_not(None))
-                )).scalars().all()
+            grace_key = f"family_grace_started_ts:{owner}"
+            seats_key = f"family_grace_seats:{owner}"
+            grace_started = int(await get_app_setting_int(session, grace_key, default=0) or 0)
+
+            profs = list((await session.execute(
+                select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == owner, FamilyVpnProfile.vpn_peer_id.is_not(None))
+            )).scalars().all())
+
+            if grace_started <= 0:
+                for p in profs:
+                    try:
+                        peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
+                        if not peer or not peer.is_active:
+                            continue
+                        if vpn_service:
+                            try:
+                                await vpn_service.remove_peer_for_server(session, peer.client_public_key, (peer.server_code or '').upper() or None)
+                            except Exception:
+                                try:
+                                    await vpn_service.provider.remove_peer(peer.client_public_key)
+                                except Exception:
+                                    pass
+                        peer.is_active = False
+                        peer.revoked_at = now
+                        peer.rotation_reason = 'family_expired'
+                        changed = True
+                    except Exception:
+                        pass
+                await set_app_setting_int(session, grace_key, int(now.timestamp()))
+                await set_app_setting_int(session, seats_key, int(g.seats_total or 0))
+                notify_items.append((owner, int(g.seats_total or 0)))
+                changed = True
+                continue
+
+            if grace_started > 0 and (now.timestamp() - grace_started) >= 24 * 3600:
+                for p in profs:
+                    try:
+                        peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
+                        if peer is not None:
+                            if vpn_service:
+                                try:
+                                    await vpn_service.remove_peer_for_server(session, peer.client_public_key, (peer.server_code or '').upper() or None)
+                                except Exception:
+                                    pass
+                            await session.delete(peer)
+                        p.vpn_peer_id = None
+                        changed = True
+                    except Exception:
+                        pass
+                await set_app_setting_int(session, grace_key, None)
+                await set_app_setting_int(session, seats_key, None)
+                g.seats_total = 0
+                purge_notify.append(owner)
+                changed = True
+
+        if changed:
+            await session.commit()
+
+    for owner, seats in notify_items:
+        try:
+            await audit_send_message(
+                bot,
+                owner,
+                (
+                    '⚠️ Срок действия семейной группы закончился.\n\n'
+                    'Семейные конфиги уже отключены, но в течение <b>24 часов</b> их ещё можно восстановить без замены — '
+                    'достаточно оплатить продление.\n\n'
+                    f'Сейчас будет сохранено мест: <b>{seats}</b>.\n'
+                    'Если не оплатить в течение 24 часов, конфиги семейной группы будут удалены окончательно.'
+                ),
+                kind='family_grace_started',
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text='💳 Продлить семейную группу', callback_data='family:renew')],
+                        [InlineKeyboardButton(text='🏠 Главное меню', callback_data='nav:home')],
+                    ]
+                ),
             )
-            for p in profs:
-                try:
-                    peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
-                    if not peer or not peer.is_active:
-                        continue
-                    if vpn_service:
-                        try:
-                            await vpn_service.provider.remove_peer(peer.client_public_key)
-                        except Exception:
-                            pass
-                    peer.is_active = False
-                    peer.revoked_at = now
-                    peer.rotation_reason = "family_expired"
-                except Exception:
-                    pass
+        except Exception:
+            pass
 
-        await session.commit()
-
+    for owner in purge_notify:
+        try:
+            await audit_send_message(
+                bot,
+                owner,
+                '⛔️ 24 часа на продление семейной группы истекли. Старые семейные конфиги удалены окончательно.\n\nЕсли захотите вернуть семейную группу позже — будут выданы уже новые конфиги.',
+                kind='family_grace_purged',
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text='💳 Купить семейную группу заново', callback_data='family:seats')],
+                        [InlineKeyboardButton(text='🏠 Главное меню', callback_data='nav:home')],
+                    ]
+                ),
+            )
+        except Exception:
+            pass
 
 def _winback_kb(*, amount_rub: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -866,6 +944,7 @@ async def _job_rotate_yandex_invites(bot: Bot) -> None:
             # don't break loop
             try:
                 await audit_send_message(
+                    bot,
                     tg_id,
                     "🔁 Пора перейти в новую семейную подписку Yandex Plus.",
                     kind="yandex_rotate",
@@ -1039,6 +1118,7 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
                 if days_left == 1 and m.notified_1d_at is None:
                     try:
                         await audit_send_message(
+                            bot,
                             int(m.tg_id),
                             "ℹ️ Завтра вам будет выдано новое приглашение в семейную подписку Yandex Plus.\n\n"
                             "Это связано со сменой аккаунта. Никаких действий сейчас не требуется.",
@@ -1304,6 +1384,7 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
 
             try:
                 await audit_send_message(
+                    bot,
                     tg_id,
                     text_msg,
                     kind=kind,
