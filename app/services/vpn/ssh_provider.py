@@ -1,8 +1,10 @@
 import asyncio
 import base64
+import json
 import asyncssh
 import logging
 import os
+from textwrap import dedent
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -108,12 +110,80 @@ class WireGuardSSHProvider:
                 await asyncio.sleep(0.5)
         raise last
 
+
+
     async def _wg_quick_save(self) -> None:
-        """Persist runtime WireGuard peers when SaveConfig=true is enabled on the server."""
+        """Best-effort runtime-to-file sync for servers with SaveConfig=true."""
         try:
             await self._run(f"sudo wg-quick save {self.interface}")
         except Exception:
             log.warning("wg_quick_save_failed interface=%s", self.interface)
+
+    async def _update_persisted_peer(self, public_key: str, client_ip: str | None) -> None:
+        """Persist peer changes directly into /etc/wireguard/<iface>.conf.
+
+        This keeps peer add/remove operations durable even on servers where
+        SaveConfig=false and `wg-quick save` is unavailable.
+        """
+        payload = base64.b64encode(
+            json.dumps(
+                {
+                    "iface": self.interface,
+                    "public_key": public_key,
+                    "client_ip": client_ip,
+                }
+            ).encode("utf-8")
+        ).decode("ascii")
+        script = dedent(
+            f"""            from pathlib import Path
+            import base64
+            import json
+
+            payload = json.loads(base64.b64decode({payload!r}).decode('utf-8'))
+            iface = str(payload.get('iface') or 'wg0').strip() or 'wg0'
+            public_key = str(payload.get('public_key') or '').strip()
+            client_ip = payload.get('client_ip')
+            if client_ip is not None:
+                client_ip = str(client_ip).strip()
+
+            path = Path(f'/etc/wireguard/{{iface}}.conf')
+            try:
+                text = path.read_text()
+            except FileNotFoundError:
+                text = ''
+
+            parts = text.split('[Peer]')
+            head = parts[0]
+            peer_blocks = parts[1:]
+            keep = []
+            for raw in peer_blocks:
+                block = raw.strip()
+                if not block:
+                    continue
+                lines = [ln.rstrip() for ln in block.splitlines()]
+                block_key = None
+                for ln in lines:
+                    if ln.strip().startswith('PublicKey') and '=' in ln:
+                        block_key = ln.split('=', 1)[1].strip()
+                        break
+                if block_key == public_key:
+                    continue
+                keep.append('[Peer]\n' + '\n'.join(lines))
+
+            result = head.rstrip() + '\n\n'
+            if keep:
+                result += '\n\n'.join(keep).rstrip() + '\n'
+            if client_ip:
+                block = f'[Peer]\nPublicKey = {{public_key}}\nAllowedIPs = {{client_ip}}/32\n'
+                result = result.rstrip() + '\n\n' + block
+
+            path.write_text(result.rstrip() + '\n')
+            """
+        )
+        cmd = f"""python3 - <<"PY"
+{script}
+PY"""
+        await self._run(cmd)
 
     async def _get_peer_ip_by_public_key(self, public_key: str) -> str | None:
         if not public_key:
@@ -136,6 +206,10 @@ class WireGuardSSHProvider:
         await self._run(
             f"{WG_BIN} set {self.interface} peer {public_key} allowed-ips {client_ip}/32"
         )
+        try:
+            await self._update_persisted_peer(public_key, client_ip)
+        except Exception:
+            log.exception("wg_persist_add_peer_failed key=%s ip=%s", public_key, client_ip)
         # Best-effort: keep all users on the same 30 Mbit plan.
         try:
             await self.tc_apply_limit_for_ip(ip=client_ip, tg_id=int(tg_id or 0))
@@ -156,6 +230,10 @@ class WireGuardSSHProvider:
         except Exception:
             log.warning("WG remove failed (ignored)")
         try:
+            await self._update_persisted_peer(public_key, None)
+        except Exception:
+            log.exception("wg_persist_remove_peer_failed key=%s", public_key)
+        try:
             if peer_ip:
                 await self.tc_clear_limit_for_ip(ip=peer_ip)
         except Exception:
@@ -170,10 +248,19 @@ class WireGuardSSHProvider:
         return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
     async def get_total_peers(self) -> int:
-        out = await self._run_output(f"{WG_BIN} show {self.interface} peers")
+        out = await self._run_output(f"{WG_BIN} show {self.interface} allowed-ips", check=False)
         if not out:
             return 0
-        return len([ln for ln in out.splitlines() if ln.strip()])
+        total = 0
+        for ln in out.splitlines():
+            parts = ln.strip().split()
+            if len(parts) < 2:
+                continue
+            allowed = parts[1].strip()
+            if not allowed or allowed == "(none)":
+                continue
+            total += 1
+        return total
 
     async def get_active_peers(self, window_seconds: int = 180) -> int:
         # count peers with recent handshake
