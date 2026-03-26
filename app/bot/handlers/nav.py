@@ -2614,13 +2614,9 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     msg_conf = await cb.message.answer_document(
         document=conf_file,
         caption=(
-            (
-                f"ℹ️ Выбранная локация была занята, поэтому выдан ближайший доступный сервер: {_vpn_flag(code)} <b>{srv['name']}</b>.\n\n"
-                if auto_moved else ""
-            )
-            + f"WireGuard конфиг для локации {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
+            f"WireGuard конфиг для сервера {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
             + (
-                "⚠️ После подключения к новой локации <b>старый конфиг будет отключён</b>.\n"
+                "⚠️ После подключения к новому серверу <b>старый конфиг будет отключён</b>.\n"
                 "Рекомендуем на время переключения выключить VPN, затем включить с новым конфигом.\n\n"
                 if old
                 else "\n"
@@ -2889,16 +2885,127 @@ async def on_trial_start(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:bundle")
 async def on_vpn_bundle(cb: CallbackQuery) -> None:
-    # After pressing "Получить конфиг" we immediately ask for a location.
-    # Выдача разрешена только с активной подпиской или активным пробным периодом.
+    # Автоматически выдаём конфиг на доступный сервер без выбора локации.
     tg_id = cb.from_user.id
+
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
             await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
             return
 
-    await on_vpn_location_menu(cb)
+    srv = await _pick_available_vpn_server(current_tg_id=tg_id)
+    if not srv:
+        await cb.answer("Сейчас все VPN-серверы заняты. Попробуйте чуть позже.", show_alert=True)
+        return
+
+    servers = _load_vpn_servers()
+    code = str(srv.get("code") or "").upper()
+
+    from app.db.models import VpnPeer
+    async with session_scope() as session:
+        q = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True).order_by(VpnPeer.id.desc())  # noqa: E712
+        res = await session.execute(q)
+        active_rows = list(res.scalars().all())
+
+        old: list[tuple[dict, str]] = []
+        for r in active_rows:
+            r_code = (r.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+            if r_code == code:
+                continue
+            old_srv = next((s for s in servers if str(s.get("code")).upper() == r_code), None)
+            if old_srv and _server_is_ready(old_srv):
+                old.append((old_srv, r.client_public_key))
+
+        try:
+            peer = await vpn_service.ensure_peer_for_server(
+                session,
+                tg_id,
+                server_code=code,
+                host=str(srv["host"]),
+                port=int(srv.get("port") or 22),
+                user=str(srv["user"]),
+                password=srv.get("password"),
+                interface=str(srv.get("interface") or "wg0"),
+                tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+            )
+            try:
+                await vpn_service.ensure_rate_limit_for_server(
+                    tg_id=tg_id,
+                    ip=str(peer.get("client_ip") or ""),
+                    host=str(srv["host"]),
+                    port=int(srv.get("port") or 22),
+                    user=str(srv["user"]),
+                    password=srv.get("password"),
+                    interface=str(srv.get("interface") or "wg0"),
+                    tc_dev=str(srv.get("tc_dev") or srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+                )
+            except Exception:
+                pass
+            await session.commit()
+
+            filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, peer.get("peer_id"))
+            await session.commit()
+        except Exception:
+            await cb.answer("⚠️ Сервер временно недоступен", show_alert=True)
+            return
+
+    conf_text = vpn_service.build_wg_conf(
+        peer,
+        user_label=str(tg_id),
+        server_public_key=str(srv.get("server_public_key")),
+        endpoint=str(srv.get("endpoint")),
+        dns=str(srv.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+    )
+
+    qr_img = qrcode.make(conf_text)
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+
+    conf_file = BufferedInputFile(conf_text.encode(), filename=filename or "wg.conf")
+    qr_file = BufferedInputFile(buf.getvalue(), filename="wg.png")
+
+    msg_conf = await cb.message.answer_document(
+        document=conf_file,
+        caption=(
+            f"WireGuard конфиг для сервера {_vpn_flag(code)} <b>{srv['name']}</b>.\n"
+            + (
+                "⚠️ После подключения к новому серверу <b>старый конфиг будет отключён</b>.\n"
+                "Рекомендуем на время переключения выключить VPN, затем включить с новым конфигом.\n\n"
+                if old
+                else "\n"
+            )
+            + f"Конфиг будет удалён через <b>{_vpn_config_ttl_seconds()} сек.</b>"
+        ),
+        parse_mode="HTML",
+    )
+    msg_qr = await cb.message.answer_photo(
+        photo=qr_file,
+        caption=f"QR для WireGuard (удалится через {_vpn_config_ttl_seconds()} сек.)",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home_vpn")]]
+        ),
+    )
+
+    await _store_last_vpn_conf_messages(
+        tg_id=tg_id,
+        chat_id=cb.message.chat.id,
+        conf_msg_id=msg_conf.message_id,
+        qr_msg_id=msg_qr.message_id,
+    )
+
+    asyncio.create_task(_schedule_vpn_cleanup_and_followup(cb.bot, chat_id=cb.message.chat.id, messages=[msg_conf, msg_qr]))
+
+    await cb.answer("Конфиг отправлен")
+
+    await _start_vpn_migration_watch(
+        bot=cb.bot,
+        tg_id=tg_id,
+        new_srv=srv,
+        new_public_key=str(peer.get("public_key") or ""),
+        old_peers=old,
+    )
 
 
 # -------------------- VPN Family Group --------------------
