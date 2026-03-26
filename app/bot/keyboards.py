@@ -135,6 +135,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🎁 Подарить подписку", callback_data="admin:sub:gift")
     b.button(text="🎁 Подарить дни всем", callback_data="admin:sub:gift_days:all")
     b.button(text="🎁 Подарить дни активным", callback_data="admin:sub:gift_days:active")
+    b.button(text="🧪 Тест очереди VPN", callback_data="admin:vpn:queue_sim")
     b.button(text="🧪 Тестовый пир Server #2", callback_data="admin:vpn:test_peer:2")
     b.button(text="🧹 Сбросить TEST Server #2", callback_data="admin:vpn:test_peer:2:reset")
     b.button(text="📣 Рассылка всем", callback_data="admin:broadcast:all")
