@@ -3053,6 +3053,11 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
     servers = _load_vpn_servers_admin()
 
     async with session_scope() as session:
+        try:
+            await vpn_service.reconcile_live_peers(session)
+            await session.commit()
+        except Exception:
+            await session.rollback()
         res = await session.execute(
             select(VpnPeer)
             .where(VpnPeer.client_public_key.in_(keys))
@@ -3209,6 +3214,11 @@ async def admin_vpn_server_users_list(cb: CallbackQuery) -> None:
 
     now = datetime.now(timezone.utc)
     async with session_scope() as session:
+        try:
+            await vpn_service.reconcile_live_peers(session)
+            await session.commit()
+        except Exception:
+            await session.rollback()
         q = (
             select(VpnPeer, Subscription)
             .outerjoin(Subscription, Subscription.tg_id == VpnPeer.tg_id)
