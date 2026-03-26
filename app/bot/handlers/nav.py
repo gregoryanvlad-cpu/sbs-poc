@@ -3644,7 +3644,7 @@ async def on_family_share_slot(cb: CallbackQuery) -> None:
 
                 if not peer_dict:
                     try:
-                        await vpn_service.remove_peer_for_server(session, row.client_public_key, old_code)
+                        await vpn_service.remove_peer_for_server(public_key=row.client_public_key, server_code=old_code)
                     except Exception:
                         pass
                     row.is_active = False
