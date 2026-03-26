@@ -45,6 +45,25 @@ class HealthService:
     def __init__(self) -> None:
         self.started_at = datetime.now(timezone.utc)
 
+    def _normalized_server_code(self, code: str | None, configured_codes: set[str] | None = None) -> str:
+        raw = str(code or "").strip().upper()
+        codes = {str(x or "").strip().upper() for x in (configured_codes or set()) if str(x or "").strip()}
+        if not raw:
+            if "NL1" in codes:
+                return "NL1"
+            return "NL"
+        if raw in codes:
+            return raw
+        if raw == "NL" and "NL1" in codes:
+            return "NL1"
+        if raw == "FR" and "FR1" in codes:
+            return "FR1"
+        if raw[-1:].isdigit() is False:
+            candidate = f"{raw}1"
+            if candidate in codes:
+                return candidate
+        return raw
+
     def _status_icon(self, status: str) -> str:
         return {"ok": "✅", "warn": "⚠️", "fail": "❌"}.get(status, "•")
 
@@ -194,16 +213,23 @@ class HealthService:
         lines: list[str] = []
         fail = 0
         warn = 0
+        configured_codes = {str(s.get("code") or "").strip().upper() for s in servers if str(s.get("code") or "").strip()}
         async with session_scope() as session:
-            db_counts_raw = await session.execute(
-                select(VpnPeer.server_code, func.count())
+            rows = await session.execute(
+                select(VpnPeer.server_code, VpnPeer.client_public_key)
                 .where(VpnPeer.is_active == True)
-                .group_by(VpnPeer.server_code)
             )
             db_counts: dict[str, int] = {}
-            for code, cnt in db_counts_raw.all():
-                norm = (str(code).upper() if code else "NL1")
-                db_counts[norm] = db_counts.get(norm, 0) + int(cnt or 0)
+            active_keys_by_server: dict[str, set[str]] = {}
+            active_keys_without_server: set[str] = set()
+            for server_code, pubkey in rows.all():
+                key = str(pubkey or "").strip()
+                norm = self._normalized_server_code(server_code, configured_codes)
+                db_counts[norm] = db_counts.get(norm, 0) + 1
+                if key:
+                    active_keys_by_server.setdefault(norm, set()).add(key)
+                    if not str(server_code or "").strip():
+                        active_keys_without_server.add(key)
         async def one(server: dict[str, Any]) -> tuple[str, str]:
             code = str(server.get("code") or "").upper() or "?"
             title = f"{code} ({server.get('name') or code})"
@@ -223,10 +249,14 @@ class HealthService:
                 total = await provider.get_total_peers()
                 active = await provider.get_active_peers(window_seconds=180)
                 peers = await provider.list_peers()
+                peer_set = {p.strip() for p in peers if str(p).strip()}
                 handshakes = await provider.get_latest_handshakes()
                 none_hs = sum(1 for p in peers if int(handshakes.get(p, 0) or 0) == 0)
                 stale = sum(1 for p in peers if int(handshakes.get(p, 0) or 0) > 0 and now_ts - int(handshakes.get(p, 0)) > 86400)
-                db_count = int(db_counts.get(code, db_counts.get("NL1" if code == "NL" else code, 0)))
+                db_assigned = int(db_counts.get(code, 0))
+                db_live = len(peer_set & active_keys_by_server.get(code, set()))
+                db_orphaned_server_code = len(peer_set & active_keys_without_server)
+                db_count = max(db_assigned, db_live)
                 cap = int(server.get("max_active") or os.environ.get("VPN_MAX_ACTIVE") or 40)
                 free = max(0, cap - db_count)
                 status = "ok"
@@ -234,6 +264,10 @@ class HealthService:
                 if abs(total - db_count) > 3:
                     status = "warn"
                     extra.append(f"расхождение WG/БД={total}/{db_count}")
+                if db_live > db_assigned:
+                    extra.append(f"в БД неразмеченных/legacy peers: +{db_live - db_assigned}")
+                if db_orphaned_server_code:
+                    extra.append(f"без server_code, но сидят на сервере: {db_orphaned_server_code}")
                 if free <= 2:
                     status = "warn"
                     extra.append(f"мало мест ({free})")
@@ -336,15 +370,20 @@ class HealthService:
             active = int(await session.scalar(select(func.count()).select_from(FamilyVpnGroup).where(FamilyVpnGroup.active_until.is_not(None), FamilyVpnGroup.active_until > now)) or 0)
             grace = int(await session.scalar(select(func.count()).select_from(FamilyVpnGroup).where(FamilyVpnGroup.active_until.is_not(None), FamilyVpnGroup.active_until <= now, FamilyVpnGroup.active_until > now - timedelta(hours=24))) or 0)
             expired = int(await session.scalar(select(func.count()).select_from(FamilyVpnGroup).where(FamilyVpnGroup.active_until.is_not(None), FamilyVpnGroup.active_until <= now - timedelta(hours=24))) or 0)
-            mismatched = int(await session.scalar(select(func.count()).select_from(
-                select(FamilyVpnProfile.owner_tg_id).group_by(FamilyVpnProfile.owner_tg_id).subquery()
-            )) or 0)
-            seat_rows = await session.execute(select(FamilyVpnGroup.owner_tg_id, FamilyVpnGroup.seats_total))
+            seat_rows = await session.execute(
+                select(FamilyVpnGroup.owner_tg_id, FamilyVpnGroup.seats_total)
+                .where(FamilyVpnGroup.active_until.is_not(None), FamilyVpnGroup.active_until > now - timedelta(hours=24))
+            )
             seat_map = {int(tg): int(seats or 0) for tg, seats in seat_rows.all()}
-            prof_rows = await session.execute(select(FamilyVpnProfile.owner_tg_id, func.count()).group_by(FamilyVpnProfile.owner_tg_id))
+            prof_rows = await session.execute(
+                select(FamilyVpnProfile.owner_tg_id, func.count())
+                .where(FamilyVpnProfile.owner_tg_id.in_(list(seat_map.keys()) or [-1]))
+                .group_by(FamilyVpnProfile.owner_tg_id)
+            )
+            prof_map = {int(owner): int(cnt or 0) for owner, cnt in prof_rows.all()}
             bad_owners = []
-            for owner, cnt in prof_rows.all():
-                if int(cnt or 0) != int(seat_map.get(int(owner), 0) or 0):
+            for owner, seats in seat_map.items():
+                if int(prof_map.get(owner, 0)) != int(seats or 0):
                     bad_owners.append(int(owner))
         status = "warn" if grace or expired or bad_owners else "ok"
         details = [
