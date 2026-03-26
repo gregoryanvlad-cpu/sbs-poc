@@ -249,6 +249,137 @@ def _server_numbered_label(servers: list[dict], code: str, *, include_name: bool
             return f"Server #{idx} — {name}" if include_name else f"#{idx}"
     return code_u or '—'
 
+def _vpn_capacity_limit_admin(server: dict | None = None) -> int:
+    try:
+        if server and server.get("max_active") is not None:
+            return max(1, int(server.get("max_active")))
+        return max(1, int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40))
+    except Exception:
+        return 40
+
+
+def _queue_pick_first_fit(servers: list[dict], used: dict[str, int]) -> dict | None:
+    for server in servers:
+        code = str(server.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+        if int(used.get(code, 0)) < _vpn_capacity_limit_admin(server):
+            return server
+    return None
+
+
+def _simulate_queue_sequence(servers: list[dict], initial_used: dict[str, int], *, allocations: int) -> tuple[list[str], dict[str, int], bool]:
+    used = {str(k).upper(): int(v or 0) for k, v in (initial_used or {}).items()}
+    order: list[str] = []
+    exhausted = False
+    for _ in range(max(0, allocations)):
+        picked = _queue_pick_first_fit(servers, used)
+        if not picked:
+            exhausted = True
+            break
+        code = str(picked.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+        used[code] = int(used.get(code, 0)) + 1
+        order.append(code)
+    return order, used, exhausted
+
+
+def _format_server_fill_line(servers: list[dict], used: dict[str, int]) -> list[str]:
+    lines: list[str] = []
+    for idx, server in enumerate(servers, start=1):
+        code = str(server.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+        name = str(server.get("name") or code)
+        cap = _vpn_capacity_limit_admin(server)
+        seats = int(used.get(code, 0))
+        left = max(0, cap - seats)
+        lines.append(
+            f"• <b>#{idx} {html.escape(name)}</b> — <code>{code}</code> — занято <b>{seats}/{cap}</b>, свободно <b>{left}</b>"
+        )
+    return lines
+
+
+def _build_queue_test_scenarios(servers: list[dict], live_used: dict[str, int]) -> list[dict]:
+    scenarios: list[dict] = []
+    codes = [str(s.get("code") or os.environ.get("VPN_CODE", "NL")).upper() for s in servers]
+
+    scenarios.append({
+        "title": "Текущая живая загрузка",
+        "used": {code: int(live_used.get(code, 0)) for code in codes},
+        "allocations": min(10, max(1, len(codes) * 2)),
+    })
+
+    if len(servers) >= 3:
+        c1, c2, c3 = codes[:3]
+        cap1 = _vpn_capacity_limit_admin(servers[0])
+        cap2 = _vpn_capacity_limit_admin(servers[1])
+        cap3 = _vpn_capacity_limit_admin(servers[2])
+        scenarios.append({
+            "title": "Пример: 46/47, 47/47, 0/47",
+            "used": {c1: max(cap1 - 1, 0), c2: cap2, c3: 0},
+            "allocations": 4,
+        })
+        scenarios.append({
+            "title": "Пример: 47/47, 46/47, 0/47",
+            "used": {c1: cap1, c2: max(cap2 - 1, 0), c3: 0},
+            "allocations": 4,
+        })
+        scenarios.append({
+            "title": "Пример: 47/47, 47/47, 0/47",
+            "used": {c1: cap1, c2: cap2, c3: 0},
+            "allocations": 4,
+        })
+
+    if servers:
+        used_all_empty = {code: 0 for code in codes}
+        scenarios.append({
+            "title": "Все серверы пустые",
+            "used": used_all_empty,
+            "allocations": min(6, sum(_vpn_capacity_limit_admin(s) for s in servers)),
+        })
+
+        used_almost_full = {}
+        for idx, server in enumerate(servers):
+            code = codes[idx]
+            cap = _vpn_capacity_limit_admin(server)
+            used_almost_full[code] = cap if idx < len(servers) - 1 else max(cap - 1, 0)
+        scenarios.append({
+            "title": "Свободно только одно место на последнем сервере",
+            "used": used_almost_full,
+            "allocations": 3,
+        })
+
+    return scenarios
+
+
+def _build_queue_sim_report(servers: list[dict], live_used: dict[str, int]) -> str:
+    lines: list[str] = []
+    lines.append("🧪 <b>Симуляция очереди выдачи VPN-конфигов</b>")
+    lines.append("")
+    lines.append("Это <b>dry-run</b>: реальные конфиги, peer'ы и записи в БД не создаются.")
+    lines.append("Проверяется текущая логика <b>first-fit</b>: бот идет по списку серверов сверху вниз и берет <b>первый</b> сервер, где есть свободное место.")
+    lines.append("")
+    lines.append("<b>Список серверов в порядке выдачи:</b>")
+    lines.extend(_format_server_fill_line(servers, live_used))
+
+    for idx, scenario in enumerate(_build_queue_test_scenarios(servers, live_used), start=1):
+        used = {str(k).upper(): int(v or 0) for k, v in (scenario.get("used") or {}).items()}
+        allocations = int(scenario.get("allocations") or 0)
+        sequence, final_used, exhausted = _simulate_queue_sequence(servers, used, allocations=allocations)
+        lines.append("")
+        lines.append(f"<b>{idx}. {html.escape(str(scenario.get('title') or 'Сценарий'))}</b>")
+        lines.append("Старт:")
+        lines.extend(_format_server_fill_line(servers, used))
+        pretty_sequence = " → ".join(f"<code>{html.escape(code)}</code>" for code in sequence) if sequence else "—"
+        lines.append(f"Выдано эмулированных конфигов: <b>{len(sequence)}</b> из <b>{allocations}</b>")
+        lines.append(f"Порядок выдачи: {pretty_sequence}")
+        if exhausted:
+            lines.append("Результат: <b>в процессе кончились свободные места</b>.")
+        else:
+            lines.append("Результат: <b>все эмулированные выдачи прошли по текущей логике</b>.")
+        lines.append("Финиш:")
+        lines.extend(_format_server_fill_line(servers, final_used))
+
+    lines.append("")
+    lines.append("<b>Как читать результат:</b> если в сценарии 46/47, 47/47, 0/47 первым будет выбран <b>первый сервер</b>, потому что на нем еще есть 1 слот. Только после его заполнения очередь перейдет на следующий доступный сервер.")
+    return "\n".join(lines)
+
 
 async def _vpn_seats_by_server() -> dict[str, int]:
     """Return occupied WG slots per configured server code.
@@ -2366,6 +2497,36 @@ async def admin_vpn_extra_finish(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
     )
 
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:queue_sim")
+async def admin_vpn_queue_sim(cb: CallbackQuery) -> None:
+    if not (is_owner(cb.from_user.id) or is_admin(cb.from_user.id)):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer("Запускаю симуляцию очереди…")
+    except Exception:
+        pass
+
+    servers = _load_vpn_servers_admin()
+    ready_servers = [s for s in servers if str(s.get("host") or "").strip() and str(s.get("user") or "").strip()]
+    if not ready_servers:
+        ready_servers = servers
+
+    if not ready_servers:
+        await cb.message.answer("⚠️ Не найдено ни одного VPN-сервера для симуляции.", reply_markup=_kb_admin_back())
+        return
+
+    try:
+        live_used = await _vpn_seats_by_server()
+    except Exception:
+        live_used = {}
+
+    text = _build_queue_sim_report(ready_servers, live_used)
+    parts = _split_html_lines(text.splitlines())
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=False)
 
 
 @router.callback_query(lambda c: c.data == "admin:vpn:test_peer:2")
