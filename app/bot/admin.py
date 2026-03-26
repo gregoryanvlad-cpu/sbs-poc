@@ -36,7 +36,7 @@ from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import get_price_rub, set_app_setting_int, get_subscription, extend_subscription, get_app_setting_int
 from app.services.referrals.service import referral_service
-from app.services.vpn.service import vpn_service
+from app.services.vpn.service import vpn_service, gen_keys
 from app.services.vpn.ssh_provider import WireGuardSSHProvider
 from app.services.regionvpn import RegionVpnService
 from app.services.lte_vpn.service import lte_vpn_service
@@ -487,6 +487,96 @@ def _providers_for_server_code_admin(code: str | None) -> list[WireGuardSSHProvi
             os.environ.get('VPN_INTERFACE') or 'wg0',
         )
     return providers
+
+
+
+async def _create_admin_test_vpn_peer(*, tg_id: int) -> tuple[dict, dict, str]:
+    from app.bot.handlers.nav import _pick_available_vpn_server
+    from app.services.vpn import crypto as vpn_crypto
+
+    server = await _pick_available_vpn_server(current_tg_id=None)
+    if not server:
+        raise RuntimeError("Нет доступных VPN-серверов для выдачи тестового конфига")
+
+    code = str(server.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
+    host = str(server.get("host") or "")
+    user = str(server.get("user") or "")
+    port = int(server.get("port") or 22)
+    password = server.get("password")
+    interface = str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0"))
+    tc_dev = str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or "")
+    server_public_key = str(server.get("server_public_key") or vpn_service.server_pub)
+    endpoint = str(server.get("endpoint") or vpn_service.endpoint)
+    dns = str(server.get("dns") or vpn_service.dns)
+
+    if not host or not user or not server_public_key or not endpoint:
+        raise RuntimeError(f"Сервер {code} настроен не полностью: нужны host/user/server_public_key/endpoint")
+
+    async with session_scope() as session:
+        try:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
+        except Exception:
+            pass
+
+        client_ip = await vpn_service._alloc_ip_unique(session, tg_id=tg_id)
+        client_priv, client_pub = gen_keys()
+
+        provider = vpn_service._provider_for(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            interface=interface,
+            tc_dev=tc_dev,
+            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+        )
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+
+        row = VpnPeer(
+            tg_id=tg_id,
+            client_public_key=client_pub,
+            client_private_key_enc=vpn_crypto.encrypt(client_priv),
+            client_ip=client_ip,
+            server_code=code,
+            is_active=True,
+            revoked_at=None,
+            rotation_reason="admin_test",
+        )
+        session.add(row)
+        await session.flush()
+
+        try:
+            await vpn_service.ensure_rate_limit_for_server(
+                tg_id=tg_id,
+                ip=client_ip,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                interface=interface,
+                tc_dev=tc_dev,
+            )
+        except Exception:
+            pass
+
+        await session.commit()
+
+        peer = {
+            "peer_id": row.id,
+            "tg_id": tg_id,
+            "client_ip": client_ip,
+            "public_key": client_pub,
+            "client_private_key_enc": row.client_private_key_enc,
+            "client_private_key_plain": client_priv,
+        }
+        conf_text = vpn_service.build_wg_conf(
+            peer,
+            user_label=f"admin-test-{tg_id}",
+            server_public_key=server_public_key,
+            endpoint=endpoint,
+            dns=dns,
+        )
+        return server, peer, conf_text
 
 def _region_service() -> RegionVpnService:
     return RegionVpnService(
@@ -1949,7 +2039,7 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
 
         # Restore WG peers if the user was expired recently.
         try:
-            from app.services.vpn.service import vpn_service
+            from app.services.vpn.service import vpn_service, gen_keys
 
             await vpn_service.restore_expired_peers(session, target_tg_id, grace_hours=24)
         except Exception:
@@ -2529,153 +2619,100 @@ async def admin_vpn_queue_sim(cb: CallbackQuery) -> None:
     await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=False)
 
 
-@router.callback_query(lambda c: c.data == "admin:vpn:test_peer:2")
-async def admin_vpn_test_peer_server2(cb: CallbackQuery) -> None:
+@router.callback_query(lambda c: c.data == "admin:vpn:test_config")
+async def admin_vpn_test_config(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
 
     try:
-        await cb.answer("Создаю тестовый пир…")
+        await cb.answer("Создаю тестовый конфиг…")
     except Exception:
         pass
 
     from aiogram.types import BufferedInputFile
 
-    servers = _load_vpn_servers_admin()
-    if len(servers) < 2:
-        await cb.message.answer(
-            "⚠️ Server #2 не найден в VPN_SERVERS_JSON.",
-            reply_markup=_kb_admin_back(),
-        )
-        return
-
-    srv = servers[1]
-    code = str(srv.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
-    host = str(srv.get("host") or "")
-    user = str(srv.get("user") or "")
-    port = int(srv.get("port") or 22)
-    password = srv.get("password")
-    interface = str(srv.get("interface") or os.environ.get("VPN_INTERFACE", "wg0"))
-    server_public_key = str(srv.get("server_public_key") or "")
-    endpoint = str(srv.get("endpoint") or "")
-    dns = str(srv.get("dns") or os.environ.get("VPN_DNS") or "1.1.1.1")
-
-    if not host or not user or not server_public_key or not endpoint:
-        await cb.message.answer(
-            "⚠️ Server #2 настроен не полностью. Нужны host/user/server_public_key/endpoint.",
-            reply_markup=_kb_admin_back(),
-        )
-        return
-
     tg_id = int(cb.from_user.id)
     try:
-        async with session_scope() as session:
-            peer = await vpn_service.ensure_peer_for_server(
-                session,
-                tg_id,
-                server_code=code,
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                interface=interface,
-            )
-            try:
-                await vpn_service.ensure_rate_limit_for_server(
-                    tg_id=tg_id,
-                    ip=str(peer.get("client_ip") or ""),
-                    host=host,
-                    port=port,
-                    user=user,
-                    password=password,
-                    interface=interface,
-                )
-            except Exception:
-                pass
-            await session.commit()
-
-        conf_text = vpn_service.build_wg_conf(
-            peer,
-            user_label=f"admin-test-{tg_id}",
-            server_public_key=server_public_key,
-            endpoint=endpoint,
-            dns=dns,
-        )
-        filename = f"server2-test-{tg_id}.conf"
+        server, peer, conf_text = await _create_admin_test_vpn_peer(tg_id=tg_id)
+        code = str(server.get("code") or "").upper()
+        filename = f"vpn-test-{code.lower()}-{tg_id}-{int(peer.get('peer_id') or 0)}.conf"
         await cb.message.answer_document(
             document=BufferedInputFile(conf_text.encode("utf-8"), filename=filename),
             caption=(
-                f"🧪 Тестовый WireGuard-конфиг для <b>{_server_numbered_label(servers, code)}</b>\n"
-                f"IP: <code>{peer.get('client_ip')}</code>"
+                f"🧪 Тестовый WireGuard-конфиг\n"
+                f"Сервер: <b>{html.escape(_server_numbered_label(_load_vpn_servers_admin(), code))}</b>\n"
+                f"IP: <code>{html.escape(str(peer.get('client_ip') or ''))}</code>\n\n"
+                f"После проверки нажми в админке <b>«🧹 Удалить тестовый конфиг»</b>."
             ),
             parse_mode="HTML",
         )
     except Exception as e:
         await cb.message.answer(
-            "⚠️ Не удалось создать тестовый пир для Server #2.\n\n"
-            f"Причина: <code>{type(e).__name__}: {str(e)[:350]}</code>",
+            "⚠️ Не удалось создать тестовый конфиг.\n\n"
+            f"Причина: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:350])}</code>",
             reply_markup=_kb_admin_back(),
             parse_mode="HTML",
         )
 
-@router.callback_query(lambda c: c.data == "admin:vpn:test_peer:2:reset")
-async def admin_vpn_test_peer_server2_reset(cb: CallbackQuery) -> None:
+
+@router.callback_query(lambda c: c.data == "admin:vpn:test_config:reset")
+async def admin_vpn_test_config_reset(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
+
     try:
-        await cb.answer("Сбрасываю test peer Server #2…")
+        await cb.answer("Удаляю тестовые конфиги…")
     except Exception:
         pass
 
-    servers = _load_vpn_servers_admin()
-    server = None
-    for s in servers:
-        code = str(s.get("code") or "").upper()
-        if code in {"NL2", "SERVER2", "SERVER #2"}:
-            server = s
-            break
-    if not server:
-        await cb.message.answer("⚠️ Server #2 не найден в VPN_SERVERS_JSON.", reply_markup=_kb_admin_back())
-        return
-
-    host = str(server.get("host") or "")
-    port = int(server.get("port") or 22)
-    user = str(server.get("user") or "")
-    password = server.get("password") or None
-    interface = str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0"))
-    code = str(server.get("code") or "NL2").upper()
-
     removed = 0
+    touched_servers: list[str] = []
     async with session_scope() as session:
-        from app.db.models.vpn_peer import VpnPeer
         q = (
             select(VpnPeer)
-            .where(VpnPeer.tg_id == cb.from_user.id, VpnPeer.is_active == True)
-            .where(func.coalesce(func.upper(VpnPeer.server_code), literal('NL')).in_([code]))
+            .where(VpnPeer.tg_id == cb.from_user.id, VpnPeer.is_active == True, VpnPeer.rotation_reason == "admin_test")
             .order_by(VpnPeer.id.desc())
         )
         rows = list((await session.execute(q)).scalars().all())
-        provider = vpn_service._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""))
+
         for row in rows:
-            try:
-                await provider.remove_peer(row.client_public_key)
-            except Exception:
-                pass
+            providers = _providers_for_server_code_admin(row.server_code)
+            removed_remote = False
+            for provider in providers:
+                try:
+                    await provider.remove_peer(row.client_public_key)
+                    removed_remote = True
+                    break
+                except Exception:
+                    continue
+
             row.is_active = False
             row.revoked_at = utcnow()
             row.rotation_reason = "admin_test_reset"
             removed += 1
+            if row.server_code and row.server_code not in touched_servers:
+                touched_servers.append(str(row.server_code))
+
         await session.commit()
 
+    if removed == 0:
+        await cb.message.answer(
+            "ℹ️ Активных тестовых VPN-конфигов не найдено.",
+            reply_markup=_kb_admin_back(),
+        )
+        return
+
+    servers_text = ", ".join(html.escape(x) for x in touched_servers) if touched_servers else "—"
     await cb.message.answer(
-        f"🧹 TEST Server #2 сброшен. Деактивировано профилей: <b>{removed}</b>",
+        f"🧹 Тестовые конфиги удалены.\n\nУдалено профилей: <b>{removed}</b>\nСерверы: <b>{servers_text}</b>",
         reply_markup=_kb_admin_back(),
         parse_mode="HTML",
     )
 
 @router.callback_query(lambda c: c.data == "admin:vpn:usage")
+
 async def admin_vpn_usage(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
