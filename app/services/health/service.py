@@ -215,6 +215,12 @@ class HealthService:
         warn = 0
         configured_codes = {str(s.get("code") or "").strip().upper() for s in servers if str(s.get("code") or "").strip()}
         async with session_scope() as session:
+            try:
+                from app.services.vpn.service import vpn_service
+                await vpn_service.reconcile_live_peers(session)
+                await session.commit()
+            except Exception:
+                await session.rollback()
             rows = await session.execute(
                 select(VpnPeer.server_code, VpnPeer.client_public_key)
                 .where(VpnPeer.is_active == True)
