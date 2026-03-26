@@ -413,7 +413,7 @@ class VPNService:
                 await session.flush()
                 return self._row_to_peer_dict(last)
 
-        client_ip = self._alloc_ip(tg_id)
+        client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
         log.info("vpn_create_peer tg_id=%s ip=%s", tg_id, client_ip)
@@ -508,7 +508,7 @@ class VPNService:
                 return self._row_to_peer_dict(last)
 
         # No eligible peer to restore on this server — create a fresh peer.
-        client_ip = self._alloc_ip(tg_id)
+        client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
         log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
@@ -678,7 +678,7 @@ class VPNService:
             active.rotation_reason = reason
             await session.flush()
 
-        client_ip = self._alloc_ip(tg_id)
+        client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
         log.info("vpn_rotate_create_peer tg_id=%s ip=%s", tg_id, client_ip)
