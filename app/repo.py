@@ -190,10 +190,13 @@ async def set_subscription_expired(session: AsyncSession, tg_id: int) -> None:
 
 async def deactivate_peers(session: AsyncSession, tg_id: int, reason: str | None = None) -> None:
     now = utcnow()
+    values: dict[str, object] = {"is_active": False, "revoked_at": now}
+    if reason is not None:
+        values["rotation_reason"] = str(reason)
     await session.execute(
         update(VpnPeer)
         .where(VpnPeer.tg_id == int(tg_id), VpnPeer.is_active.is_(True))
-        .values(is_active=False, revoked_at=now)
+        .values(**values)
     )
 
 
