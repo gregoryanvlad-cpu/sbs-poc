@@ -2783,7 +2783,7 @@ async def _reset_admin_test_configs_for_codes(*, tg_id: int, server_codes: set[s
                 continue
 
             row.is_active = False
-            row.revoked_at = utcnow()
+            row.revoked_at = _utcnow()
             row.rotation_reason = "admin_test_reset"
             removed += 1
             if row_code and row_code not in touched_servers:
