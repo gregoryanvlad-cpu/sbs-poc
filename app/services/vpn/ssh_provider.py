@@ -48,15 +48,22 @@ class WireGuardSSHProvider:
             log.info("SSH key loaded (base64)")
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
-        return await asyncssh.connect(
-            self.host,
-            port=self.port,
-            username=self.user,
-            client_keys=[self._key_obj],
-            known_hosts=None,
-            connect_timeout=self.connect_timeout,
-            login_timeout=self.login_timeout,
-        )
+        kwargs = {
+            "host": self.host,
+            "port": self.port,
+            "username": self.user,
+            "known_hosts": None,
+            "connect_timeout": self.connect_timeout,
+            "login_timeout": self.login_timeout,
+        }
+
+        if self.password:
+            kwargs["password"] = self.password
+
+        if self._key_obj:
+            kwargs["client_keys"] = [self._key_obj]
+
+        return await asyncssh.connect(**kwargs)
 
     async def _run(self, cmd: str) -> None:
         last = None
