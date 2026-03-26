@@ -217,6 +217,28 @@ async def _send_admin_kick_report(bot: Bot, *, force: bool = False) -> None:
         pass
 
 
+async def _job_reconcile_vpn_server_state() -> None:
+    try:
+        from app.services.vpn.service import vpn_service
+    except Exception:
+        return
+    async with session_scope() as session:
+        try:
+            stats = await vpn_service.reconcile_live_peers(session)
+            if stats.get("server_code_backfilled") or stats.get("reactivated"):
+                await session.commit()
+                log.info(
+                    "vpn_reconcile_live_peers backfilled=%s reactivated=%s",
+                    stats.get("server_code_backfilled", 0),
+                    stats.get("reactivated", 0),
+                )
+            else:
+                await session.rollback()
+        except Exception:
+            await session.rollback()
+            log.exception("vpn_reconcile_live_peers_failed")
+
+
 async def run_scheduler() -> None:
     """Scheduler jobs loop (single replica) protected by advisory lock.
 
@@ -241,6 +263,7 @@ async def run_scheduler() -> None:
                 try:
                     await _job_expire_subscriptions(bot)
                     await _job_prune_wg_peers()
+                    await _job_reconcile_vpn_server_state()
                     await _job_prune_regionvpn_clients()
                     await _job_expire_lte_clients(bot)
                     await _job_poll_lte_connections(bot)
@@ -376,7 +399,7 @@ async def _job_expire_family_groups(bot: Bot) -> None:
                             continue
                         if vpn_service:
                             try:
-                                await vpn_service.remove_peer_for_server(session, peer.client_public_key, (peer.server_code or '').upper() or None)
+                                await vpn_service.remove_peer_for_server(public_key=peer.client_public_key, server_code=(peer.server_code or '').upper() or None)
                             except Exception:
                                 try:
                                     await vpn_service.provider.remove_peer(peer.client_public_key)
@@ -401,7 +424,7 @@ async def _job_expire_family_groups(bot: Bot) -> None:
                         if peer is not None:
                             if vpn_service:
                                 try:
-                                    await vpn_service.remove_peer_for_server(session, peer.client_public_key, (peer.server_code or '').upper() or None)
+                                    await vpn_service.remove_peer_for_server(public_key=peer.client_public_key, server_code=(peer.server_code or '').upper() or None)
                                 except Exception:
                                     pass
                             await session.delete(peer)
