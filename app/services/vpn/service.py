@@ -687,20 +687,135 @@ class VPNService:
         provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev, tc_parent_rate_mbit=tc_parent_rate_mbit)
         await provider.tc_apply_limit_for_ip(ip=ip, tg_id=tg_id)
 
+    def _server_config_for_code(self, code: str | None) -> tuple[dict[str, Any] | None, str | None]:
+        code_u = str(code or "").strip().upper() or None
+        if not code_u:
+            return None, None
+        for server in self._load_vpn_servers() or []:
+            srv_code = str(server.get("code") or "").strip().upper()
+            if srv_code == code_u:
+                return server, srv_code
+        return None, code_u
+
+    def _provider_from_server_config(self, server: dict[str, Any]) -> WireGuardSSHProvider:
+        return self._provider_for(
+            host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
+            port=int(server.get("port") or os.environ.get("WG_SSH_PORT", "22") or 22),
+            user=str(server.get("user") or os.environ.get("WG_SSH_USER") or ""),
+            password=server.get("password") if server.get("password") is not None else os.environ.get("WG_SSH_PASSWORD"),
+            interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE") or "wg0"),
+            tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+        )
+
     async def remove_peer_for_server(
         self,
-        *,
         public_key: str,
-        host: str,
-        port: int,
-        user: str,
-        password: str | None,
-        interface: str,
+        host: str | None = None,
+        port: int | None = None,
+        user: str | None = None,
+        password: str | None = None,
+        interface: str | None = None,
         tc_dev: str | None = None,
         tc_parent_rate_mbit: int | None = None,
-    ) -> None:
-        provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev, tc_parent_rate_mbit=tc_parent_rate_mbit)
-        await provider.remove_peer(public_key)
+        server_code: str | None = None,
+    ) -> bool:
+        if host and user and interface:
+            provider = self._provider_for(
+                host=host,
+                port=int(port or 22),
+                user=user,
+                password=password,
+                interface=interface,
+                tc_dev=tc_dev,
+                tc_parent_rate_mbit=tc_parent_rate_mbit,
+            )
+            await provider.remove_peer(public_key)
+            return True
+
+        srv, resolved_code = self._server_config_for_code(server_code)
+        if srv is not None:
+            await self._provider_from_server_config(srv).remove_peer(public_key)
+            return True
+
+        last_err: Exception | None = None
+        for server in self._load_vpn_servers() or []:
+            try:
+                provider = self._provider_from_server_config(server)
+                peers = await provider.list_peers()
+                if public_key not in peers:
+                    continue
+                await provider.remove_peer(public_key)
+                return True
+            except Exception as e:
+                last_err = e
+                continue
+
+        if resolved_code:
+            raise RuntimeError(f"VPN server not found for code: {resolved_code}")
+        if last_err is not None:
+            raise last_err
+        return False
+
+    async def reconcile_live_peers(self, session: AsyncSession) -> dict[str, int]:
+        from app.db.models.subscription import Subscription
+
+        servers = self._load_vpn_servers() or []
+        if not servers:
+            return {"server_code_backfilled": 0, "reactivated": 0}
+
+        live_keys: dict[str, str] = {}
+        for server in servers:
+            code = str(server.get("code") or "").strip().upper()
+            if not code:
+                continue
+            try:
+                provider = self._provider_from_server_config(server)
+                for key in await provider.list_peers():
+                    key_s = str(key or "").strip()
+                    if key_s:
+                        live_keys[key_s] = code
+            except Exception:
+                log.exception("vpn_reconcile_list_peers_failed server=%s", code)
+
+        if not live_keys:
+            return {"server_code_backfilled": 0, "reactivated": 0}
+
+        rows = list((await session.execute(
+            select(VpnPeer).where(VpnPeer.client_public_key.in_(list(live_keys.keys()))).order_by(VpnPeer.id.desc())
+        )).scalars().all())
+        if not rows:
+            return {"server_code_backfilled": 0, "reactivated": 0}
+
+        subs = {
+            int(tg_id): (bool(is_active) and (end_at is None or end_at > utcnow()))
+            for tg_id, is_active, end_at in (await session.execute(
+                select(Subscription.tg_id, Subscription.is_active, Subscription.end_at)
+                .where(Subscription.tg_id.in_(sorted({int(r.tg_id) for r in rows})))
+            )).all()
+        }
+
+        server_code_backfilled = 0
+        reactivated = 0
+        touched_ids: set[int] = set()
+        for row in rows:
+            key = str(row.client_public_key or "").strip()
+            code = live_keys.get(key)
+            if not key or not code or int(row.id) in touched_ids:
+                continue
+            touched_ids.add(int(row.id))
+            row_code = str(getattr(row, "server_code", None) or "").strip().upper()
+            if row_code != code:
+                row.server_code = code
+                server_code_backfilled += 1
+            if not bool(getattr(row, "is_active", False)) and subs.get(int(row.tg_id), False):
+                row.is_active = True
+                row.revoked_at = None
+                reactivated += 1
+
+        if server_code_backfilled or reactivated:
+            await session.flush()
+        return {"server_code_backfilled": server_code_backfilled, "reactivated": reactivated}
 
     async def get_peer_handshake_for_server(
         self,
