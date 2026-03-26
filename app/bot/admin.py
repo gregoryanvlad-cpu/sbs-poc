@@ -490,13 +490,24 @@ def _providers_for_server_code_admin(code: str | None) -> list[WireGuardSSHProvi
 
 
 
-async def _create_admin_test_vpn_peer(*, tg_id: int) -> tuple[dict, dict, str]:
+async def _create_admin_test_vpn_peer(*, tg_id: int, preferred_code: str | None = None) -> tuple[dict, dict, str]:
     from app.bot.handlers.nav import _pick_available_vpn_server
     from app.services.vpn import crypto as vpn_crypto
 
-    server = await _pick_available_vpn_server(current_tg_id=None)
-    if not server:
-        raise RuntimeError("Нет доступных VPN-серверов для выдачи тестового конфига")
+    preferred = str(preferred_code or "").strip().upper()
+    if preferred and preferred != "AUTO":
+        servers = _load_vpn_servers_admin()
+        server = next((s for s in servers if str(s.get("code") or "").strip().upper() == preferred), None)
+        if not server:
+            raise RuntimeError(f"Сервер {preferred} не найден в VPN_SERVERS_JSON")
+        used = await _vpn_seats_by_server()
+        cap = _vpn_capacity_limit_admin(server)
+        if int(used.get(preferred, 0)) >= cap:
+            raise RuntimeError(f"На сервере {preferred} нет свободных мест: {int(used.get(preferred, 0))}/{cap}")
+    else:
+        server = await _pick_available_vpn_server(current_tg_id=None)
+        if not server:
+            raise RuntimeError("Нет доступных VPN-серверов для выдачи тестового конфига")
 
     code = str(server.get("code") or os.environ.get("VPN_CODE", "NL")).upper()
     host = str(server.get("host") or "")
@@ -1068,6 +1079,24 @@ def _kb_server_users_menu() -> InlineKeyboardMarkup:
     for idx, s in enumerate(servers, start=1):
         name = str(s.get("name") or s.get("code") or f"Server #{idx}")
         b.button(text=f"👥 Server #{idx} — {name}", callback_data=f"admin:vpn:server_users:{idx}")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _kb_admin_test_config_servers() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    servers = _load_vpn_servers_admin()
+    for idx, srv in enumerate(servers, start=1):
+        code = str(srv.get("code") or "").strip().upper()
+        if not code:
+            continue
+        b.button(
+            text=f"🧪 Server #{idx} — {str(srv.get('name') or code)}",
+            callback_data=f"admin:vpn:test_config:create:{code}",
+        )
+    if servers:
+        b.button(text="🤖 Автовыбор по очереди", callback_data="admin:vpn:test_config:create:auto")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
     b.adjust(1)
     return b.as_markup()
@@ -2626,6 +2655,24 @@ async def admin_vpn_test_config(cb: CallbackQuery) -> None:
         return
 
     try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    await cb.message.answer(
+        "Выбери сервер, на котором нужно создать тестовый конфиг.",
+        reply_markup=_kb_admin_test_config_servers(),
+    )
+
+
+@router.callback_query(lambda c: c.data.startswith("admin:vpn:test_config:create:"))
+async def admin_vpn_test_config_create(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    preferred_code = str(cb.data or "").split(":")[-1].strip().upper()
+    try:
         await cb.answer("Создаю тестовый конфиг…")
     except Exception:
         pass
@@ -2634,7 +2681,10 @@ async def admin_vpn_test_config(cb: CallbackQuery) -> None:
 
     tg_id = int(cb.from_user.id)
     try:
-        server, peer, conf_text = await _create_admin_test_vpn_peer(tg_id=tg_id)
+        server, peer, conf_text = await _create_admin_test_vpn_peer(
+            tg_id=tg_id,
+            preferred_code=None if preferred_code == "AUTO" else preferred_code,
+        )
         code = str(server.get("code") or "").upper()
         filename = f"vpn-test-{code.lower()}-{tg_id}-{int(peer.get('peer_id') or 0)}.conf"
         await cb.message.answer_document(
@@ -2651,7 +2701,7 @@ async def admin_vpn_test_config(cb: CallbackQuery) -> None:
         await cb.message.answer(
             "⚠️ Не удалось создать тестовый конфиг.\n\n"
             f"Причина: <code>{html.escape(type(e).__name__)}: {html.escape(str(e)[:350])}</code>",
-            reply_markup=_kb_admin_back(),
+            reply_markup=_kb_admin_test_config_servers(),
             parse_mode="HTML",
         )
 
