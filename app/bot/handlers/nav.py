@@ -28,6 +28,7 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import select, func, literal
 
 from app.bot.auth import is_owner
+from app.repo import utcnow
 from app.bot.keyboards import (
     kb_back_home,
     kb_back_faq,
