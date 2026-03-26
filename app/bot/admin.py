@@ -1102,6 +1102,24 @@ def _kb_admin_test_config_servers() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def _kb_admin_test_config_reset_servers() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    servers = _load_vpn_servers_admin()
+    for idx, srv in enumerate(servers, start=1):
+        code = str(srv.get("code") or "").strip().upper()
+        if not code:
+            continue
+        b.button(
+            text=f"🧹 Server #{idx} — {str(srv.get('name') or code)}",
+            callback_data=f"admin:vpn:test_config:reset_server:{code}",
+        )
+    if servers:
+        b.button(text="🧹 Удалить на всех серверах", callback_data="admin:vpn:test_config:reset_all")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
 def _kb_home_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
@@ -2713,41 +2731,125 @@ async def admin_vpn_test_config_reset(cb: CallbackQuery) -> None:
         return
 
     try:
-        await cb.answer("Удаляю тестовые конфиги…")
+        await cb.answer()
     except Exception:
         pass
 
+    await cb.message.answer(
+        "Выбери сервер, с которого нужно удалить тестовый конфиг.",
+        reply_markup=_kb_admin_test_config_reset_servers(),
+    )
+
+
+async def _reset_admin_test_configs_for_codes(*, tg_id: int, server_codes: set[str] | None = None) -> tuple[int, list[str], list[str]]:
     removed = 0
     touched_servers: list[str] = []
+    errors: list[str] = []
+
     async with session_scope() as session:
-        q = (
-            select(VpnPeer)
-            .where(VpnPeer.tg_id == cb.from_user.id, VpnPeer.is_active == True, VpnPeer.rotation_reason == "admin_test")
-            .order_by(VpnPeer.id.desc())
-        )
+        q = select(VpnPeer).where(
+            VpnPeer.tg_id == tg_id,
+            VpnPeer.rotation_reason.in_(["admin_test", "admin_test_reset"]),
+        ).order_by(VpnPeer.id.desc())
         rows = list((await session.execute(q)).scalars().all())
 
+        filtered: list[VpnPeer] = []
         for row in rows:
-            providers = _providers_for_server_code_admin(row.server_code)
+            row_code = str(row.server_code or "").strip().upper()
+            if server_codes and row_code not in server_codes:
+                continue
+            filtered.append(row)
+
+        for row in filtered:
+            row_code = str(row.server_code or "").strip().upper()
+            providers = _providers_for_server_code_admin(row_code)
             removed_remote = False
+            last_error: str | None = None
+
             for provider in providers:
                 try:
-                    await provider.remove_peer(row.client_public_key)
+                    await provider.remove_peer(str(row.client_public_key))
                     removed_remote = True
                     break
-                except Exception:
+                except Exception as e:
+                    last_error = f"{type(e).__name__}: {e}"
                     continue
+
+            if not removed_remote and row.is_active:
+                if providers:
+                    errors.append(f"{row_code or '—'}: не удалось удалить peer {row.client_public_key[:16]}… ({html.escape(str(last_error or 'unknown error')[:140])})")
+                    continue
+                errors.append(f"{row_code or '—'}: для peer {row.client_public_key[:16]}… не найден SSH-провайдер")
+                continue
 
             row.is_active = False
             row.revoked_at = utcnow()
             row.rotation_reason = "admin_test_reset"
             removed += 1
-            if row.server_code and row.server_code not in touched_servers:
-                touched_servers.append(str(row.server_code))
+            if row_code and row_code not in touched_servers:
+                touched_servers.append(row_code)
 
         await session.commit()
 
-    if removed == 0:
+    return removed, touched_servers, errors
+
+
+@router.callback_query(lambda c: c.data.startswith("admin:vpn:test_config:reset_server:"))
+async def admin_vpn_test_config_reset_server(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    code = str(cb.data or "").split(":")[-1].strip().upper()
+    try:
+        await cb.answer(f"Удаляю тестовые конфиги с {code}…")
+    except Exception:
+        pass
+
+    removed, touched_servers, errors = await _reset_admin_test_configs_for_codes(
+        tg_id=int(cb.from_user.id),
+        server_codes={code},
+    )
+
+    if removed == 0 and not errors:
+        await cb.message.answer(
+            f"ℹ️ На сервере <b>{html.escape(code)}</b> активных тестовых конфигов не найдено.",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [
+        "🧹 <b>Удаление тестовых конфигов завершено</b>",
+        f"Сервер: <b>{html.escape(code)}</b>",
+        f"Удалено профилей: <b>{removed}</b>",
+    ]
+    if touched_servers:
+        lines.append(f"Затронутые серверы: <b>{html.escape(', '.join(touched_servers))}</b>")
+    if errors:
+        lines.append("")
+        lines.append("⚠️ Ошибки:")
+        lines.extend(f"• {err}" for err in errors[:10])
+    await cb.message.answer("\n".join(lines), reply_markup=_kb_admin_back(), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:test_config:reset_all")
+async def admin_vpn_test_config_reset_all(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer("Удаляю тестовые конфиги на всех серверах…")
+    except Exception:
+        pass
+
+    removed, touched_servers, errors = await _reset_admin_test_configs_for_codes(
+        tg_id=int(cb.from_user.id),
+        server_codes=None,
+    )
+
+    if removed == 0 and not errors:
         await cb.message.answer(
             "ℹ️ Активных тестовых VPN-конфигов не найдено.",
             reply_markup=_kb_admin_back(),
@@ -2755,11 +2857,17 @@ async def admin_vpn_test_config_reset(cb: CallbackQuery) -> None:
         return
 
     servers_text = ", ".join(html.escape(x) for x in touched_servers) if touched_servers else "—"
-    await cb.message.answer(
-        f"🧹 Тестовые конфиги удалены.\n\nУдалено профилей: <b>{removed}</b>\nСерверы: <b>{servers_text}</b>",
-        reply_markup=_kb_admin_back(),
-        parse_mode="HTML",
-    )
+    lines = [
+        "🧹 <b>Тестовые конфиги удалены</b>",
+        f"Удалено профилей: <b>{removed}</b>",
+        f"Серверы: <b>{servers_text}</b>",
+    ]
+    if errors:
+        lines.append("")
+        lines.append("⚠️ Ошибки:")
+        lines.extend(f"• {err}" for err in errors[:10])
+    await cb.message.answer("\n".join(lines), reply_markup=_kb_admin_back(), parse_mode="HTML")
+
 
 @router.callback_query(lambda c: c.data == "admin:vpn:usage")
 
