@@ -348,10 +348,29 @@ class VPNService:
             "tc_dev": str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
         }
 
+    def _default_server_code(self) -> str:
+        return (os.environ.get("VPN_CODE") or "NL").upper()
+
+    async def _family_peer_subquery(self, tg_id: int):
+        from app.db.models.family_vpn_profile import FamilyVpnProfile
+
+        return select(FamilyVpnProfile.vpn_peer_id).where(
+            FamilyVpnProfile.owner_tg_id == tg_id,
+            FamilyVpnProfile.vpn_peer_id.is_not(None),
+        )
+
     async def _get_active_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
+        reason_expr = func.coalesce(VpnPeer.rotation_reason, "")
+        family_peer_ids = await self._family_peer_subquery(tg_id)
         q = (
             select(VpnPeer)
-            .where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
+            .where(
+                VpnPeer.tg_id == tg_id,
+                VpnPeer.is_active == True,  # noqa: E712
+                ~VpnPeer.id.in_(family_peer_ids),
+                ~reason_expr.like("family_slot_%"),
+                reason_expr != "admin_test",
+            )
             .order_by(VpnPeer.id.desc())
             .limit(1)
         )
@@ -359,9 +378,46 @@ class VPNService:
         return res.scalar_one_or_none()
 
     async def _get_last_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
-        q = select(VpnPeer).where(VpnPeer.tg_id == tg_id).order_by(VpnPeer.id.desc()).limit(1)
+        reason_expr = func.coalesce(VpnPeer.rotation_reason, "")
+        family_peer_ids = await self._family_peer_subquery(tg_id)
+        q = (
+            select(VpnPeer)
+            .where(
+                VpnPeer.tg_id == tg_id,
+                ~VpnPeer.id.in_(family_peer_ids),
+                ~reason_expr.like("family_slot_%"),
+                reason_expr != "admin_test",
+            )
+            .order_by(VpnPeer.id.desc())
+            .limit(1)
+        )
         res = await session.execute(q)
         return res.scalar_one_or_none()
+
+    def _server_dict_by_code(self, code: str | None) -> dict | None:
+        code_u = str(code or "").strip().upper()
+        if not code_u:
+            return None
+        for server in self._load_vpn_servers():
+            if str(server.get("code") or "").strip().upper() == code_u:
+                return server
+        return None
+
+    def _provider_for_server_code(self, code: str | None) -> tuple[WireGuardSSHProvider, str]:
+        code_u = str(code or "").strip().upper() or self._default_server_code()
+        server = self._server_dict_by_code(code_u)
+        if not server:
+            return self.provider, code_u
+        provider = self._provider_for(
+            host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
+            port=int(server.get("port") or 22),
+            user=str(server.get("user") or os.environ.get("WG_SSH_USER") or ""),
+            password=server.get("password"),
+            interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+        )
+        return provider, code_u
 
     def _row_to_peer_dict(self, row: VpnPeer) -> Dict[str, Any]:
         priv_plain = crypto.decrypt(row.client_private_key_enc)
@@ -405,8 +461,11 @@ class VPNService:
                     eligible = last.revoked_at >= cutoff
 
             if eligible:
-                log.info("vpn_restore_peer tg_id=%s peer_id=%s", tg_id, last.id)
-                await self.provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
+                server_code = str(getattr(last, "server_code", None) or self._default_server_code()).upper()
+                provider, server_code = self._provider_for_server_code(server_code)
+                log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
+                await provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
+                last.server_code = server_code
                 last.is_active = True
                 last.revoked_at = None
                 last.rotation_reason = None
@@ -416,15 +475,17 @@ class VPNService:
         client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
-        log.info("vpn_create_peer tg_id=%s ip=%s", tg_id, client_ip)
-        await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+        server_code = self._default_server_code()
+        provider, server_code = self._provider_for_server_code(server_code)
+        log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
             tg_id=tg_id,
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
-            server_code=(os.environ.get("VPN_CODE") or "NL").upper(),
+            server_code=server_code,
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
@@ -656,8 +717,10 @@ class VPNService:
         provider = self._provider_for(host=host, port=port, user=user, password=password, interface=interface, tc_dev=tc_dev, tc_parent_rate_mbit=tc_parent_rate_mbit)
         return await provider.get_peer_latest_handshake(public_key)
 
+
+
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
-        """Manual reset: best-effort remove old peer then create/apply new peer."""
+        """Manual reset for the owner's main profile only."""
 
         # Serialize resets per user (see ensure_peer).
         try:
@@ -666,30 +729,42 @@ class VPNService:
             pass
 
         active = await self._get_active_peer(session, tg_id)
+        target_server_code = self._default_server_code()
 
         if active:
+            target_server_code = str(getattr(active, "server_code", None) or target_server_code).upper()
+            provider, target_server_code = self._provider_for_server_code(target_server_code)
             try:
-                await self.provider.remove_peer(active.client_public_key)
+                await provider.remove_peer(active.client_public_key)
             except Exception:
-                log.exception("vpn_remove_old_peer_failed tg_id=%s peer_id=%s", tg_id, active.id)
+                log.exception(
+                    "vpn_remove_old_peer_failed tg_id=%s peer_id=%s server=%s",
+                    tg_id,
+                    active.id,
+                    target_server_code,
+                )
 
+            active.server_code = target_server_code
             active.is_active = False
             active.revoked_at = utcnow()
             active.rotation_reason = reason
             await session.flush()
+        else:
+            _, target_server_code = self._provider_for_server_code(target_server_code)
 
         client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
-        log.info("vpn_rotate_create_peer tg_id=%s ip=%s", tg_id, client_ip)
-        await self.provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+        provider, target_server_code = self._provider_for_server_code(target_server_code)
+        log.info("vpn_rotate_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, target_server_code)
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
         row = VpnPeer(
             tg_id=tg_id,
             client_public_key=client_pub,
             client_private_key_enc=crypto.encrypt(client_priv),
             client_ip=client_ip,
-            server_code=None,
+            server_code=target_server_code,
             is_active=True,
             revoked_at=None,
             rotation_reason=None,
