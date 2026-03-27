@@ -1819,6 +1819,47 @@ async def admin_user_set_end_at_finish(message: Message, state: FSMContext) -> N
     )
 
 
+def _kb_yandex_gate(*, blocked: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("✅ Включить выдачу приглашений" if blocked else "⛔️ Остановить выдачу приглашений"),
+            callback_data=("admin:yandex:gate:off" if blocked else "admin:yandex:gate:on"),
+        )],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+    ])
+
+
+@router.callback_query(lambda c: c.data == "admin:yandex:gate")
+async def admin_yandex_gate(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    async with session_scope() as session:
+        blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
+    state_text = "⛔️ остановлена" if blocked else "✅ включена"
+    text = (
+        "🟡 <b>Выдача приглашений Yandex</b>\n\n"
+        f"Текущий статус: <b>{state_text}</b>\n\n"
+        "Когда стоп включён, новые пользователи без ранее выданного приглашения не смогут получить invite. "
+        "Пользователи, у которых ссылка уже есть, продолжат видеть и открывать своё приглашение."
+    )
+    await cb.message.edit_text(text, reply_markup=_kb_yandex_gate(blocked=blocked), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "") in {"admin:yandex:gate:on", "admin:yandex:gate:off"})
+async def admin_yandex_gate_toggle(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    blocked = (cb.data or "").endswith(":on")
+    async with session_scope() as session:
+        await set_app_setting_int(session, "yandex_invites_blocked", 1 if blocked else 0)
+        await session.commit()
+    await cb.answer("Сохранено")
+    await admin_yandex_gate(cb)
+
+
 @router.callback_query(lambda c: c.data == "admin:vpn:grace")
 async def admin_vpn_grace_list(cb: CallbackQuery) -> None:
     """List users within the 24h grace window after subscription expiration."""
