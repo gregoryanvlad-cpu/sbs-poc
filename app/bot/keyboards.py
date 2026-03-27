@@ -121,6 +121,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="➕ Добавить Yandex-аккаунт", callback_data="admin:yandex:add")
     b.button(text="📋 Список аккаунтов/слотов", callback_data="admin:yandex:list")
     b.button(text="✏️ Редактировать аккаунт", callback_data="admin:yandex:edit")
+    b.button(text="⛔️ Стоп выдача Yandex", callback_data="admin:yandex:gate")
 
     # Kick reports
     b.button(text="📋 Кого исключить сегодня", callback_data="admin:kick:report")
