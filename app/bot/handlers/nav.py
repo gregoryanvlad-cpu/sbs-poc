@@ -1344,14 +1344,22 @@ async def on_nav(cb: CallbackQuery) -> None:
                 "Если ссылка уже не открывается — запроси новую у поддержки: @sbsmanager_bot."
             )
         else:
-            # Ссылки ещё не было — выдаём по кнопке.
-            buttons.append([InlineKeyboardButton(text="Получить приглашение", callback_data="yandex:issue")])
-            info = (
-                "🟡 <b>Yandex Plus</b>\n\n"
-                "Нажмите кнопку ниже — вам будет выслано приглашение в семейную подписку.\n\n"
-                "⚠️ <b>Важно:</b> после получения ссылки перейдите по ней <b>сразу сейчас</b>.\n"
-                "Ссылка-приглашение действует ограниченное время и позже может устареть."
-            )
+            invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
+            if invites_blocked:
+                info = (
+                    "🟡 <b>Yandex Plus</b>\n\n"
+                    "⚠️ <b>Сейчас места в семейной подписке временно заняты.</b>\n\n"
+                    "Наша команда уже знает об этом и скоро загрузит новые аккаунты. "
+                    "Как только появятся новые места, выдача приглашений возобновится."
+                )
+            else:
+                buttons.append([InlineKeyboardButton(text="Получить приглашение", callback_data="yandex:issue")])
+                info = (
+                    "🟡 <b>Yandex Plus</b>\n\n"
+                    "Нажмите кнопку ниже — вам будет выслано приглашение в семейную подписку.\n\n"
+                    "⚠️ <b>Важно:</b> после получения ссылки перейдите по ней <b>сразу сейчас</b>.\n"
+                    "Ссылка-приглашение действует ограниченное время и позже может устареть."
+                )
 
         buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
 
@@ -3521,7 +3529,10 @@ async def on_family_billing_opt(cb: CallbackQuery) -> None:
 def _family_share_kb(seats_total: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(1, seats_total + 1):
-        rows.append([InlineKeyboardButton(text=f"Поделиться профилем {i}", callback_data=f"family:share:{i}")])
+        rows.append([
+            InlineKeyboardButton(text=f"📤 Профиль {i}", callback_data=f"family:share:{i}"),
+            InlineKeyboardButton(text=f"♻️ Сброс {i}", callback_data=f"family:reset:{i}"),
+        ])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:family")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3589,6 +3600,78 @@ def _family_forward_instructions_text() -> str:
 4) Для отключения: <code>sudo wg-quick down wg0</code>.
 
 Подробные инструкции для каждого устройства также есть в боте: <b>VPN → Инструкция</b>."""
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("family:reset:"))
+async def on_family_reset_slot(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        await _safe_cb_answer(cb)
+        return
+    try:
+        slot_no = int(parts[2])
+    except Exception:
+        slot_no = 0
+    if slot_no <= 0:
+        await _safe_cb_answer(cb)
+        return
+
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
+            return
+
+        grp = await _get_or_create_family_group(session, tg_id)
+        now = utcnow()
+        if not (grp.active_until and grp.active_until > now):
+            await cb.answer("Семейная группа не активна. Оплатите продление.", show_alert=True)
+            return
+
+        from app.db.models import FamilyVpnProfile, VpnPeer
+        prof = await session.scalar(
+            select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == tg_id, FamilyVpnProfile.slot_no == slot_no).limit(1)
+        )
+        if not prof:
+            await cb.answer("Профиль не найден", show_alert=True)
+            return
+        if prof.is_paused:
+            await cb.answer("Профиль на паузе. Сначала включите его.", show_alert=True)
+            return
+
+        old_peer = await session.get(VpnPeer, int(prof.vpn_peer_id or 0)) if getattr(prof, "vpn_peer_id", None) else None
+        if old_peer:
+            old_code = str(getattr(old_peer, "server_code", None) or os.environ.get("VPN_CODE") or "NL1").upper()
+            try:
+                await vpn_service.remove_peer_for_server(public_key=old_peer.client_public_key, server_code=old_code)
+            except Exception:
+                pass
+            old_peer.is_active = False
+            old_peer.revoked_at = utcnow()
+            old_peer.rotation_reason = f"family_slot_{slot_no}_manual_reset"
+
+        peer_dict = await vpn_service.create_extra_peer(session, tg_id=tg_id, prefer_current_server=False)
+        row = await session.get(VpnPeer, int(peer_dict.get("peer_id")))
+        if row:
+            row.rotation_reason = f"family_slot_{slot_no}"
+        prof.vpn_peer_id = int(peer_dict.get("peer_id"))
+        await session.commit()
+
+    conf_text = vpn_service.build_wg_conf(peer_dict, user_label=f"family:{tg_id}:{slot_no}")
+    conf_file = BufferedInputFile(conf_text.encode(), filename=f"wgf{slot_no}.conf")
+    await cb.message.answer_document(
+        conf_file,
+        caption=(
+            f"♻️ Новый конфиг для семейного профиля <b>#{slot_no}</b> готов.\n"
+            "Старый конфиг больше не работает — отправьте человеку новый файл."
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+        ),
+    )
+    await cb.answer("Профиль сброшен")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("family:share:"))
@@ -3692,7 +3775,7 @@ async def on_family_share_slot(cb: CallbackQuery) -> None:
 
         if not peer_dict and not prof.is_paused:
             # Create a new extra peer (same tg_id, unique IP)
-            peer_dict = await vpn_service.create_extra_peer(session, tg_id=tg_id)
+            peer_dict = await vpn_service.create_extra_peer(session, tg_id=tg_id, prefer_current_server=False)
             # mark as family slot
             try:
                 row = await session.get(VpnPeer, int(peer_dict.get("peer_id")))
