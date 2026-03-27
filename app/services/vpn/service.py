@@ -431,6 +431,27 @@ class VPNService:
             "client_private_key_plain": priv_plain,
         }
 
+    async def _pick_server_for_new_peer(self, session: AsyncSession) -> dict:
+        """Pick a server for a brand-new regular peer.
+
+        Regular users should follow the same seat-aware multi-server logic as
+        admin-created extra/family peers. We intentionally keep the selection
+        deterministic by walking servers in configured order and taking the
+        first server with free capacity.
+        """
+        servers = self._load_vpn_servers()
+        if not servers:
+            raise RuntimeError("No VPN servers configured")
+        used = await self._vpn_seats_by_server(session)
+
+        for server in servers:
+            code = str(server.get("code") or "").upper()
+            seats = int(used.get(code, 0))
+            cap = self._server_capacity(server)
+            if seats < cap:
+                return server
+        raise RuntimeError("All VPN servers are full")
+
     async def ensure_peer(self, session: AsyncSession, tg_id: int) -> Dict[str, Any]:
         """Return existing active peer or create/apply a new one."""
 
@@ -476,8 +497,17 @@ class VPNService:
         client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
 
-        server_code = self._default_server_code()
-        provider, server_code = self._provider_for_server_code(server_code)
+        server = await self._pick_server_for_new_peer(session)
+        server_code = str(server.get("code") or self._default_server_code()).upper()
+        provider = self._provider_for(
+            host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
+            port=int(server.get("port") or 22),
+            user=str(server.get("user") or os.environ.get("WG_SSH_USER") or ""),
+            password=server.get("password"),
+            interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+        )
         log.info("vpn_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
         await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
 
