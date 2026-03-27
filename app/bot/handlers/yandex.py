@@ -11,7 +11,7 @@ from app.bot.keyboards import kb_main
 from app.db.models import User
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
-from app.repo import get_subscription
+from app.repo import get_subscription, get_app_setting_int
 from app.bot.ui import utcnow
 from app.core.config import settings
 from app.services.yandex.service import yandex_service
@@ -144,6 +144,18 @@ async def on_yandex_issue(cb: CallbackQuery) -> None:
         ):
             invite_link = ym.invite_link
         else:
+            invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
+            if invites_blocked:
+                await cb.message.answer(
+                    "⚠️ <b>Сейчас места в семейной подписке временно заняты.</b>\n\n"
+                    "Наша команда уже знает об этом и скоро загрузит новые аккаунты. "
+                    "Как только появятся новые места, выдача приглашений возобновится.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                    ),
+                )
+                return
             try:
                 ym = await yandex_service.ensure_membership_for_user(
                     session=session,
