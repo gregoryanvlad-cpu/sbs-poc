@@ -275,7 +275,7 @@ class VPNService:
                 return s
         raise RuntimeError("All VPN servers are full")
 
-    async def create_extra_peer(self, session: AsyncSession, tg_id: int) -> Dict[str, Any]:
+    async def create_extra_peer(self, session: AsyncSession, tg_id: int, *, prefer_current_server: bool = True) -> Dict[str, Any]:
         """Create an additional active peer for the same tg_id.
 
         Intended for admin-only usage (multiple devices for the same admin).
@@ -293,16 +293,17 @@ class VPNService:
         client_priv, client_pub = gen_keys()
 
         inherited_code = None
-        try:
-            active = await self._get_active_peer(session, tg_id)
-            if active and getattr(active, "server_code", None):
-                inherited_code = str(active.server_code).upper()
-        except Exception:
-            inherited_code = None
-        if not inherited_code:
+        if prefer_current_server:
+            try:
+                active = await self._get_active_peer(session, tg_id)
+                if active and getattr(active, "server_code", None):
+                    inherited_code = str(active.server_code).upper()
+            except Exception:
+                inherited_code = None
+        if not inherited_code and prefer_current_server:
             inherited_code = (os.environ.get("VPN_CODE") or "NL").upper()
 
-        server = await self._pick_server_for_extra_peer(session, inherited_code=inherited_code)
+        server = await self._pick_server_for_extra_peer(session, inherited_code=inherited_code if prefer_current_server else None)
         server_code = str(server.get("code") or inherited_code or os.environ.get("VPN_CODE") or "NL").upper()
         provider = self._provider_for(
             host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
