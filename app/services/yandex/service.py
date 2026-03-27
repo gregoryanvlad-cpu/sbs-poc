@@ -11,7 +11,7 @@ from app.db.models.subscription import Subscription
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
-from app.repo import utcnow
+from app.repo import utcnow, get_app_setting_int
 
 
 @dataclass
@@ -118,6 +118,10 @@ class YandexService:
         sub = await session.scalar(select(Subscription).where(Subscription.tg_id == tg_id).limit(1))
         if not sub or not sub.end_at or _ensure_tz(sub.end_at) <= now:
             raise RuntimeError("Subscription is not active")
+
+        invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
+        if invites_blocked:
+            raise RuntimeError("Yandex invites are temporarily blocked")
 
         acc, slot = await _pick_slot_for_issue(session, now=now)
 
