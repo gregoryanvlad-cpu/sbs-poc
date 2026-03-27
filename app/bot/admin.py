@@ -516,12 +516,17 @@ async def _create_admin_test_vpn_peer(*, tg_id: int, preferred_code: str | None 
     password = server.get("password")
     interface = str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0"))
     tc_dev = str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or "")
-    server_public_key = str(server.get("server_public_key") or vpn_service.server_pub)
-    endpoint = str(server.get("endpoint") or vpn_service.endpoint)
+    # IMPORTANT: for admin test configs we must use the selected server strictly as-is.
+    # Falling back to global VPN defaults here can silently generate a config for
+    # another server (for example, default server #2) even when admin selected #1.
+    server_public_key = str(server.get("server_public_key") or "")
+    endpoint = str(server.get("endpoint") or "")
     dns = str(server.get("dns") or vpn_service.dns)
 
     if not host or not user or not server_public_key or not endpoint:
-        raise RuntimeError(f"Сервер {code} настроен не полностью: нужны host/user/server_public_key/endpoint")
+        raise RuntimeError(
+            f"Сервер {code} настроен не полностью: нужны host/user/server_public_key/endpoint в VPN_SERVERS_JSON"
+        )
 
     async with session_scope() as session:
         try:
