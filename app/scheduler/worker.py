@@ -1568,17 +1568,8 @@ async def _job_poll_lte_connections(bot: Bot) -> None:
     except Exception:
         log.exception("lte_poll_failed")
         return
-    for tg_id in result.connected_ids:
-        try:
-            await bot.send_message(
-                int(tg_id),
-                "Вы подключились к VPN LTE. Не забудьте отключиться, когда выйдете на Wi‑Fi.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
-                ),
-            )
-        except Exception:
-            pass
+    # LTE connection notifications disabled: users complained about noisy alerts.
+    # Keep polling for anti-sharing detection and strict disables below.
     for tg_id in result.warned_ids:
         try:
             await bot.send_message(
