@@ -4157,11 +4157,7 @@ async def on_vpn_lte_install(cb: CallbackQuery) -> None:
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
-    if not settings.lte_access_log_poll_enabled:
-        try:
-            await cb.bot.send_message(cb.from_user.id, "Вы подключились к VPN LTE. Не забудьте отключиться, когда выйдете на Wi‑Fi.", reply_markup=kb_lte_main_menu())
-        except Exception:
-            pass
+    # LTE connection reminder disabled to avoid noisy unsolicited notifications.
     await _safe_cb_answer(cb)
 
 
