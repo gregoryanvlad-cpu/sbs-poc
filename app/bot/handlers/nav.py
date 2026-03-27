@@ -156,13 +156,52 @@ async def _restore_wg_peers_after_payment(session, tg_id: int) -> None:
         pass
 
 
-async def _subscription_required_alert_text(session, tg_id: int) -> str:
-    """Choose the correct access-denied text for users without an active subscription."""
-    if await is_trial_available(session, tg_id):
-        return "Сначала активируйте пробный период: кнопка «🎁 Пробный период 5 дней» в главном меню."
-    if await has_used_trial(session, tg_id):
-        return "Ваш пробный период закончился. Чтобы продолжить пользоваться сервисом, оплатите подписку."
-    return "Для доступа необходимо оплатить подписку!"
+def _kb_subscription_required(*, show_trial: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if show_trial:
+        rows.append([InlineKeyboardButton(text="🎁 Пробный период 5 дней", callback_data="trial:start")])
+    rows.append([InlineKeyboardButton(text="💳 Купить подписку", callback_data="nav:pay")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _subscription_required_prompt(session, tg_id: int) -> tuple[str, InlineKeyboardMarkup, str]:
+    """Return a friendly subscription prompt with concrete next-step buttons."""
+    trial_available = await is_trial_available(session, tg_id)
+    if trial_available:
+        text = (
+            "🔒 <b>Нужна активная подписка</b>\n\n"
+            "Чтобы получить доступ, выберите удобный вариант:\n"
+            "• активируйте <b>пробный период 5 дней</b>\n"
+            "• или сразу <b>оформите платную подписку</b>."
+        )
+        alert_text = "Нужна подписка: можно взять пробный период или сразу оплатить."
+    elif await has_used_trial(session, tg_id):
+        text = (
+            "🔒 <b>Нужна активная подписка</b>\n\n"
+            "Ваш пробный период уже был использован.\n"
+            "Чтобы продолжить пользоваться сервисом, оформите платную подписку."
+        )
+        alert_text = "Пробный период уже использован. Оформите платную подписку."
+    else:
+        text = (
+            "🔒 <b>Нужна активная подписка</b>\n\n"
+            "Чтобы получить доступ, оформите платную подписку."
+        )
+        alert_text = "Для доступа нужна платная подписка."
+    return text, _kb_subscription_required(show_trial=trial_available), alert_text
+
+
+async def _show_subscription_required_prompt(cb: CallbackQuery, session, tg_id: int) -> None:
+    text, kb, alert_text = await _subscription_required_prompt(session, tg_id)
+    try:
+        await cb.answer(alert_text)
+    except Exception:
+        pass
+    try:
+        await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
 
 # --- VPN-Region (VLESS + Reality) ---
 
@@ -2124,7 +2163,7 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
+            await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
         from app.db.models.vpn_peer import VpnPeer
@@ -2443,7 +2482,7 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
+            await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
     servers = _load_vpn_servers()
@@ -2529,7 +2568,7 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
+            await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
     servers = _load_vpn_servers()
@@ -2749,7 +2788,7 @@ async def on_vpn_reset_confirm(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
+            await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
     await cb.message.edit_text(
@@ -2769,7 +2808,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
+            await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
     await cb.answer("Сбрасываю…")
@@ -2892,7 +2931,7 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
         if not _is_sub_active(sub.end_at):
-            await cb.answer(await _subscription_required_alert_text(session, tg_id), show_alert=True)
+            await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
     srv = await _pick_available_vpn_server(current_tg_id=tg_id)
