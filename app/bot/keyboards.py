@@ -152,7 +152,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
 
     b.button(text="🏠 Главное меню", callback_data="nav:home")
-    b.adjust(1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
     return b.as_markup()
 
 
