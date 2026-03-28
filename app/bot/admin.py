@@ -1400,12 +1400,19 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
 
     # LTE snapshot (best-effort)
     try:
-        lte_row = await session.get(LteVpnClient, tg_id)
+        has_success_payment = bool(await session.scalar(select(Payment.id).where(Payment.tg_id == tg_id, Payment.status == "success").limit(1)))
+        lte_state = await lte_vpn_service.reconcile_access(
+            tg_id,
+            subscription_end_at=sub.end_at if sub else None,
+            has_success_payment=has_success_payment,
+            ensure_remote=False,
+        )
+        lte_row = lte_state.get("row")
         if lte_row is not None:
-            lte_until = lte_row.cycle_anchor_end_at
+            lte_until = lte_state.get("until")
             if lte_until and lte_until.tzinfo is None:
                 lte_until = lte_until.replace(tzinfo=timezone.utc)
-            lte_active = bool(lte_row.is_enabled and lte_until and lte_until > datetime.now(timezone.utc))
+            lte_active = bool(lte_state.get("allowed"))
             last_seen_txt = _fmt_dt_short(lte_row.last_seen_at) if lte_row.last_seen_at else '—'
             lines.append(
                 f"LTE: {'✅ активна' if lte_active else '⛔️ не активна'} | enabled: <b>{'yes' if lte_row.is_enabled else 'no'}</b> | до: <b>{_fmt_dt_short(lte_until)}</b> | last_seen: <b>{last_seen_txt}</b>"
