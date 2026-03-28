@@ -315,6 +315,54 @@ class LteVpnService:
         await self.ensure_remote_client(tg_id, row.uuid)
         return row
 
+    async def repair_active_clients(self, *, tg_id: int | None = None, limit: int = 200) -> dict[str, int]:
+        """Best-effort self-heal for active LTE profiles.
+
+        Re-enables locally disabled rows and re-syncs the remote Xray client
+        for users who still have a valid main subscription or paid LTE cycle.
+        """
+        now = datetime.now(timezone.utc)
+        async with session_scope() as session:
+            q = (
+                select(LteVpnClient.tg_id, LteVpnClient.is_enabled, LteVpnClient.cycle_anchor_end_at, Subscription.end_at, Subscription.is_active)
+                .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+                .where(
+                    or_(
+                        and_(Subscription.is_active == True, Subscription.end_at.is_not(None), Subscription.end_at > now),
+                        and_(LteVpnClient.cycle_anchor_end_at.is_not(None), LteVpnClient.cycle_anchor_end_at > now),
+                    )
+                )
+                .order_by(LteVpnClient.tg_id.asc())
+                .limit(int(limit))
+            )
+            if tg_id is not None:
+                q = q.where(LteVpnClient.tg_id == int(tg_id))
+            rows = (await session.execute(q)).all()
+
+        scanned = len(rows)
+        repaired = 0
+        reenabled = 0
+        failed = 0
+
+        for row in rows:
+            row_tg_id = int(row.tg_id)
+            sub_end = row.end_at
+            try:
+                await self.sync_client(row_tg_id, subscription_end_at=sub_end, force_rotate=False)
+                repaired += 1
+                if not bool(row.is_enabled):
+                    reenabled += 1
+            except Exception:
+                failed += 1
+                log.exception("lte_repair_active_client_failed tg_id=%s", row_tg_id)
+
+        return {
+            "scanned": scanned,
+            "repaired": repaired,
+            "reenabled": reenabled,
+            "failed": failed,
+        }
+
     async def tail_access_log(self, lines: int = 500) -> str:
         return await self._run_output(f"tail -n {int(lines)} {self.access_log_path}", check=False)
 
