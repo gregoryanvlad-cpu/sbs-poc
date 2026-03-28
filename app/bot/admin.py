@@ -1305,6 +1305,31 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
     except Exception:
         pass
 
+    try:
+        pay_rows = list((await session.execute(
+            select(Payment)
+            .where(Payment.tg_id == tg_id)
+            .order_by(Payment.paid_at.desc(), Payment.id.desc())
+            .limit(10)
+        )).scalars().all())
+    except Exception:
+        pay_rows = []
+
+    if pay_rows:
+        lines.append("")
+        lines.append("💳 <b>Последние оплаты</b>")
+        for pay in pay_rows:
+            provider = html.escape(str(pay.provider or '—'))
+            status = html.escape(str(pay.status or '—'))
+            amount = int(pay.amount or 0)
+            paid_at = _fmt_dt_short(pay.paid_at)
+            pid = html.escape(str(pay.provider_payment_id or '—'))
+            if len(pid) > 32:
+                pid = pid[:32] + '…'
+            lines.append(
+                f"• #{pay.id} | <b>{status}</b> | {amount} ₽ | {provider} | {paid_at} | <code>{pid}</code>"
+            )
+
     # Activity counters (best-effort, from app_settings; updated by middleware)
     try:
         total_actions = int(await get_app_setting_int(session, f"ua:actions_total:{tg_id}", default=0) or 0)
@@ -1499,6 +1524,89 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
 
     return "\n".join(lines)
 
+
+
+
+@router.callback_query(lambda c: c.data == "admin:payments:reconcile")
+async def admin_payments_reconcile(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer("Проверяю оплаты…")
+    except Exception:
+        pass
+
+    from app.scheduler.worker import _job_reconcile_pending_platega_payments
+
+    async with session_scope() as session:
+        before_pending = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.status == "pending")) or 0)
+        before_success = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.status == "success")) or 0)
+
+    await _job_reconcile_pending_platega_payments(cb.bot)
+
+    async with session_scope() as session:
+        after_pending = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.status == "pending")) or 0)
+        after_success = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.status == "success")) or 0)
+        latest = list((await session.execute(
+            select(Payment)
+            .where(Payment.provider.like("platega%"))
+            .order_by(Payment.paid_at.desc(), Payment.id.desc())
+            .limit(8)
+        )).scalars().all())
+
+    lines = [
+        "💳 <b>Проверка оплат</b>",
+        "",
+        f"Pending до: <b>{before_pending}</b>",
+        f"Pending после: <b>{after_pending}</b>",
+        f"Success до/после: <b>{before_success}</b>/<b>{after_success}</b>",
+    ]
+    if before_pending > after_pending:
+        lines.append(f"\n✅ Автодоводка обработала: <b>{before_pending - after_pending}</b> pending-платеж(ей).")
+    elif before_pending == after_pending:
+        lines.append("\nℹ️ Новых изменений не найдено.")
+    if latest:
+        lines.append("")
+        lines.append("Последние платежи Platega:")
+        for pay in latest:
+            pid = html.escape(str(pay.provider_payment_id or '—'))
+            if len(pid) > 28:
+                pid = pid[:28] + '…'
+            lines.append(
+                f"• #{pay.id} | tg <code>{pay.tg_id}</code> | <b>{html.escape(str(pay.status or '—'))}</b> | {int(pay.amount or 0)} ₽ | {_fmt_dt_short(pay.paid_at)} | <code>{pid}</code>"
+            )
+
+    await cb.message.answer("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data == "admin:lte:repair")
+async def admin_lte_repair(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer("Проверяю LTE…")
+    except Exception:
+        pass
+
+    stats = await lte_vpn_service.repair_active_clients(limit=300)
+    lines = [
+        "📶 <b>Починка LTE-профилей</b>",
+        "",
+        f"Проверено: <b>{int(stats.get('scanned', 0))}</b>",
+        f"Пересинхронизировано: <b>{int(stats.get('repaired', 0))}</b>",
+        f"Повторно включено: <b>{int(stats.get('reenabled', 0))}</b>",
+        f"Ошибок: <b>{int(stats.get('failed', 0))}</b>",
+    ]
+    if int(stats.get('failed', 0)) == 0:
+        lines.append("\n✅ Проверка завершена без ошибок.")
+    else:
+        lines.append("\n⚠️ Есть ошибки. Проверь логи последнего деплоя.")
+
+    await cb.message.answer("\n".join(lines), reply_markup=kb_admin_menu(), parse_mode="HTML")
 
 @router.callback_query(lambda c: c.data == "admin:price")
 async def admin_price(cb: CallbackQuery, state: FSMContext) -> None:
