@@ -133,6 +133,8 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
     b.button(text="💲 Цена подписки", callback_data="admin:price")
     b.button(text="📶 Цена VPN LTE", callback_data="admin:lte_price")
+    b.button(text="💳 Проверить оплаты", callback_data="admin:payments:reconcile")
+    b.button(text="📶 Починить LTE", callback_data="admin:lte:repair")
     b.button(text="🎁 Подарить подписку", callback_data="admin:sub:gift")
     b.button(text="🎁 Подарить дни всем", callback_data="admin:sub:gift_days:all")
     b.button(text="🎁 Подарить дни активным", callback_data="admin:sub:gift_days:active")
