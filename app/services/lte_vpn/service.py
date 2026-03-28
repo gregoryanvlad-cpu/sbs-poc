@@ -315,16 +315,31 @@ class LteVpnService:
         await self.ensure_remote_client(tg_id, row.uuid)
         return row
 
+    async def _remote_client_map(self) -> dict[str, str]:
+        cfg = await self._read_xray_config()
+        ref = self._find_inbound(cfg)
+        result: dict[str, str] = {}
+        for c in ref.clients:
+            if not isinstance(c, dict):
+                continue
+            email = str(c.get("email") or "").strip()
+            cid = str(c.get("id") or "").strip()
+            if email:
+                result[email] = cid
+        return result
+
     async def repair_active_clients(self, *, tg_id: int | None = None, limit: int = 200) -> dict[str, int]:
         """Best-effort self-heal for active LTE profiles.
 
         Re-enables locally disabled rows and re-syncs the remote Xray client
         for users who still have a valid main subscription or paid LTE cycle.
+        Returns precise counters so admin UI can distinguish between scanned
+        rows and actually fixed rows.
         """
         now = datetime.now(timezone.utc)
         async with session_scope() as session:
             q = (
-                select(LteVpnClient.tg_id, LteVpnClient.is_enabled, LteVpnClient.cycle_anchor_end_at, Subscription.end_at, Subscription.is_active)
+                select(LteVpnClient.tg_id, LteVpnClient.uuid, LteVpnClient.is_enabled, LteVpnClient.cycle_anchor_end_at, Subscription.end_at, Subscription.is_active)
                 .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
                 .where(
                     or_(
@@ -339,19 +354,36 @@ class LteVpnService:
                 q = q.where(LteVpnClient.tg_id == int(tg_id))
             rows = (await session.execute(q)).all()
 
+        remote_by_email: dict[str, str] = {}
+        try:
+            remote_by_email = await self._remote_client_map()
+        except Exception:
+            log.exception("lte_repair_remote_read_failed")
+
         scanned = len(rows)
         repaired = 0
         reenabled = 0
+        already_ok = 0
         failed = 0
+        touched_tg_ids: list[int] = []
 
         for row in rows:
             row_tg_id = int(row.tg_id)
             sub_end = row.end_at
+            email = self.email_for_tg_id(row_tg_id)
+            remote_uuid = str(remote_by_email.get(email) or "").strip()
+            local_uuid = str(row.uuid or "").strip()
+            needs_remote_fix = (not remote_uuid) or (local_uuid and remote_uuid != local_uuid)
+            needs_reenable = not bool(row.is_enabled)
             try:
                 await self.sync_client(row_tg_id, subscription_end_at=sub_end, force_rotate=False)
-                repaired += 1
-                if not bool(row.is_enabled):
+                if needs_reenable:
                     reenabled += 1
+                if needs_reenable or needs_remote_fix:
+                    repaired += 1
+                    touched_tg_ids.append(row_tg_id)
+                else:
+                    already_ok += 1
             except Exception:
                 failed += 1
                 log.exception("lte_repair_active_client_failed tg_id=%s", row_tg_id)
@@ -360,7 +392,9 @@ class LteVpnService:
             "scanned": scanned,
             "repaired": repaired,
             "reenabled": reenabled,
+            "already_ok": already_ok,
             "failed": failed,
+            "touched_tg_ids": touched_tg_ids,
         }
 
     async def tail_access_log(self, lines: int = 500) -> str:
