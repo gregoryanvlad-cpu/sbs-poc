@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select, text, func, delete
+from sqlalchemy import select, text, func, delete, or_
 
 from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
@@ -16,7 +16,7 @@ from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, Family
 from app.db.models import LteVpnClient
 from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
-from app.repo import list_expired_subscriptions, set_subscription_expired, get_app_setting_int, set_app_setting_int
+from app.repo import list_expired_subscriptions, set_subscription_expired, get_app_setting_int, set_app_setting_int, get_subscription, extend_subscription
 from app.services.yandex.service import yandex_service
 from app.services.referrals.service import referral_service
 from app.services.regionvpn.service import RegionVpnService
@@ -239,6 +239,145 @@ async def _job_reconcile_vpn_server_state() -> None:
             log.exception("vpn_reconcile_live_peers_failed")
 
 
+
+
+async def _job_reconcile_pending_platega_payments(bot: Bot) -> None:
+    """Reconcile pending Platega payments after restarts or missed watcher tasks.
+
+    Why:
+    - The in-memory Platega watcher is best-effort and can be lost on deploy/restart.
+    - Without reconciliation, money may be charged while subscription state stays pending,
+      which later triggers false expiry reminders/auto-disable.
+
+    Scope:
+    - Normal VPN subscriptions (including winback variants).
+    - LTE monthly payments.
+    - Family payments are intentionally left to the existing family-specific flow.
+    """
+    if settings.payment_provider != "platega":
+        return
+    if not settings.platega_merchant_id or not settings.platega_secret:
+        return
+
+    from app.services.payments.platega import PlategaClient, PlategaError
+    from app.services.vpn.service import vpn_service
+
+    client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
+    now = _utcnow()
+    notify_ok: list[tuple[int, str]] = []
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Payment)
+                .where(
+                    Payment.status == "pending",
+                    Payment.provider_payment_id.is_not(None),
+                    or_(
+                        Payment.provider == "platega",
+                        Payment.provider == "platega_lte",
+                        Payment.provider.like("platega_winback_%"),
+                    ),
+                )
+                .order_by(Payment.paid_at.asc(), Payment.id.asc())
+                .limit(200)
+            )
+        ).scalars().all()
+
+        changed = False
+        for pay in rows:
+            provider_tid = str(pay.provider_payment_id or "").strip()
+            if not provider_tid:
+                continue
+
+            try:
+                st = await client.get_transaction_status(transaction_id=provider_tid)
+            except PlategaError:
+                continue
+            except Exception:
+                continue
+
+            status = (st.status or "").upper()
+            tg_id = int(pay.tg_id)
+
+            if status in ("FAILED", "CANCELLED", "EXPIRED", "REJECTED"):
+                pay.status = "failed"
+                changed = True
+                continue
+
+            if status not in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
+                continue
+
+            if (pay.provider or "") == "platega_lte":
+                await lte_vpn_service.activate_paid_month(tg_id)
+                pay.status = "success"
+                changed = True
+                notify_ok.append((tg_id, "✅ <b>Оплата подтверждена автоматически.</b>\n\nVPN LTE активирован."))
+                continue
+
+            sub = await get_subscription(session, tg_id)
+            base = sub.end_at if sub.end_at and _ensure_tz(sub.end_at) > now else now
+            add_months = int(getattr(pay, "period_months", 1) or 1)
+            new_end = base + timedelta(days=int(getattr(pay, "period_days", 30) or 30))
+
+            await extend_subscription(
+                session,
+                tg_id,
+                months=add_months,
+                days_legacy=int(getattr(pay, "period_days", 30) or 30),
+                amount_rub=int(pay.amount),
+                provider=str(pay.provider or "platega"),
+                status="success",
+                provider_payment_id=provider_tid,
+            )
+
+            try:
+                if (pay.provider or "").startswith("platega_winback_"):
+                    await set_app_setting_int(session, f"winback_promo_consumed:{tg_id}", 1)
+            except Exception:
+                pass
+
+            try:
+                await vpn_service.restore_expired_peers(session, tg_id, grace_hours=24)
+            except Exception:
+                pass
+
+            pay.status = "success"
+            try:
+                await referral_service.on_successful_payment(session, pay)
+            except Exception:
+                pass
+
+            sub.end_at = new_end
+            sub.is_active = True
+            sub.status = "active"
+
+            try:
+                if settings.yandex_enabled:
+                    await yandex_service.rotate_membership_for_user_if_needed(session, tg_id=tg_id)
+            except Exception:
+                pass
+
+            changed = True
+            notify_ok.append((tg_id, "✅ <b>Оплата подтверждена автоматически.</b>\n\nПодписка активирована."))
+
+        if changed:
+            await session.commit()
+
+    for tg_id, text_msg in notify_ok:
+        try:
+            await audit_send_message(
+                bot,
+                tg_id,
+                text_msg,
+                kind="payment_auto_reconciled",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+            )
+        except Exception:
+            pass
+
 async def run_scheduler() -> None:
     """Scheduler jobs loop (single replica) protected by advisory lock.
 
@@ -261,6 +400,7 @@ async def run_scheduler() -> None:
                     continue
 
                 try:
+                    await _job_reconcile_pending_platega_payments(bot)
                     await _job_expire_subscriptions(bot)
                     await _job_prune_wg_peers()
                     await _job_reconcile_vpn_server_state()
