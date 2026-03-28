@@ -1398,6 +1398,23 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
     except Exception:
         pass
 
+    # LTE snapshot (best-effort)
+    try:
+        lte_row = await session.get(LteVpnClient, tg_id)
+        if lte_row is not None:
+            lte_until = lte_row.cycle_anchor_end_at
+            if lte_until and lte_until.tzinfo is None:
+                lte_until = lte_until.replace(tzinfo=timezone.utc)
+            lte_active = bool(lte_row.is_enabled and lte_until and lte_until > datetime.now(timezone.utc))
+            last_seen_txt = _fmt_dt_short(lte_row.last_seen_at) if lte_row.last_seen_at else '—'
+            lines.append(
+                f"LTE: {'✅ активна' if lte_active else '⛔️ не активна'} | enabled: <b>{'yes' if lte_row.is_enabled else 'no'}</b> | до: <b>{_fmt_dt_short(lte_until)}</b> | last_seen: <b>{last_seen_txt}</b>"
+            )
+        else:
+            lines.append("LTE: —")
+    except Exception:
+        pass
+
     # WireGuard peers & IPs (best-effort)
     try:
         peers = list(
@@ -1593,14 +1610,33 @@ async def admin_lte_repair(cb: CallbackQuery) -> None:
         pass
 
     stats = await lte_vpn_service.repair_active_clients(limit=300)
+    touched_ids = [int(x) for x in (stats.get('touched_tg_ids') or [])][:10]
+    touched_labels: list[str] = []
+    if touched_ids:
+        try:
+            labels = await asyncio.gather(*[_tg_label(cb.bot, tid) for tid in touched_ids], return_exceptions=True)
+            for tid, lbl in zip(touched_ids, labels):
+                if isinstance(lbl, Exception):
+                    touched_labels.append(f"ID {tid}")
+                else:
+                    touched_labels.append(str(lbl))
+        except Exception:
+            touched_labels = [f"ID {tid}" for tid in touched_ids]
+
     lines = [
         "📶 <b>Починка LTE-профилей</b>",
         "",
         f"Проверено: <b>{int(stats.get('scanned', 0))}</b>",
-        f"Пересинхронизировано: <b>{int(stats.get('repaired', 0))}</b>",
-        f"Повторно включено: <b>{int(stats.get('reenabled', 0))}</b>",
+        f"Реально починено: <b>{int(stats.get('repaired', 0))}</b>",
+        f"Повторно включено в БД: <b>{int(stats.get('reenabled', 0))}</b>",
+        f"Уже были в порядке: <b>{int(stats.get('already_ok', 0))}</b>",
         f"Ошибок: <b>{int(stats.get('failed', 0))}</b>",
     ]
+    if touched_labels:
+        lines.append("")
+        lines.append("Изменённые профили:")
+        for label in touched_labels:
+            lines.append(f"• {html.escape(label)}")
     if int(stats.get('failed', 0)) == 0:
         lines.append("\n✅ Проверка завершена без ошибок.")
     else:
