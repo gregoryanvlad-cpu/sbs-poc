@@ -5,8 +5,8 @@ from pathlib import Path
 
 from app.bot.keyboards import kb_main
 from app.db.session import session_scope
-from sqlalchemy import select, func
-from app.db.models import User, Payment, Subscription, Referral
+from sqlalchemy import select, func, delete
+from app.db.models import User, Payment, Subscription, Referral, ReferralEarning
 from app.repo import ensure_user, is_trial_available
 from app.services.referrals.service import referral_service
 
@@ -52,16 +52,22 @@ async def cmd_start(message: Message) -> None:
                 # Самовосстановление после старого бага: если зрелому пользователю
                 # ошибочно проставили pending-реферала, убираем только pending-метадату,
                 # не трогая уже оформленные referral-записи.
-                has_referral_row = bool(await session.scalar(select(Referral.referred_tg_id).where(Referral.referred_tg_id == int(tg_id)).limit(1)))
                 payments_cnt = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.tg_id == int(tg_id))) or 0)
                 has_sub = bool(await session.get(Subscription, int(tg_id)))
-                if getattr(existing_user, 'referred_by_tg_id', None) and (payments_cnt > 0 or has_sub):
+                is_mature_user = bool(payments_cnt > 0 or has_sub)
+                if is_mature_user:
                     # Для уже существующего взрослого пользователя повторный заход по чужой рефке
-                    # не должен привязывать нового реферера. Если pending/ошибочная привязка есть,
-                    # снимаем её. Активные реф-записи в отдельной таблице здесь не трогаем.
+                    # не должен ни назначать нового реферера, ни оставлять ошибочно созданную
+                    # реферальную связь без заработков.
                     existing_user.referred_by_tg_id = None
                     if hasattr(existing_user, 'referred_at'):
                         existing_user.referred_at = None
+                    ref_row = await session.scalar(select(Referral).where(Referral.referred_tg_id == int(tg_id)).limit(1))
+                    if ref_row is not None:
+                        referral_earnings_cnt = int(await session.scalar(select(func.count()).select_from(ReferralEarning).where(ReferralEarning.referred_tg_id == int(tg_id))) or 0)
+                        # Удаляем только явно ошибочную связь: без first_payment_id и без заработков.
+                        if getattr(ref_row, 'first_payment_id', None) is None and referral_earnings_cnt == 0:
+                            await session.delete(ref_row)
 
         await referral_service.ensure_ref_code(session, tg_id)
         show_trial = await is_trial_available(session, tg_id)
