@@ -55,7 +55,10 @@ async def cmd_start(message: Message) -> None:
                 has_referral_row = bool(await session.scalar(select(Referral.referred_tg_id).where(Referral.referred_tg_id == int(tg_id)).limit(1)))
                 payments_cnt = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.tg_id == int(tg_id))) or 0)
                 has_sub = bool(await session.get(Subscription, int(tg_id)))
-                if getattr(existing_user, 'referred_by_tg_id', None) and not has_referral_row and (payments_cnt > 0 or has_sub):
+                if getattr(existing_user, 'referred_by_tg_id', None) and (payments_cnt > 0 or has_sub):
+                    # Для уже существующего взрослого пользователя повторный заход по чужой рефке
+                    # не должен привязывать нового реферера. Если pending/ошибочная привязка есть,
+                    # снимаем её. Активные реф-записи в отдельной таблице здесь не трогаем.
                     existing_user.referred_by_tg_id = None
                     if hasattr(existing_user, 'referred_at'):
                         existing_user.referred_at = None
