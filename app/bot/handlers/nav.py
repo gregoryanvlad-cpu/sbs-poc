@@ -25,7 +25,7 @@ try:
 except Exception:  # pragma: no cover
     CopyTextButton = None  # type: ignore
 from dateutil.relativedelta import relativedelta
-from sqlalchemy import select, func, literal
+from sqlalchemy import select, func, literal, text
 
 from app.bot.auth import is_owner
 from app.repo import utcnow
@@ -1825,7 +1825,7 @@ async def _start_platega_payment(
         return
 
     # Store pending payment
-    from sqlalchemy import select, func, literal
+    from sqlalchemy import select, func, literal, text
     from app.db.models import Payment
 
     async with session_scope() as session:
@@ -3786,99 +3786,6 @@ async def on_family_renew_all(cb: CallbackQuery) -> None:
             await session.commit()
         await cb.message.edit_text("✅ Все семейные места продлены на месяц.", reply_markup=_family_renew_menu_kb())
         await _safe_cb_answer(cb)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("family:buy_count:"))
-async def on_family_buy_count(cb: CallbackQuery) -> None:
-    tg_id = cb.from_user.id
-    parts = (cb.data or "").split(":")
-    count = int(parts[-1]) if parts and parts[-1].isdigit() else 0
-    if count <= 0:
-        await _safe_cb_answer(cb)
-        return
-    async with session_scope() as session:
-        sub = await get_subscription(session, tg_id)
-        if not _is_sub_active(sub.end_at):
-            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
-            return
-        grp = await _get_or_create_family_group(session, tg_id)
-        current_total = int(grp.seats_total or 0)
-        if current_total + count > FAMILY_MAX_SEATS:
-            await cb.answer(f"Максимум мест: {FAMILY_MAX_SEATS}", show_alert=True)
-            return
-        price = await _get_family_seat_price(session, tg_id)
-        await _set_family_payment_context(session, tg_id, mode=1, count=count, slot_no=None)
-        await session.commit()
-    if settings.payment_provider == "platega":
-        await _start_platega_family_payment(cb, tg_id=tg_id, seats=count, amount_rub=price * count)
-    else:
-        async with session_scope() as session:
-            await _apply_family_payment(session, owner_tg_id=tg_id, seats=count, mode=1)
-            await session.commit()
-        await cb.message.edit_text("✅ Новые семейные места добавлены.", reply_markup=_family_manage_kb(can_manage=True, has_seats=True))
-        await _safe_cb_answer(cb)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("family:renewslot:"))
-async def on_family_renew_slot(cb: CallbackQuery) -> None:
-    tg_id = cb.from_user.id
-    parts = (cb.data or "").split(":")
-    slot_no = int(parts[-1]) if parts and parts[-1].isdigit() else 0
-    if slot_no <= 0:
-        await _safe_cb_answer(cb)
-        return
-    async with session_scope() as session:
-        sub = await get_subscription(session, tg_id)
-        if not _is_sub_active(sub.end_at):
-            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
-            return
-        grp = await _get_or_create_family_group(session, tg_id)
-        if slot_no > int(grp.seats_total or 0):
-            await cb.answer("Такого места нет.", show_alert=True)
-            return
-        price = await _get_family_seat_price(session, tg_id)
-        await _set_family_payment_context(session, tg_id, mode=4, count=1, slot_no=slot_no)
-        await session.commit()
-    if settings.payment_provider == "platega":
-        await _start_platega_family_payment(cb, tg_id=tg_id, seats=1, amount_rub=price)
-    else:
-        async with session_scope() as session:
-            await _apply_family_payment(session, owner_tg_id=tg_id, seats=1, mode=4, slot_no=slot_no)
-            await session.commit()
-        await cb.message.edit_text(f"✅ Место #{slot_no} продлено на месяц.", reply_markup=_family_renew_menu_kb())
-        await _safe_cb_answer(cb)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("family:slot:"))
-async def on_family_slot_view(cb: CallbackQuery) -> None:
-    tg_id = cb.from_user.id
-    parts = (cb.data or "").split(":")
-    slot_no = int(parts[-1]) if parts and parts[-1].isdigit() else 0
-    if slot_no <= 0:
-        await _safe_cb_answer(cb)
-        return
-    now = utcnow()
-    async with session_scope() as session:
-        grp = await _get_or_create_family_group(session, tg_id)
-        if slot_no > int(grp.seats_total or 0):
-            await cb.answer("Такого места нет.", show_alert=True)
-            return
-        rows = await _get_family_profiles(session, tg_id)
-        prof = next((r for r in rows if int(r.slot_no or 0) == slot_no), None)
-        if not prof:
-            await cb.answer("Место не найдено.", show_alert=True)
-            return
-        paid = _is_family_slot_paid(prof, now=now)
-        state = _family_slot_state_text(prof, now=now)
-        cfg = "создан" if prof.vpn_peer_id else "не создан"
-        text = (
-            f"📋 <b>Место #{slot_no}</b>\n\n"
-            f"Статус: <b>{state}</b>\n"
-            f"Профиль: <b>{cfg}</b>\n"
-            f"Пауза: <b>{'да' if prof.is_paused else 'нет'}</b>"
-        )
-    await cb.message.edit_text(text, reply_markup=_family_slot_actions_kb(slot_no, paid=paid), parse_mode="HTML")
-    await _safe_cb_answer(cb)
 
 
 async def _start_platega_family_payment(cb: CallbackQuery, *, tg_id: int, seats: int, amount_rub: int) -> None:
