@@ -1016,6 +1016,7 @@ def _kb_admin_diag() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Быстрая проверка", callback_data="admin:diag:quick")],
             [InlineKeyboardButton(text="🧪 Полная диагностика", callback_data="admin:diag:full")],
+            [InlineKeyboardButton(text="🧹 Починить дубли WG", callback_data="admin:diag:dedupe_wg")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
@@ -1026,6 +1027,7 @@ def _kb_admin_diag_refresh(full: bool = False) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:diag:{'full' if full else 'quick'}")],
             [InlineKeyboardButton(text="⚡ Быстрая проверка", callback_data="admin:diag:quick"), InlineKeyboardButton(text="🧪 Полная", callback_data="admin:diag:full")],
+            [InlineKeyboardButton(text="🧹 Починить дубли WG", callback_data="admin:diag:dedupe_wg")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
@@ -1071,6 +1073,32 @@ async def admin_diag_run(cb: CallbackQuery) -> None:
             "❌ Диагностика упала. Проверь логи последнего деплоя.",
             reply_markup=_kb_admin_diag_refresh(full=full),
         )
+
+
+
+@router.callback_query(lambda c: c.data == "admin:diag:dedupe_wg")
+async def admin_diag_dedupe_wg(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Чищу дубли WG…")
+    except Exception:
+        pass
+    try:
+        async with session_scope() as session:
+            stats = await vpn_service.dedupe_active_peers(session)
+            await session.commit()
+        msg = (
+            "🧹 <b>Чистка дублей WG завершена</b>\n\n"
+            f"Дубликатных IP-групп: <b>{int(stats.get('duplicate_ips', 0) or 0)}</b>\n"
+            f"Деактивировано записей в БД: <b>{int(stats.get('deactivated', 0) or 0)}</b>\n"
+            f"Удалено с серверов: <b>{int(stats.get('remote_removed', 0) or 0)}</b>"
+        )
+        await cb.message.answer(msg, parse_mode="HTML", reply_markup=_kb_admin_diag())
+    except Exception:
+        log.exception("admin_diag_dedupe_wg_failed")
+        await cb.message.answer("❌ Не удалось почистить дубли WG. Проверь логи.", reply_markup=_kb_admin_diag())
 
 def _kb_admin_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
