@@ -3463,17 +3463,8 @@ def _family_buy_counter_kb(current: int) -> InlineKeyboardMarkup:
     )
 
 
-def _family_buy_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="1 место", callback_data="family:buy_count:1"),
-                InlineKeyboardButton(text="2 места", callback_data="family:buy_count:2"),
-                InlineKeyboardButton(text="3 места", callback_data="family:buy_count:3"),
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:family")],
-        ]
-    )
+def _family_buy_kb(current: int) -> InlineKeyboardMarkup:
+    return _family_buy_counter_kb(current)
 
 
 def _family_renew_menu_kb() -> InlineKeyboardMarkup:
