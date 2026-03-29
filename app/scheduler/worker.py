@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select, text, func, delete, or_
+from sqlalchemy.orm import aliased
 
 from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
@@ -116,20 +117,36 @@ def _human_age(from_dt: datetime | None, now: datetime) -> str:
 
 
 async def build_kick_report_text(session) -> str:
-    """Builds admin report for users whose subscription ended and who were not marked removed."""
+    """Build admin kick report using the same broad logic as the manual admin screen.
+
+    Important: this report intentionally includes overdue subscriptions even when the
+    user is not currently in a Yandex family. The admin screen already shows such rows
+    as requiring attention; the scheduled notification must not say "никого исключать не
+    нужно" while those overdue rows exist.
+    """
     now = _utcnow()
 
-    # we consider due-to-kick if subscription already expired (end_at <= now)
-    # and membership exists with account_label & slot_index (so you can kick by slot)
+    YM = aliased(YandexMembership)
+    latest_active_ids = (
+        select(
+            YM.tg_id.label("tg_id"),
+            func.max(YM.id).label("id"),
+        )
+        .where(YM.removed_at.is_(None))
+        .group_by(YM.tg_id)
+        .subquery()
+    )
+
     q = (
-        select(YandexMembership, Subscription)
-        .join(Subscription, Subscription.tg_id == YandexMembership.tg_id)
+        select(Subscription, YM)
+        .select_from(Subscription)
+        .outerjoin(latest_active_ids, latest_active_ids.c.tg_id == Subscription.tg_id)
+        .outerjoin(YM, YM.id == latest_active_ids.c.id)
         .where(
             Subscription.end_at.is_not(None),
             Subscription.end_at <= now,
-            YandexMembership.removed_at.is_(None),
         )
-        .order_by(Subscription.end_at.asc(), YandexMembership.id.asc())
+        .order_by(Subscription.end_at.asc(), Subscription.tg_id.asc())
         .limit(200)
     )
     rows = (await session.execute(q)).all()
@@ -138,20 +155,18 @@ async def build_kick_report_text(session) -> str:
         return "Сегодня участников для исключения нет ✅"
 
     lines: list[str] = []
-    lines.append("Сегодня пора исключить следующих участников из следующих семей:\n")
+    lines.append("Сегодня требуют внимания следующие просроченные пользователи:\n")
 
     idx = 1
-    for m, sub in rows:
-        tg_id = int(m.tg_id)
+    for sub, m in rows:
+        tg_id = int(sub.tg_id)
 
-        # last successful payment date (best-effort)
         pay_q = (
             select(func.max(Payment.paid_at))
             .where(Payment.tg_id == tg_id, Payment.status == "success")
         )
         paid_at = (await session.execute(pay_q)).scalar_one_or_none()
 
-        # real VPN status
         peer_q = (
             select(VpnPeer)
             .where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)
@@ -161,27 +176,28 @@ async def build_kick_report_text(session) -> str:
         peer = (await session.execute(peer_q)).scalar_one_or_none()
         vpn_status = "Включен" if peer else "Отключен"
 
-        # renewed?
         renewed = False
         try:
-            renewed = _is_extended(sub.end_at, m.coverage_end_at)
+            renewed = _is_extended(sub.end_at, getattr(m, "coverage_end_at", None) if m else None)
         except Exception:
             renewed = False
-
-        # for this report we mainly show those not renewed; but keep field truthful
         renewed_text = "Продлевалась" if renewed else "Не продлевалась"
+
+        membership_state = "В семье" if m else "Не добавлен в семью"
+        family_label = (getattr(m, "account_label", None) or getattr(m, "family_label", None) or "—") if m else "—"
+        slot_index = getattr(m, "slot_index", None) if m else None
 
         lines.append(f"#{idx}")
         lines.append(f"Пользователь ID TG: {tg_id}")
         lines.append(f"Дата приобретения подписки на сервис: {_fmt_dt(paid_at) if paid_at else _fmt_dt(sub.start_at)}")
         lines.append(f"Дата окончания подписки на сервис: {_fmt_dt(sub.end_at)}")
-        lines.append(f"Наименование семьи (label): {m.account_label or '—'}")
-        lines.append(f"Номер слота: {m.slot_index if m.slot_index is not None else '—'}")
+        lines.append(f"Статус Яндекс семьи: {membership_state}")
+        lines.append(f"Наименование семьи (label): {family_label}")
+        lines.append(f"Номер слота: {slot_index if slot_index is not None else '—'}")
         lines.append(f"VPN: {vpn_status}")
         lines.append(f"Подписка: {renewed_text}")
         lines.append(f"Пользователь с нами: {_human_age(sub.start_at, now)}")
-        lines.append("")  # blank line
-
+        lines.append("")
         idx += 1
 
     return "\n".join(lines).strip()
