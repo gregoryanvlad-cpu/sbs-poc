@@ -29,6 +29,7 @@ from app.db.models.vpn_peer import VpnPeer
 from app.db.models.family_vpn_profile import FamilyVpnProfile
 from app.db.models.lte_vpn_client import LteVpnClient
 from app.db.models import MessageAudit
+from app.db.models.app_setting import AppSetting
 from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
@@ -442,6 +443,172 @@ async def _vpn_seats_by_server() -> dict[str, int]:
         result.setdefault(default_code, 0)
     return result
 
+
+
+
+
+def _ensure_tz_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _main_payment_duration_days(pay: Payment) -> int:
+    days = int(getattr(pay, "period_days", 0) or 0)
+    months = int(getattr(pay, "period_months", 0) or 0)
+    if days > 0:
+        return days
+    if months > 0:
+        return months * 30
+    return 30
+
+
+def _is_main_subscription_provider(provider: str | None) -> bool:
+    p = str(provider or "").strip().lower()
+    if not p:
+        return False
+    if p in {"trial", "gift", "platega_lte", "mock_lte", "mock_family"}:
+        return False
+    if p.startswith("platega_family_"):
+        return False
+    return True
+
+
+def _is_main_success_payment(pay: Payment) -> bool:
+    return (
+        str(getattr(pay, "status", "") or "").lower() == "success"
+        and int(getattr(pay, "amount", 0) or 0) > 0
+        and _is_main_subscription_provider(getattr(pay, "provider", None))
+    )
+
+
+async def _collect_full_bot_stats() -> dict[str, object]:
+    now = _utcnow()
+    window_start = now - timedelta(days=30)
+
+    async with session_scope() as session:
+        total_users = int(await session.scalar(select(func.count()).select_from(User)) or 0)
+
+        blocked_users = int(
+            await session.scalar(
+                select(func.count(func.distinct(MessageAudit.tg_id))).where(
+                    MessageAudit.text_preview.like("[SEND_FAILED:FORBIDDEN]%")
+                )
+            )
+            or 0
+        )
+
+        trial_keys = (
+            await session.execute(
+                select(AppSetting.key).where(
+                    AppSetting.key.like("trial_used:%"),
+                    AppSetting.int_value == 1,
+                )
+            )
+        ).scalars().all()
+        trial_user_ids: set[int] = set()
+        for key in trial_keys:
+            try:
+                trial_user_ids.add(int(str(key).split(":", 1)[1]))
+            except Exception:
+                continue
+        trial_periods = len(trial_user_ids)
+
+        all_payments = (
+            await session.execute(
+                select(Payment).where(Payment.status == "success").order_by(Payment.tg_id.asc(), Payment.paid_at.asc(), Payment.id.asc())
+            )
+        ).scalars().all()
+
+        try:
+            peers_total = int(sum((await _vpn_seats_by_server()).values()))
+        except Exception:
+            peers_total = int(await session.scalar(select(func.count()).select_from(VpnPeer).where(VpnPeer.is_active == True)) or 0)  # noqa: E712
+
+    trial_to_paid_users: set[int] = set()
+    active_paid_subscription_users = 0
+    renewals_last_30_days = 0
+    churn_cohort = 0
+    churn_count = 0
+    pay_199 = 0
+    upsell_99 = 0
+    lte_99 = 0
+
+    current_user_tg_id: int | None = None
+    current_end: datetime | None = None
+    active_at_window_start = False
+    had_prior_main_payment = False
+
+    def flush_user_state() -> None:
+        nonlocal active_paid_subscription_users, churn_cohort, churn_count
+        if current_user_tg_id is None:
+            return
+        active_now = bool(current_end and current_end > now)
+        if active_now:
+            active_paid_subscription_users += 1
+        if active_at_window_start:
+            churn_cohort += 1
+            if not active_now:
+                churn_count += 1
+
+    for pay in all_payments:
+        tg_id = int(pay.tg_id)
+        if current_user_tg_id != tg_id:
+            flush_user_state()
+            current_user_tg_id = tg_id
+            current_end = None
+            active_at_window_start = False
+            had_prior_main_payment = False
+
+        provider = str(getattr(pay, "provider", "") or "")
+        amount = int(getattr(pay, "amount", 0) or 0)
+        paid_at = _ensure_tz_utc(getattr(pay, "paid_at", None)) or now
+
+        if provider in {"platega_lte", "mock_lte"} and amount == 99:
+            lte_99 += 1
+            continue
+
+        if not _is_main_success_payment(pay):
+            continue
+
+        if tg_id in trial_user_ids:
+            trial_to_paid_users.add(tg_id)
+        if amount == 199:
+            pay_199 += 1
+        if amount == 99:
+            upsell_99 += 1
+        if paid_at >= window_start and had_prior_main_payment:
+            renewals_last_30_days += 1
+
+        start_at = current_end if current_end and current_end > paid_at else paid_at
+        end_at = start_at + timedelta(days=_main_payment_duration_days(pay))
+        if start_at <= window_start < end_at:
+            active_at_window_start = True
+        current_end = end_at
+        had_prior_main_payment = True
+
+    flush_user_state()
+
+    churn_percent = (float(churn_count) / float(churn_cohort) * 100.0) if churn_cohort > 0 else 0.0
+    return {
+        "total_users": total_users,
+        "blocked_users": blocked_users,
+        "peers_total": peers_total,
+        "trial_periods": trial_periods,
+        "trial_to_paid": len(trial_to_paid_users),
+        "payments_199": pay_199,
+        "upsells_99": upsell_99,
+        "lte_99": lte_99,
+        "active_paid_users": active_paid_subscription_users,
+        "renewals_last_30_days": renewals_last_30_days,
+        "churn_count": churn_count,
+        "churn_cohort": churn_cohort,
+        "churn_percent": churn_percent,
+        "window_start": window_start,
+        "now": now,
+    }
 
 
 def _kb_admin_self_cleanup_confirm() -> InlineKeyboardMarkup:
@@ -2804,6 +2971,56 @@ async def admin_broadcast_send(message: Message, state: FSMContext) -> None:
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(lambda c: c.data == "admin:stats:full")
+async def admin_full_stats(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    try:
+        stats = await _collect_full_bot_stats()
+    except Exception:
+        log.exception("admin_full_stats_failed")
+        await cb.message.answer(
+            "❌ Не удалось собрать полную статистику бота. Проверь логи.",
+            reply_markup=_kb_admin_back(),
+        )
+        return
+
+    text = f"""📈 <b>Полная статистика бота</b>
+
+👥 Всего пользователей: <b>{int(stats['total_users'])}</b>
+🚫 Отписались / заблокировали бота: <b>{int(stats['blocked_users'])}</b>
+🌐 Всего peer'ов на серверах: <b>{int(stats['peers_total'])}</b>
+
+🎁 Пробных периодов: <b>{int(stats['trial_periods'])}</b>
+💳 Оформили подписку после триала: <b>{int(stats['trial_to_paid'])}</b>
+
+💰 Оплат на 199 ₽: <b>{int(stats['payments_199'])}</b>
+📈 Апселлов на +99 ₽: <b>{int(stats['upsells_99'])}</b>
+📶 LTE-активаций на 99 ₽: <b>{int(stats['lte_99'])}</b>
+
+🟢 Сейчас платящих пользователей: <b>{int(stats['active_paid_users'])}</b>
+🔁 Продлений за последние 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>
+📉 Churn за месяц: <b>{int(stats['churn_count'])}</b> / <b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)
+
+<i>Churn считается по платящим пользователям, у которых платная подписка была активна на {stats['window_start'].strftime('%d.%m.%Y')} и не активна сейчас.</i>
+<i>«Отписались» — это пользователи, для которых бот получил Telegram FORBIDDEN при отправке сообщения.</i>"""
+
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+        else:
+            raise
 
 
 @router.callback_query(lambda c: c.data == "admin:vpn:status")
