@@ -1,7 +1,7 @@
 """add expires_at to family_vpn_profiles
 
 Revision ID: 0017_family_profile_expires_at
-Revises: 6d6a44f9ff41
+Revises: 0016_lte_vpn_clients
 Create Date: 2026-03-29
 """
 
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "0017_family_profile_expires_at"
-down_revision = "6d6a44f9ff41"
+down_revision = "0016_lte_vpn_clients"
 branch_labels = None
 depends_on = None
 
