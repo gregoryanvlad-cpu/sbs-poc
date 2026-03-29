@@ -522,6 +522,26 @@ async def _collect_full_bot_stats() -> dict[str, object]:
             )
         ).scalars().all()
 
+        message_rows = (
+            await session.execute(
+                select(MessageAudit.kind, MessageAudit.tg_id, MessageAudit.seen_at)
+                .where(
+                    MessageAudit.kind.in_(
+                        [
+                            "trial_d1",
+                            "trial_d2",
+                            "upsell_after_first_payment",
+                            "referral_link_opened",
+                            "referral_registered",
+                            "referral_paid",
+                            "referral_earning_created",
+                            "referral_hold_released",
+                        ]
+                    )
+                )
+            )
+        ).all()
+
         try:
             peers_total = int(sum((await _vpn_seats_by_server()).values()))
         except Exception:
@@ -535,6 +555,7 @@ async def _collect_full_bot_stats() -> dict[str, object]:
     pay_199 = 0
     upsell_99 = 0
     lte_99 = 0
+    family_upsell_orders = 0
 
     current_user_tg_id: int | None = None
     current_end: datetime | None = None
@@ -569,6 +590,9 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         if provider in {"platega_lte", "mock_lte"} and amount == 99:
             lte_99 += 1
             continue
+        if provider.startswith("platega_family_") or provider == "mock_family":
+            family_upsell_orders += 1
+            continue
 
         if not _is_main_success_payment(pay):
             continue
@@ -591,6 +615,15 @@ async def _collect_full_bot_stats() -> dict[str, object]:
 
     flush_user_state()
 
+    kinds_sent: dict[str, set[int]] = {}
+    kinds_seen: dict[str, set[int]] = {}
+    for kind, tg_id, seen_at in message_rows:
+        k = str(kind or "")
+        uid = int(tg_id)
+        kinds_sent.setdefault(k, set()).add(uid)
+        if seen_at is not None:
+            kinds_seen.setdefault(k, set()).add(uid)
+
     churn_percent = (float(churn_count) / float(churn_cohort) * 100.0) if churn_cohort > 0 else 0.0
     return {
         "total_users": total_users,
@@ -601,6 +634,17 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         "payments_199": pay_199,
         "upsells_99": upsell_99,
         "lte_99": lte_99,
+        "family_upsell_orders": family_upsell_orders,
+        "trial_d1_sent": len(kinds_sent.get("trial_d1", set())),
+        "trial_d1_seen": len(kinds_seen.get("trial_d1", set())),
+        "trial_d2_sent": len(kinds_sent.get("trial_d2", set())),
+        "trial_d2_seen": len(kinds_seen.get("trial_d2", set())),
+        "upsell_after_pay_sent": len(kinds_sent.get("upsell_after_first_payment", set())),
+        "referral_link_opened": len(kinds_sent.get("referral_link_opened", set())),
+        "referral_registered": len(kinds_sent.get("referral_registered", set())),
+        "referral_paid": len(kinds_sent.get("referral_paid", set())),
+        "referral_earning_created": len(kinds_sent.get("referral_earning_created", set())),
+        "referral_hold_released": len(kinds_sent.get("referral_hold_released", set())),
         "active_paid_users": active_paid_subscription_users,
         "renewals_last_30_days": renewals_last_30_days,
         "churn_count": churn_count,
@@ -3006,6 +3050,13 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
 💰 Оплат на 199 ₽: <b>{int(stats['payments_199'])}</b>
 📈 Апселлов на +99 ₽: <b>{int(stats['upsells_99'])}</b>
 📶 LTE-активаций на 99 ₽: <b>{int(stats['lte_99'])}</b>
+👨‍👩‍👧‍👦 Продаж семейного апселла: <b>{int(stats['family_upsell_orders'])}</b>
+
+📨 D1 trial отправлено / прочитано: <b>{int(stats['trial_d1_sent'])}</b> / <b>{int(stats['trial_d1_seen'])}</b>
+📨 D2 trial отправлено / прочитано: <b>{int(stats['trial_d2_sent'])}</b> / <b>{int(stats['trial_d2_seen'])}</b>
+📨 Апселл после оплаты: <b>{int(stats['upsell_after_pay_sent'])}</b>
+👥 Рефка: переход / регистрация / оплата: <b>{int(stats['referral_link_opened'])}</b> / <b>{int(stats['referral_registered'])}</b> / <b>{int(stats['referral_paid'])}</b>
+💸 Рефка: начисление / выход из холда: <b>{int(stats['referral_earning_created'])}</b> / <b>{int(stats['referral_hold_released'])}</b>
 
 🟢 Сейчас платящих пользователей: <b>{int(stats['active_paid_users'])}</b>
 🔁 Продлений за последние 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>
