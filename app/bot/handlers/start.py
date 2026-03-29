@@ -77,7 +77,7 @@ async def cmd_start(message: Message) -> None:
         show_trial = await is_trial_available(session, tg_id)
         await session.commit()
 
-    if new_pending_referrer_tg_id:
+    if new_pending_referrer_tg_id and is_new_registration:
         ref_kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="👥 Открыть рефералку", callback_data="nav:referrals")]]
         )
@@ -85,23 +85,13 @@ async def cmd_start(message: Message) -> None:
             await audit_send_message(
                 message.bot,
                 int(new_pending_referrer_tg_id),
-                "🔔 По вашей ссылке только что перешёл новый пользователь. Теперь важно довести его до первой оплаты.",
+                "🔔 <b>Вы пригласили нового пользователя</b>\n\nОн уже нажал Start по вашей ссылке. Теперь важно довести его до первой оплаты — только после этого реферал засчитается.",
                 kind="referral_link_opened",
                 reply_markup=ref_kb,
+                parse_mode="HTML",
             )
         except Exception:
             pass
-        if is_new_registration:
-            try:
-                await audit_send_message(
-                    message.bot,
-                    int(new_pending_referrer_tg_id),
-                    "✅ По вашей реферальной ссылке зарегистрировался новый пользователь. Реферал засчитается после его первой успешной оплаты.",
-                    kind="referral_registered",
-                    reply_markup=ref_kb,
-                )
-            except Exception:
-                pass
 
     # Greeting (обычный текст, без рамки/код-блока)
     text = (
