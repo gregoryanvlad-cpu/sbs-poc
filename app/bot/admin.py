@@ -1765,7 +1765,7 @@ async def _gift_revoke_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboa
         lines.append("Активных подарков для отката нет.")
 
     kb_rows.append([InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")])
-PLACEHOLDER
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:gift_revoke:"))
