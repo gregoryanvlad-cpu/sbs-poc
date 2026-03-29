@@ -13,7 +13,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
-from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, FamilyVpnProfile
+from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, FamilyVpnProfile, Referral, ReferralEarning
 from app.db.models import LteVpnClient
 from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
@@ -57,6 +57,134 @@ def _days_until(dt: datetime, now: datetime) -> int:
     if delta.total_seconds() <= 0:
         return 0
     return int((delta.total_seconds() + 86399) // 86400)
+
+
+def _trial_activation_kb(day_no: int) -> InlineKeyboardMarkup:
+    if int(day_no) == 1:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔌 Подключить VPN", callback_data="nav:vpn")],
+                [InlineKeyboardButton(text="📖 Как подключить", callback_data="vpn:guide")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Сменить сервер", callback_data="vpn:loc")],
+            [InlineKeyboardButton(text="🌍 Открыть VPN", callback_data="nav:vpn")],
+            [InlineKeyboardButton(text="💳 Купить подписку", callback_data="nav:pay")],
+        ]
+    )
+
+
+def _family_upsell_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить место", callback_data="family:buy")],
+            [InlineKeyboardButton(text="👤 Личный кабинет", callback_data="nav:cabinet")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+async def _send_first_payment_family_upsell(bot: Bot, tg_id: int) -> None:
+    try:
+        await audit_send_message(
+            bot,
+            int(tg_id),
+            "➕ <b>Можно добавить ещё одно место</b>\n\n"
+            "Если хотите подключить второе устройство или дать доступ мужу, жене или ребёнку — "
+            "добавьте ещё одно место в семейной группе. Это отдельный апселл без изменения вашей основной подписки.",
+            kind="upsell_after_first_payment",
+            reply_markup=_family_upsell_kb(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+async def _collect_referral_payment_notification(session, payment: Payment) -> dict | None:
+    earning = await session.scalar(
+        select(ReferralEarning)
+        .where(ReferralEarning.payment_id == int(payment.id))
+        .order_by(ReferralEarning.id.desc())
+        .limit(1)
+    )
+    if not earning:
+        return None
+    referral = await session.scalar(
+        select(Referral)
+        .where(Referral.referred_tg_id == int(payment.tg_id))
+        .order_by(Referral.id.desc())
+        .limit(1)
+    )
+    return {
+        "referrer_tg_id": int(earning.referrer_tg_id),
+        "earned_rub": int(getattr(earning, "earned_rub", 0) or 0),
+        "is_activation": bool(referral and int(getattr(referral, "first_payment_id", 0) or 0) == int(payment.id)),
+        "available_at": getattr(earning, "available_at", None),
+    }
+
+
+async def _send_referral_payment_notifications(bot: Bot, payload: dict | None) -> None:
+    if not payload:
+        return
+    referrer_tg_id = int(payload.get("referrer_tg_id") or 0)
+    if referrer_tg_id <= 0:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="👥 Открыть рефералку", callback_data="nav:referrals")]]
+    )
+    if payload.get("is_activation"):
+        try:
+            await audit_send_message(
+                bot,
+                referrer_tg_id,
+                "🎉 Ваш друг оплатил подписку по реферальной ссылке. Реферал активирован.",
+                kind="referral_paid",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+    hold_note = ""
+    available_at = payload.get("available_at")
+    if isinstance(available_at, datetime):
+        hold_note = (
+            f"\n\nДоступно к выводу после: "
+            f"<b>{_ensure_tz(available_at).astimezone(AMSTERDAM_TZ).strftime('%d.%m.%Y %H:%M')}</b>."
+        )
+    try:
+        await audit_send_message(
+            bot,
+            referrer_tg_id,
+            f"💸 Начислено реферальное вознаграждение: <b>{int(payload.get('earned_rub') or 0)} ₽</b>.{hold_note}",
+            kind="referral_earning_created",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+async def _send_referral_release_notifications(bot: Bot, released_rows: list[tuple[int, int, int]]) -> None:
+    if not released_rows:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="👥 Открыть рефералку", callback_data="nav:referrals")]]
+    )
+    for referrer_tg_id, items_cnt, total_rub in released_rows:
+        try:
+            suffix = f" за {int(items_cnt)} начисл." if int(items_cnt) > 1 else ""
+            await audit_send_message(
+                bot,
+                int(referrer_tg_id),
+                f"✅ Реферальный холд завершён. Доступно к выводу: <b>{int(total_rub)} ₽</b>{suffix}.",
+                kind="referral_hold_released",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 async def _jobstate_get(session, key: str) -> str | None:
@@ -301,6 +429,8 @@ async def _job_reconcile_pending_platega_payments(bot: Bot) -> None:
         ).scalars().all()
 
         changed = False
+        referral_notifications: list[dict] = []
+        first_payment_upsell_ids: set[int] = set()
         for pay in rows:
             provider_tid = str(pay.provider_payment_id or "").strip()
             if not provider_tid:
@@ -361,8 +491,26 @@ async def _job_reconcile_pending_platega_payments(bot: Bot) -> None:
             pay.status = "success"
             try:
                 await referral_service.on_successful_payment(session, pay)
+                payload = await _collect_referral_payment_notification(session, pay)
+                if payload:
+                    referral_notifications.append(payload)
             except Exception:
                 pass
+
+            successful_before = int(
+                await session.scalar(
+                    select(func.count(Payment.id)).where(
+                        Payment.tg_id == tg_id,
+                        Payment.status == "success",
+                        Payment.amount.is_not(None),
+                        Payment.amount > 0,
+                        Payment.id != int(pay.id),
+                    )
+                )
+                or 0
+            )
+            if successful_before == 0:
+                first_payment_upsell_ids.add(tg_id)
 
             sub.end_at = new_end
             sub.is_active = True
@@ -393,6 +541,10 @@ async def _job_reconcile_pending_platega_payments(bot: Bot) -> None:
             )
         except Exception:
             pass
+    for payload in referral_notifications:
+        await _send_referral_payment_notifications(bot, payload)
+    for tg_id in sorted(first_payment_upsell_ids):
+        await _send_first_payment_family_upsell(bot, tg_id)
 
 async def run_scheduler() -> None:
     """Scheduler jobs loop (single replica) protected by advisory lock.
@@ -428,6 +580,7 @@ async def run_scheduler() -> None:
                     await _job_user_subscription_notifications(bot)
                     # VPN-only users (no YandexMembership) still need expiry reminders.
                     await _job_subscription_end_at_notifications(bot)
+                    await _job_trial_activation_notifications(bot)
                     await _job_trial_expiring_notifications(bot)
                     await _job_trial_reengagement_notifications(bot)
                     await _job_family_group_expiring_notifications(bot)
@@ -436,9 +589,28 @@ async def run_scheduler() -> None:
                     await _job_winback_discount_campaign(bot)
                     # Make pending referral earnings available when hold expires.
                     try:
+                        due_rows = (
+                            await session.execute(
+                                select(
+                                    ReferralEarning.referrer_tg_id,
+                                    func.count(ReferralEarning.id),
+                                    func.coalesce(func.sum(ReferralEarning.earned_rub), 0),
+                                )
+                                .where(
+                                    ReferralEarning.status == "pending",
+                                    ReferralEarning.available_at.is_not(None),
+                                    ReferralEarning.available_at <= _utcnow(),
+                                )
+                                .group_by(ReferralEarning.referrer_tg_id)
+                            )
+                        ).all()
                         released = await referral_service.release_pending(session)
                         if released:
                             await session.commit()
+                            await _send_referral_release_notifications(
+                                bot,
+                                [(int(r[0]), int(r[1]), int(r[2] or 0)) for r in due_rows if int(r[0] or 0) > 0],
+                            )
                     except Exception:
                         pass
                     await _send_admin_kick_report(bot, force=False)
@@ -1098,6 +1270,92 @@ async def _job_rotate_yandex_invites(bot: Bot) -> None:
                 pass
 
 
+async def _job_trial_activation_notifications(bot: Bot) -> None:
+    """D1/D2 nudges during trial to push first useful VPN action."""
+    now = _utcnow()
+    now_local = now.astimezone(AMSTERDAM_TZ)
+    if now_local.hour < 12:
+        return
+
+    async with session_scope() as session:
+        q = (
+            select(Subscription)
+            .where(
+                Subscription.is_active.is_(True),
+                Subscription.end_at.is_not(None),
+                Subscription.end_at > now,
+            )
+            .order_by(Subscription.tg_id.asc())
+            .limit(1000)
+        )
+        rows = (await session.execute(q)).scalars().all()
+        if not rows:
+            return
+
+        changed = False
+        for sub in rows:
+            tg_id = int(sub.tg_id)
+            trial_used = bool(await get_app_setting_int(session, f"trial_used:{tg_id}", default=0))
+            if not trial_used:
+                continue
+            paid_q = (
+                select(Payment.id)
+                .where(
+                    Payment.tg_id == tg_id,
+                    Payment.status == "success",
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
+                )
+                .limit(1)
+            )
+            if (await session.execute(paid_q)).first() is not None:
+                continue
+            trial_end_ts = await get_app_setting_int(session, f"trial_end_ts:{tg_id}", default=0)
+            if trial_end_ts <= 0:
+                continue
+            trial_end_at = datetime.fromtimestamp(int(trial_end_ts), tz=timezone.utc)
+            if trial_end_at <= now:
+                continue
+            trial_started_at = trial_end_at - timedelta(days=5)
+            days_since_start = int((now - trial_started_at).total_seconds() // 86400)
+            if 1 <= days_since_start < 2:
+                due_day = 1
+            elif 2 <= days_since_start < 3:
+                due_day = 2
+            else:
+                continue
+            sent_key = f"trial_d{due_day}_sent:{tg_id}"
+            if bool(await get_app_setting_int(session, sent_key, default=0)):
+                continue
+            if due_day == 1:
+                text_msg = (
+                    "🔌 <b>VPN уже активен</b>\n\n"
+                    "Если ещё не подключились — сделайте это сейчас и проверьте Telegram, YouTube и сайты, которые у вас обычно тормозят. "
+                    "Пара минут на настройку — и вы сразу увидите разницу."
+                )
+            else:
+                text_msg = (
+                    "🌍 <b>Проверьте сервис в обычном режиме</b>\n\n"
+                    "Откройте Telegram, звонки, медиа и проблемные сайты. Важно найти для себя рабочий сценарий ещё во время trial, "
+                    "чтобы пользоваться VPN каждый день без лишней настройки."
+                )
+            try:
+                await audit_send_message(
+                    bot,
+                    tg_id,
+                    text_msg,
+                    kind=f"trial_d{due_day}",
+                    reply_markup=_trial_activation_kb(due_day),
+                    parse_mode="HTML",
+                )
+                await set_app_setting_int(session, sent_key, 1)
+                changed = True
+            except Exception:
+                pass
+        if changed:
+            await session.commit()
+
+
 def _trial_expiring_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1202,6 +1460,20 @@ async def _job_trial_expiring_notifications(bot: Bot) -> None:
                     kind=f"trial_warn_{days_left}d",
                     reply_markup=_trial_expiring_kb(),
                 )
+                if days_left == 1:
+                    await audit_send_message(
+                        bot,
+                        tg_id,
+                        "➕ <b>Дополнительно:</b> после активации основной подписки вы сможете добавить ещё одно место для второго устройства или члена семьи отдельным апселлом через семейную группу.",
+                        kind="upsell_trial_end",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [InlineKeyboardButton(text="💳 Купить подписку", callback_data="nav:pay")],
+                                [InlineKeyboardButton(text="👨‍👩‍👧‍👦 Семейная группа", callback_data="vpn:family")],
+                            ]
+                        ),
+                        parse_mode="HTML",
+                    )
                 await set_app_setting_int(session, sent_key, 1)
                 changed = True
             except Exception:
@@ -1549,7 +1821,7 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
             await session.commit()
 
 
-TRIAL_REENGAGEMENT_DAY_MARKS = [1, 4, 8, 11, 15, 18, 22, 25, 32, 46, 60, 74, 95, 125, 155]
+TRIAL_REENGAGEMENT_DAY_MARKS = [1, 3, 7, 14, 30]
 
 
 def _trial_reengagement_text() -> str:
@@ -1565,7 +1837,7 @@ def _trial_reengagement_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💳 Купить подписку", callback_data="nav:pay")],
-            [InlineKeyboardButton(text="Я уверен", callback_data="nav:home")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
         ]
     )
 
@@ -1663,7 +1935,7 @@ async def _job_trial_reengagement_notifications(bot: Bot) -> None:
                 await audit_send_message(
                     bot,
                     tg_id,
-                    _trial_reengagement_text(),
+                    _trial_reengagement_text(days_since_end),
                     kind=f"trial_reengage_{due_stage}",
                     reply_markup=_trial_reengagement_kb(),
                 )
