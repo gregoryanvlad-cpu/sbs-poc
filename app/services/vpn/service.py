@@ -1155,5 +1155,53 @@ class VPNService:
         items.sort(key=lambda x: (int(x.get("handshake_ts", 0) or 0), int(x.get("total_bytes", 0) or 0)), reverse=True)
         return items
 
+    async def dedupe_active_peers(self, session: AsyncSession) -> dict[str, int]:
+        """Deactivate duplicate active WG peers that share the same client_ip.
+
+        Keep the best candidate per IP and deactivate the rest.
+        Preference order:
+        1) row with non-empty server_code
+        2) newest created_at
+        3) highest id
+
+        Best-effort removes stale peers from remote server when server_code is known.
+        """
+        rows = (await session.scalars(select(VpnPeer).where(VpnPeer.is_active == True).order_by(VpnPeer.client_ip.asc(), VpnPeer.id.desc()))).all()
+        by_ip: dict[str, list[VpnPeer]] = {}
+        for row in rows:
+            by_ip.setdefault(str(row.client_ip or ''), []).append(row)
+
+        duplicate_ips = 0
+        deactivated = 0
+        remote_removed = 0
+
+        def _rank(r: VpnPeer):
+            return (1 if str(getattr(r, 'server_code', '') or '').strip() else 0, getattr(r, 'created_at', None) or utcnow(), int(getattr(r, 'id', 0) or 0))
+
+        for ip, peers in by_ip.items():
+            if not ip or len(peers) <= 1:
+                continue
+            duplicate_ips += 1
+            keep = max(peers, key=_rank)
+            for row in peers:
+                if row.id == keep.id:
+                    continue
+                row.is_active = False
+                row.revoked_at = utcnow()
+                if not getattr(row, 'rotation_reason', None):
+                    row.rotation_reason = 'dedup_ip'
+                deactivated += 1
+                code = str(getattr(row, 'server_code', None) or '').strip().upper()
+                if code:
+                    try:
+                        provider, _ = self._provider_for_server_code(code)
+                        await provider.remove_peer(row.client_public_key)
+                        remote_removed += 1
+                    except Exception:
+                        log.exception('vpn_dedupe_remove_remote_failed peer_id=%s code=%s ip=%s', row.id, code, ip)
+        if deactivated:
+            await session.flush()
+        return {'duplicate_ips': duplicate_ips, 'deactivated': deactivated, 'remote_removed': remote_removed}
+
 
 vpn_service = VPNService()
