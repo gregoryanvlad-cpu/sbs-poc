@@ -1373,6 +1373,42 @@ async def on_nav(cb: CallbackQuery) -> None:
         await _safe_cb_answer(cb)
         return
 
+
+    if where == "faq":
+        text = (
+            "❓ <b>FAQ</b>\n\n"
+            "Выберите раздел ниже."
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=kb_faq(), parse_mode="HTML")
+        except Exception:
+            try:
+                await cb.message.answer(text, reply_markup=kb_faq(), parse_mode="HTML")
+            except Exception:
+                pass
+        await _safe_cb_answer(cb)
+        return
+
+    if where == "support":
+        text = (
+            "🛠 <b>Поддержка</b>\n\n"
+            "По всем вопросам пиши сюда: @sbsmanager_bot\n\n"
+            "Контакты для связи:\n"
+            "sbs@sertera.group"
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=kb_back_home(), parse_mode="HTML")
+        except Exception:
+            try:
+                await cb.message.answer(text, reply_markup=kb_back_home(), parse_mode="HTML")
+            except Exception:
+                pass
+        await _safe_cb_answer(cb)
+        return
+
+    await cb.answer("Неизвестный раздел")
+
+
 @router.callback_query(lambda c: c.data == "yandex:issue_now")
 async def on_yandex_issue_now(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
@@ -1401,37 +1437,6 @@ async def on_yandex_issue_now(cb: CallbackQuery) -> None:
     await cb.answer('Новое приглашение выдано')
 
 
-    if where == "faq":
-        text = (
-            "❓ FAQ\n\n"
-            "Выберите раздел ниже.\n"
-        )
-        try:
-            await cb.message.edit_text(text, reply_markup=kb_faq())
-        except Exception:
-            try:
-                await cb.message.answer(text, reply_markup=kb_faq())
-            except Exception:
-                pass
-        await _safe_cb_answer(cb)
-        return
-
-    if where == "support":
-        try:
-            await cb.message.edit_text(
-                "🛠 Поддержка\n\n"
-                "По всем вопросам пиши сюда: @sbsmanager_bot\n\n"
-                "Контакты для связи:\n"
-                "sbs@sertera.group",
-                reply_markup=kb_back_home(),
-            )
-        except Exception:
-            pass
-        await _safe_cb_answer(cb)
-        return
-
-
-    await cb.answer("Неизвестный раздел")
 
 
 @router.callback_query(lambda c: c.data and (c.data.startswith("pay:buy") or c.data.startswith("pay:mock") or c.data.startswith("pay:promo:")))
@@ -3443,6 +3448,21 @@ async def on_vpn_family(cb: CallbackQuery) -> None:
     await _safe_cb_answer(cb)
 
 
+def _family_buy_counter_kb(current: int) -> InlineKeyboardMarkup:
+    current = max(1, min(FAMILY_MAX_SEATS, int(current or 1)))
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➖", callback_data="family:buy:delta:-1"),
+                InlineKeyboardButton(text=f"{current} мест", callback_data="family:buy:noop"),
+                InlineKeyboardButton(text="➕", callback_data="family:buy:delta:1"),
+            ],
+            [InlineKeyboardButton(text="💳 Купить", callback_data="family:buy:pay")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="vpn:family")],
+        ]
+    )
+
+
 def _family_buy_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3574,6 +3594,59 @@ async def on_family_renew_pick(cb: CallbackQuery) -> None:
         parse_mode="HTML",
     )
     await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "family:buy:noop")
+async def on_family_buy_noop(cb: CallbackQuery) -> None:
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("family:buy:delta:"))
+async def on_family_buy_delta(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    delta = -1 if (cb.data or "").endswith(":-1") else 1
+    async with session_scope() as session:
+        grp = await _get_or_create_family_group(session, tg_id)
+        current_total = int(grp.seats_total or 0)
+        max_add = max(1, FAMILY_MAX_SEATS - current_total)
+        target = int(await get_app_setting_int(session, f"family_buy_target:{tg_id}", default=1) or 1)
+        target = max(1, min(max_add, target + delta))
+        await set_app_setting_int(session, f"family_buy_target:{tg_id}", target)
+        price = await _get_family_seat_price(session, tg_id)
+        await session.commit()
+    await cb.message.edit_text(
+        "👨‍👩‍👧‍👦 <b>Покупка семейных мест</b>\n\n"
+        f"Цена: <b>{price} ₽</b> за 1 место в месяц.\n"
+        f"Вы добавляете: <b>{target}</b> мест.\n",
+        reply_markup=_family_buy_counter_kb(target),
+        parse_mode="HTML",
+    )
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "family:buy:pay")
+async def on_family_buy_pay(cb: CallbackQuery) -> None:
+    tg_id = cb.from_user.id
+    async with session_scope() as session:
+        sub = await get_subscription(session, tg_id)
+        if not _is_sub_active(sub.end_at):
+            await cb.answer("Сначала продлите свою подписку.", show_alert=True)
+            return
+        grp = await _get_or_create_family_group(session, tg_id)
+        current_total = int(grp.seats_total or 0)
+        count = int(await get_app_setting_int(session, f"family_buy_target:{tg_id}", default=1) or 1)
+        count = max(1, min(FAMILY_MAX_SEATS - current_total, count))
+        price = await _get_family_seat_price(session, tg_id)
+        await _set_family_payment_context(session, tg_id, mode=1, count=count, slot_no=None)
+        await session.commit()
+    if settings.payment_provider == "platega":
+        await _start_platega_family_payment(cb, tg_id=tg_id, seats=count, amount_rub=price * count)
+    else:
+        async with session_scope() as session:
+            await _apply_family_payment(session, owner_tg_id=tg_id, seats=count, mode=1)
+            await session.commit()
+        await cb.message.edit_text("✅ Новые семейные места добавлены.", reply_markup=_family_manage_kb(can_manage=True, has_seats=True))
+        await _safe_cb_answer(cb)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("family:buy_count:"))
