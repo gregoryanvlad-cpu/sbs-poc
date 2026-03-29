@@ -46,7 +46,7 @@ from app.bot.keyboards import (
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
-from app.db.models import Payment, User, LteVpnClient
+from app.db.models import Payment, User, LteVpnClient, Referral, ReferralEarning
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int, get_app_setting_int, has_successful_payments
@@ -54,10 +54,97 @@ from app.repo import extend_subscription, get_subscription, get_price_rub, is_tr
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 from app.services.lte_vpn.service import lte_vpn_service
+from app.services.message_audit import audit_send_message
 
 router = Router()
 
 TG_PROXY_URL = "https://t.me/proxy?server=mt.masterpix.org&port=443&secret=7ix9qzx1rb59pdRm9E7ivEp4cC5hcHBsZS5jb20"
+
+
+def _family_upsell_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить место", callback_data="family:buy")],
+            [InlineKeyboardButton(text="👤 Личный кабинет", callback_data="nav:cabinet")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
+async def _send_first_payment_family_upsell(bot: Bot, tg_id: int) -> None:
+    try:
+        await audit_send_message(
+            bot,
+            int(tg_id),
+            "➕ <b>Можно добавить ещё одно место</b>\n\n"
+            "Если хотите подключить второе устройство или дать доступ мужу, жене или ребёнку — "
+            "добавьте ещё одно место в семейной группе. Это отдельный апселл без изменения вашей основной подписки.",
+            kind="upsell_after_first_payment",
+            reply_markup=_family_upsell_kb(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+async def _collect_referral_payment_notification(session, payment: Payment) -> dict | None:
+    earning = await session.scalar(
+        select(ReferralEarning)
+        .where(ReferralEarning.payment_id == int(payment.id))
+        .order_by(ReferralEarning.id.desc())
+        .limit(1)
+    )
+    if not earning:
+        return None
+    referral = await session.scalar(
+        select(Referral)
+        .where(Referral.referred_tg_id == int(payment.tg_id))
+        .order_by(Referral.id.desc())
+        .limit(1)
+    )
+    return {
+        "referrer_tg_id": int(earning.referrer_tg_id),
+        "earned_rub": int(getattr(earning, "earned_rub", 0) or 0),
+        "is_activation": bool(referral and int(getattr(referral, "first_payment_id", 0) or 0) == int(payment.id)),
+        "available_at": getattr(earning, "available_at", None),
+    }
+
+
+async def _send_referral_payment_notifications(bot: Bot, payload: dict | None) -> None:
+    if not payload:
+        return
+    referrer_tg_id = int(payload.get("referrer_tg_id") or 0)
+    if referrer_tg_id <= 0:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="👥 Открыть рефералку", callback_data="nav:referrals")]]
+    )
+    if payload.get("is_activation"):
+        try:
+            await audit_send_message(
+                bot,
+                referrer_tg_id,
+                "🎉 Ваш друг оплатил подписку по реферальной ссылке. Реферал активирован.",
+                kind="referral_paid",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+    hold_note = ""
+    available_at = payload.get("available_at")
+    if isinstance(available_at, datetime):
+        hold_note = f"\n\nДоступно к выводу после: <b>{available_at.astimezone(timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M')}</b>."
+    try:
+        await audit_send_message(
+            bot,
+            referrer_tg_id,
+            f"💸 Начислено реферальное вознаграждение: <b>{int(payload.get('earned_rub') or 0)} ₽</b>.{hold_note}",
+            kind="referral_earning_created",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 async def _mark_purchase_notified_once(session, *, provider_payment_id: str | None, payment_id: int | None) -> bool:
@@ -1507,8 +1594,21 @@ async def on_buy(cb: CallbackQuery) -> None:
             .order_by(Payment.id.desc())
             .limit(1)
         )
+        referral_payload = None
+        first_paid_before = int(
+            await session.scalar(
+                select(func.count(Payment.id)).where(
+                    Payment.tg_id == tg_id,
+                    Payment.status == "success",
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
+                )
+            )
+            or 0
+        )
         if pay:
             await referral_service.on_successful_payment(session, pay)
+            referral_payload = await _collect_referral_payment_notification(session, pay)
 
         sub.end_at = new_end
         sub.is_active = True
@@ -1692,7 +1792,20 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                     await _restore_wg_peers_after_payment(session, tg_id)
 
                     pay.status = "success"
+                    first_paid_before = int(
+                        await session.scalar(
+                            select(func.count(Payment.id)).where(
+                                Payment.tg_id == tg_id,
+                                Payment.status == "success",
+                                Payment.amount.is_not(None),
+                                Payment.amount > 0,
+                                Payment.id != int(pay.id),
+                            )
+                        )
+                        or 0
+                    )
                     await referral_service.on_successful_payment(session, pay)
+                    referral_payload = await _collect_referral_payment_notification(session, pay)
 
                     sub.end_at = new_end
                     sub.is_active = True
@@ -1729,6 +1842,9 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                         )
                     except Exception:
                         pass
+                    if first_paid_before == 0:
+                        await _send_first_payment_family_upsell(bot, tg_id)
+                    await _send_referral_payment_notifications(bot, referral_payload)
                     return
 
                 if status in ("FAILED", "CANCELLED", "EXPIRED", "REJECTED"):
@@ -2026,7 +2142,20 @@ async def on_pay_check(cb: CallbackQuery) -> None:
             # referral earnings processing: use the newest successful payment row
             # (extend_subscription inserts a Payment row). We keep original pending row too.
             pay.status = "success"
+            first_paid_before = int(
+                await session.scalar(
+                    select(func.count(Payment.id)).where(
+                        Payment.tg_id == cb.from_user.id,
+                        Payment.status == "success",
+                        Payment.amount.is_not(None),
+                        Payment.amount > 0,
+                        Payment.id != int(pay.id),
+                    )
+                )
+                or 0
+            )
             await referral_service.on_successful_payment(session, pay)
+            referral_payload = await _collect_referral_payment_notification(session, pay)
 
             sub.end_at = new_end
             sub.is_active = True
