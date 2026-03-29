@@ -26,6 +26,7 @@ async def cmd_start(message: Message) -> None:
     show_trial = False
     async with session_scope() as session:
         u = message.from_user
+        existing_user = await session.get(User, int(tg_id))
         await ensure_user(
             session,
             tg_id,
@@ -34,7 +35,9 @@ async def cmd_start(message: Message) -> None:
             last_name=u.last_name,
         )
 
-        if payload and payload.startswith("ref_"):
+        # Привязка по рефералке допустима только на самом первом входе.
+        # Если пользователь уже существовал в БД, не перезаписываем источник.
+        if existing_user is None and payload and payload.startswith("ref_"):
             code = payload.split("ref_", 1)[1].strip()
             if code:
                 await referral_service.attach_pending_referrer(
