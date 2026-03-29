@@ -24,6 +24,9 @@ class FamilyVpnProfile(Base):
     # associated WireGuard peer (vpn_peers.id). Nullable until created.
     vpn_peer_id: Mapped[int | None] = mapped_column(ForeignKey("vpn_peers.id"), nullable=True)
 
+    # per-seat paid coverage end (independent for each family place)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     is_paused: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
