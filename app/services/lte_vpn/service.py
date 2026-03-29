@@ -18,7 +18,7 @@ import asyncssh
 from sqlalchemy import and_, func, or_, select
 
 from app.core.config import settings
-from app.db.models import LteVpnClient, Subscription
+from app.db.models import LteVpnClient, Subscription, Payment
 from app.db.session import session_scope
 
 log = logging.getLogger(__name__)
@@ -242,6 +242,113 @@ class LteVpnService:
         async with session_scope() as session:
             return await session.get(LteVpnClient, tg_id)
 
+    async def reconcile_access(self, tg_id: int, *, subscription_end_at: datetime | None, has_success_payment: bool, ensure_remote: bool = False) -> dict:
+        """Recalculate effective LTE entitlement from DB state + successful LTE payments.
+
+        This protects against cases where payment status became success, but the local
+        LTE row was not extended or the remote Xray client was not re-synced.
+        """
+        now = datetime.now(timezone.utc)
+        changed = False
+        reenabled = False
+        row: LteVpnClient | None = None
+
+        async with session_scope() as session:
+            row = await session.get(LteVpnClient, tg_id)
+            lte_paid_rows = (
+                await session.execute(
+                    select(Payment.paid_at)
+                    .where(
+                        Payment.tg_id == int(tg_id),
+                        Payment.status == "success",
+                        Payment.provider.in_(("platega_lte", "mock_lte")),
+                    )
+                    .order_by(Payment.paid_at.asc(), Payment.id.asc())
+                )
+            ).all()
+            lte_paid_ats = []
+            for (paid_at,) in lte_paid_rows:
+                if paid_at is None:
+                    continue
+                try:
+                    lte_paid_ats.append(paid_at.astimezone(timezone.utc) if paid_at.tzinfo else paid_at.replace(tzinfo=timezone.utc))
+                except Exception:
+                    lte_paid_ats.append(paid_at)
+
+            current_end = row.cycle_anchor_end_at if row else None
+            if current_end is not None and current_end.tzinfo is None:
+                current_end = current_end.replace(tzinfo=timezone.utc)
+            if subscription_end_at is not None and subscription_end_at.tzinfo is None:
+                subscription_end_at = subscription_end_at.replace(tzinfo=timezone.utc)
+
+            target_end: datetime | None
+            if not has_success_payment:
+                # Trial / gifted-without-payment flow: LTE follows the main sub while it is active.
+                target_end = subscription_end_at
+            elif lte_paid_ats:
+                target_end = current_end
+                for paid_at in lte_paid_ats:
+                    start = target_end if target_end and target_end > paid_at else paid_at
+                    target_end = self._add_one_month(start)
+            else:
+                target_end = current_end
+
+            has_lte_payment = bool(lte_paid_ats)
+            should_enable = False
+            if not has_success_payment:
+                should_enable = bool(target_end and target_end > now)
+            elif has_lte_payment:
+                should_enable = bool(target_end and target_end > now)
+
+            if should_enable and row is None:
+                row = LteVpnClient(
+                    tg_id=int(tg_id),
+                    uuid=str(uuid.uuid4()),
+                    email=self.email_for_tg_id(tg_id),
+                    rate_mbit=settings.lte_rate_mbit,
+                )
+                session.add(row)
+                changed = True
+
+            if row is not None:
+                desired_email = self.email_for_tg_id(tg_id)
+                if row.email != desired_email:
+                    row.email = desired_email
+                    changed = True
+                if should_enable and not row.is_enabled:
+                    row.is_enabled = True
+                    reenabled = True
+                    changed = True
+                if should_enable and target_end is not None:
+                    existing_end = row.cycle_anchor_end_at
+                    if existing_end is not None and existing_end.tzinfo is None:
+                        existing_end = existing_end.replace(tzinfo=timezone.utc)
+                    elif existing_end is not None:
+                        existing_end = existing_end.astimezone(timezone.utc)
+                    if existing_end is None or abs((existing_end - target_end).total_seconds()) > 1:
+                        row.cycle_anchor_end_at = target_end
+                        changed = True
+                row.updated_at = now
+
+            if changed:
+                await session.flush()
+                await session.commit()
+
+        remote_fixed = False
+        if ensure_remote and should_enable and row is not None:
+            await self.ensure_remote_client(tg_id, row.uuid)
+            remote_fixed = True
+
+        return {
+            "allowed": bool(should_enable),
+            "until": target_end,
+            "row": row,
+            "has_lte_payment": has_lte_payment,
+            "changed": changed,
+            "reenabled": reenabled,
+            "remote_fixed": remote_fixed,
+        }
+
     async def activate_paid_month(self, tg_id: int) -> LteVpnClient:
         now = datetime.now(timezone.utc)
         async with session_scope() as session:
@@ -257,23 +364,20 @@ class LteVpnService:
             row.updated_at = now
             await session.flush()
             await session.commit()
-            return row
+        try:
+            await self.ensure_remote_client(tg_id, row.uuid)
+        except Exception:
+            log.exception("lte_activate_remote_sync_failed tg_id=%s", tg_id)
+        return row
 
     async def has_lte_access(self, tg_id: int, *, subscription_end_at: datetime | None, has_success_payment: bool) -> bool:
-        if not subscription_end_at:
-            return False
-        if not has_success_payment:
-            return True
-        now = datetime.now(timezone.utc)
-        async with session_scope() as session:
-            row = await session.get(LteVpnClient, tg_id)
-            if not row or not row.cycle_anchor_end_at or not row.is_enabled:
-                return False
-            try:
-                anchor = row.cycle_anchor_end_at.astimezone(timezone.utc)
-            except Exception:
-                anchor = row.cycle_anchor_end_at
-            return bool(anchor and anchor > now)
+        state = await self.reconcile_access(
+            tg_id,
+            subscription_end_at=subscription_end_at,
+            has_success_payment=has_success_payment,
+            ensure_remote=False,
+        )
+        return bool(state.get("allowed"))
 
     async def ensure_remote_client(self, tg_id: int, client_uuid: str) -> None:
         email = self.email_for_tg_id(tg_id)
