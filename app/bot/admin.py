@@ -4183,6 +4183,23 @@ async def admin_ref_assign(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
+@router.callback_query(lambda c: c.data == "admin:ref:reset")
+async def admin_ref_reset(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    await state.set_state(AdminReferralAssignFSM.waiting_referred)
+    await state.update_data(mode="reset")
+    await cb.message.edit_text(
+        "🧹 <b>Сбросить реферала</b>\n\n"
+        "Отправь TG ID пользователя или @username. После сброса он будет считаться пришедшим самостоятельно, а новые реферальные начисления больше не пойдут.",
+        reply_markup=_kb_ref_manage(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
 @router.message(AdminReferralAssignFSM.waiting_referred)
 async def admin_ref_wait_referred(message: Message, state: FSMContext) -> None:
     if not is_owner(message.from_user.id):
@@ -4212,6 +4229,26 @@ async def admin_ref_wait_referred(message: Message, state: FSMContext) -> None:
             f"Реферал: <b>{ref_lbl}</b>\n"
             f"Был у: <b>{prev_lbl}</b>\n"
             f"Теперь у: <b>{await _format_user_label(message.bot, new_owner_id)}</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_menu(),
+        )
+        return
+
+    if mode == "reset":
+        async with session_scope() as session:
+            ok, prev = await referral_service.admin_reset_referral(
+                session, referred_tg_id=referred_id,
+            )
+            await session.commit()
+
+        ref_lbl = await _format_user_label(message.bot, referred_id)
+        prev_lbl = await _format_user_label(message.bot, prev) if prev else "—"
+        await state.clear()
+        await message.answer(
+            "✅ <b>Готово</b>\n\n"
+            f"Пользователь: <b>{ref_lbl}</b>\n"
+            f"Был у: <b>{prev_lbl}</b>\n"
+            "Теперь отображается как: <b>пришёл самостоятельно</b>",
             parse_mode="HTML",
             reply_markup=kb_admin_menu(),
         )
