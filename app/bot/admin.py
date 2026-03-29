@@ -1150,9 +1150,14 @@ def _message_html_caption(message: Message) -> str:
 def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:user:card:{tg_id}")],
-            [InlineKeyboardButton(text="📨 Напомнить об оплате", callback_data=f"admin:user:notify_expired:{tg_id}")],
-            [InlineKeyboardButton(text="🗓 Изменить дату окончания", callback_data=f"admin:user:set_end_at:{tg_id}")],
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin:user:card:{tg_id}"),
+                InlineKeyboardButton(text="↩️ Забрать подарок", callback_data=f"admin:user:gift_revoke:{tg_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="📨 Напомнить об оплате", callback_data=f"admin:user:notify_expired:{tg_id}"),
+                InlineKeyboardButton(text="🗓 Изменить дату окончания", callback_data=f"admin:user:set_end_at:{tg_id}"),
+            ],
             [InlineKeyboardButton(text="💰 Цена места семьи", callback_data=f"admin:user:set_family_price:{tg_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
@@ -1722,6 +1727,121 @@ async def admin_user_card_refresh(cb: CallbackQuery) -> None:
         return
     async with session_scope() as session:
         text = await _render_user_card(session, cb.bot, tg_id)
+    await cb.message.edit_text(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+
+
+async def _gift_revoke_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = list((await session.execute(
+        select(Payment)
+        .where(Payment.tg_id == tg_id, Payment.provider == "gift")
+        .order_by(Payment.paid_at.desc(), Payment.id.desc())
+        .limit(10)
+    )).scalars().all())
+
+    lines = ["↩️ <b>Откат подарков</b>", f"Пользователь: <code>{tg_id}</code>"]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    active_rows = []
+    for pay in rows:
+        status = str(pay.status or "—")
+        paid_at = _fmt_dt_short(pay.paid_at)
+        months = int(getattr(pay, "period_months", 0) or 0)
+        days = int(getattr(pay, "period_days", 0) or 0)
+        period_label = []
+        if months:
+            period_label.append(f"{months}м")
+        if days:
+            period_label.append(f"{days}д")
+        period_text = "+".join(period_label) if period_label else "?"
+        lines.append(f"• #{int(pay.id)} | {html.escape(status)} | {paid_at} | {period_text}")
+        if status == "success":
+            active_rows.append(pay)
+            kb_rows.append([InlineKeyboardButton(text=f"↩️ Забрать #{int(pay.id)} ({period_text})", callback_data=f"admin:user:gift_revoke_pick:{tg_id}:{int(pay.id)}")])
+
+    if not rows:
+        lines.append("")
+        lines.append("Подарков не найдено.")
+    elif not active_rows:
+        lines.append("")
+        lines.append("Активных подарков для отката нет.")
+
+    kb_rows.append([InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")])
+PLACEHOLDER
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:gift_revoke:"))
+async def admin_user_gift_revoke_menu(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        await cb.answer("Некорректный пользователь", show_alert=True)
+        return
+    async with session_scope() as session:
+        text, kb = await _gift_revoke_menu_text(session, tg_id)
+    await cb.answer()
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:gift_revoke_pick:"))
+async def admin_user_gift_revoke_pick(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    parts = (cb.data or "").split(":")
+    if len(parts) < 6:
+        await cb.answer("Некорректные данные", show_alert=True)
+        return
+    try:
+        tg_id = int(parts[-2])
+        payment_id = int(parts[-1])
+    except Exception:
+        await cb.answer("Некорректные данные", show_alert=True)
+        return
+
+    async with session_scope() as session:
+        pay = await session.get(Payment, payment_id)
+        if not pay or int(pay.tg_id or 0) != tg_id or str(pay.provider or "") != "gift":
+            await cb.answer("Подарок не найден", show_alert=True)
+            return
+        if str(pay.status or "") != "success":
+            text, kb = await _gift_revoke_menu_text(session, tg_id)
+            await cb.answer("Этот подарок уже откатан", show_alert=True)
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        sub = await session.get(Subscription, tg_id)
+        if not sub:
+            sub = await get_subscription(session, tg_id)
+        if not sub:
+            await cb.answer("Подписка не найдена", show_alert=True)
+            return
+
+        months = int(getattr(pay, "period_months", 0) or 0)
+        days = int(getattr(pay, "period_days", 0) or 0)
+        delta_months = months
+        delta_days = days if months == 0 else 0
+        old_end = sub.end_at
+        base_end = old_end or _utcnow()
+        new_end = base_end
+        if delta_months:
+            new_end = new_end - relativedelta(months=delta_months)
+        if delta_days:
+            new_end = new_end - timedelta(days=delta_days)
+        now = _utcnow()
+        if new_end < now:
+            new_end = now
+
+        sub.end_at = new_end
+        sub.is_active = bool(sub.end_at and sub.end_at > now)
+        sub.status = "active" if sub.is_active else "expired"
+        pay.status = "revoked"
+        await session.commit()
+
+        text = await _render_user_card(session, cb.bot, tg_id)
+
+    await cb.answer("Подарок откатан")
     await cb.message.edit_text(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
 
 
