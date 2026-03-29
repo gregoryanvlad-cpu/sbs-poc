@@ -1790,7 +1790,7 @@ async def admin_user_gift_revoke_pick(cb: CallbackQuery) -> None:
         await cb.answer()
         return
     parts = (cb.data or "").split(":")
-    if len(parts) < 6:
+    if len(parts) < 5:
         await cb.answer("Некорректные данные", show_alert=True)
         return
     try:
