@@ -205,8 +205,31 @@ async def get_price_rub(session: AsyncSession) -> int:
 
 
 async def is_trial_available(session: AsyncSession, tg_id: int) -> bool:
-    used = int(await get_app_setting_int(session, f"trial_used:{int(tg_id)}", default=0) or 0)
-    return used == 0
+    tg_id = int(tg_id)
+    used = int(await get_app_setting_int(session, f"trial_used:{tg_id}", default=0) or 0)
+    if used != 0:
+        return False
+
+    # Trial is only for users without a current subscription and without any
+    # successful paid purchase. A successful trial row (0 ₽ / provider=trial)
+    # must not count as a paid purchase.
+    sub = await get_subscription(session, tg_id)
+    now = utcnow()
+    if sub.end_at and sub.end_at > now and bool(sub.is_active):
+        return False
+
+    paid_row = await session.scalar(
+        select(Payment.id)
+        .where(
+            Payment.tg_id == tg_id,
+            Payment.status == "success",
+            Payment.amount.is_not(None),
+            Payment.amount > 0,
+        )
+        .order_by(Payment.id.desc())
+        .limit(1)
+    )
+    return paid_row is None
 
 
 async def set_trial_used(session: AsyncSession, tg_id: int) -> None:
