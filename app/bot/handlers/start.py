@@ -1,6 +1,6 @@
 from aiogram import Router
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardRemove, FSInputFile
+from aiogram.types import Message, ReplyKeyboardRemove, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from pathlib import Path
 
 from app.bot.keyboards import kb_main
@@ -9,6 +9,7 @@ from sqlalchemy import select, func, delete
 from app.db.models import User, Payment, Subscription, Referral, ReferralEarning
 from app.repo import ensure_user, is_trial_available
 from app.services.referrals.service import referral_service
+from app.services.message_audit import audit_send_message
 
 router = Router()
 
@@ -26,9 +27,12 @@ async def cmd_start(message: Message) -> None:
         payload = None
 
     show_trial = False
+    new_pending_referrer_tg_id: int | None = None
+    is_new_registration = False
     async with session_scope() as session:
         u = message.from_user
         existing_user = await session.get(User, int(tg_id))
+        is_new_registration = existing_user is None
         await ensure_user(
             session,
             tg_id,
@@ -43,7 +47,7 @@ async def cmd_start(message: Message) -> None:
             code = payload.split("ref_", 1)[1].strip()
             if existing_user is None:
                 if code:
-                    await referral_service.attach_pending_referrer(
+                    new_pending_referrer_tg_id = await referral_service.attach_pending_referrer(
                         session,
                         referred_tg_id=tg_id,
                         ref_code=code,
@@ -72,6 +76,32 @@ async def cmd_start(message: Message) -> None:
         await referral_service.ensure_ref_code(session, tg_id)
         show_trial = await is_trial_available(session, tg_id)
         await session.commit()
+
+    if new_pending_referrer_tg_id:
+        ref_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="👥 Открыть рефералку", callback_data="nav:referrals")]]
+        )
+        try:
+            await audit_send_message(
+                message.bot,
+                int(new_pending_referrer_tg_id),
+                "🔔 По вашей ссылке только что перешёл новый пользователь. Теперь важно довести его до первой оплаты.",
+                kind="referral_link_opened",
+                reply_markup=ref_kb,
+            )
+        except Exception:
+            pass
+        if is_new_registration:
+            try:
+                await audit_send_message(
+                    message.bot,
+                    int(new_pending_referrer_tg_id),
+                    "✅ По вашей реферальной ссылке зарегистрировался новый пользователь. Реферал засчитается после его первой успешной оплаты.",
+                    kind="referral_registered",
+                    reply_markup=ref_kb,
+                )
+            except Exception:
+                pass
 
     # Greeting (обычный текст, без рамки/код-блока)
     text = (
