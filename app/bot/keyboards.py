@@ -15,7 +15,7 @@ def kb_main(*, show_trial: bool = False) -> InlineKeyboardMarkup:
     b.button(text="💳 Оплата", callback_data="nav:pay")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
-    b.adjust(2, repeat=True)
+    b.adjust(1)
     return b.as_markup()
 def kb_back_home() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
