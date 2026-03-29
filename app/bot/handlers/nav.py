@@ -3434,7 +3434,7 @@ async def on_vpn_family(cb: CallbackQuery) -> None:
             if sub.end_at:
                 body_lines.append(f"Основная подписка: <b>до {fmt_dt(sub.end_at)}</b>")
             body_lines.append(f"Автосчёт семьи: <b>{'включён' if bool(getattr(grp, 'billing_opt_in', False)) else 'выключен'}</b>")
-            body = "\\n".join(body_lines) + "\\n\\n"
+            body = "\n".join(body_lines) + "\n\n"
 
         note = ""
         if not owner_active:
@@ -3463,7 +3463,7 @@ def _family_buy_counter_kb(current: int) -> InlineKeyboardMarkup:
     )
 
 
-def _family_buy_kb(current: int) -> InlineKeyboardMarkup:
+def _family_buy_kb(current: int = 1) -> InlineKeyboardMarkup:
     return _family_buy_counter_kb(current)
 
 
@@ -3509,11 +3509,19 @@ async def on_family_buy(cb: CallbackQuery) -> None:
             await cb.answer("Сначала продлите свою подписку.", show_alert=True)
             return
         price = await _get_family_seat_price(session, tg_id)
+    async with session_scope() as session:
+        grp = await _get_or_create_family_group(session, tg_id)
+        current_total = int(grp.seats_total or 0)
+        max_add = max(1, FAMILY_MAX_SEATS - current_total)
+        target = int(await get_app_setting_int(session, f"family_buy_target:{tg_id}", default=1) or 1)
+        target = max(1, min(max_add, target))
+        await set_app_setting_int(session, f"family_buy_target:{tg_id}", target)
+        await session.commit()
     await cb.message.edit_text(
         "👨‍👩‍👧‍👦 <b>Купить семейные места</b>\n\n"
         f"Цена: <b>{price} ₽</b> за 1 место в месяц.\n"
         "Выберите, сколько новых мест хотите добавить.",
-        reply_markup=_family_buy_kb(),
+        reply_markup=_family_buy_kb(target),
         parse_mode="HTML",
     )
     await _safe_cb_answer(cb)
