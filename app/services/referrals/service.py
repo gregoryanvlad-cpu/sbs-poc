@@ -288,14 +288,17 @@ class ReferralService:
         await session.flush()
         return user.ref_code
 
-    async def attach_pending_referrer(self, session, *, referred_tg_id: int, ref_code: str) -> None:
-        """Save referral click (pending) if this user wasn't referred before."""
+    async def attach_pending_referrer(self, session, *, referred_tg_id: int, ref_code: str) -> int | None:
+        """Save referral click (pending) if this user wasn't referred before.
+
+        Returns referrer_tg_id when a new pending referrer was attached, otherwise None.
+        """
         if not ref_code:
-            return
+            return None
 
         referrer = await session.scalar(select(User).where(User.ref_code == ref_code).limit(1))
         if not referrer or int(referrer.tg_id) == int(referred_tg_id):
-            return
+            return None
 
         user = await session.get(User, int(referred_tg_id))
         if not user:
@@ -305,11 +308,12 @@ class ReferralService:
 
         # do not overwrite
         if user.referred_by_tg_id:
-            return
+            return None
 
         user.referred_by_tg_id = int(referrer.tg_id)
         user.referred_at = _utcnow()
         await session.flush()
+        return int(referrer.tg_id)
 
     # =====================================================
     # ADMIN-ONLY: FORCE REASSIGN REFERRAL OWNER
