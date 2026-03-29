@@ -435,21 +435,14 @@ async def run_scheduler() -> None:
 
 
 async def _job_family_group_expiring_notifications(bot: Bot) -> None:
-    """Warn owners 3/2/1 days before family group (VPN seats) expires."""
+    """Warn owners about the nearest expiring paid family place."""
     now = _utcnow()
     now_local = now.astimezone(AMSTERDAM_TZ)
     if now_local.hour < 19:
         return
 
     async with session_scope() as session:
-        q = (
-            select(FamilyVpnGroup)
-            .where(FamilyVpnGroup.seats_total > 0)
-            .where(FamilyVpnGroup.active_until.is_not(None))
-            .where(FamilyVpnGroup.active_until > now)
-            .limit(2000)
-        )
-        groups = list((await session.execute(q)).scalars().all())
+        groups = list((await session.execute(select(FamilyVpnGroup).where(FamilyVpnGroup.seats_total > 0).limit(2000))).scalars().all())
         if not groups:
             return
 
@@ -457,39 +450,51 @@ async def _job_family_group_expiring_notifications(bot: Bot) -> None:
 
         for g in groups:
             owner = int(g.owner_tg_id)
-            # Only meaningful if owner has an active subscription (otherwise they can't manage).
+            if not bool(getattr(g, 'billing_opt_in', False)):
+                continue
             sub = await session.scalar(select(Subscription).where(Subscription.tg_id == owner).limit(1))
             if not sub or not sub.end_at or _ensure_tz(sub.end_at) <= now:
                 continue
-
-            end_at = _ensure_tz(g.active_until)
-            days_left = _days_until(end_at, now)
+            rows = list((await session.execute(
+                select(FamilyVpnProfile)
+                .where(FamilyVpnProfile.owner_tg_id == owner)
+                .order_by(FamilyVpnProfile.slot_no.asc())
+            )).scalars().all())
+            seats_total = int(g.seats_total or 0)
+            nearest_slot = None
+            nearest_end = None
+            for p in rows[:seats_total]:
+                end_at = _ensure_tz(getattr(p, 'expires_at', None)) if getattr(p, 'expires_at', None) else None
+                if not end_at or end_at <= now:
+                    continue
+                if nearest_end is None or end_at < nearest_end:
+                    nearest_end = end_at
+                    nearest_slot = int(p.slot_no or 0)
+            if nearest_end is None or nearest_slot is None:
+                continue
+            g.active_until = max((_ensure_tz(getattr(p, 'expires_at', None)) for p in rows[:seats_total] if getattr(p, 'expires_at', None) and _ensure_tz(getattr(p, 'expires_at', None)) > now), default=None)
+            days_left = _days_until(nearest_end, now)
             if days_left not in (3, 2, 1):
                 continue
-
-            sent_key = f"family_warn_{days_left}d_sent:{owner}:{end_at.date().isoformat()}"
+            sent_key = f"family_warn_{days_left}d_sent:{owner}:{nearest_slot}:{nearest_end.date().isoformat()}"
             if bool(await get_app_setting_int(session, sent_key, default=0)):
                 continue
-
             try:
                 await bot.send_message(
                     owner,
                     (
-                        f"⏳ Через <b>{days_left}</b> дн. закончится семейная группа VPN.\n\n"
-                        "Если не продлить — профили семейной группы перестанут работать."
+                        f"⏳ Через <b>{days_left}</b> дн. закончится семейное место <b>№{nearest_slot}</b>.\n\n"
+                        "Нажмите кнопку ниже, чтобы продлить места семейной группы."
                     ),
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
-                            [InlineKeyboardButton(text="💳 Продлить семейную группу", callback_data="family:renew")],
+                            [InlineKeyboardButton(text="💳 Продлить семейные места", callback_data="family:renew_menu")],
                             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
                         ]
                     ),
                 )
-                await set_app_setting_int(session, sent_key, 1)
-                changed = True
-            except Exception:
-                # even if blocked, we still mark as attempted to avoid spam loops
+            finally:
                 await set_app_setting_int(session, sent_key, 1)
                 changed = True
 
@@ -498,45 +503,42 @@ async def _job_family_group_expiring_notifications(bot: Bot) -> None:
 
 
 async def _job_expire_family_groups(bot: Bot) -> None:
-    """Handle family-group expiry with 24h grace, warning and final purge."""
+    """Disable expired family places individually without collapsing the whole family group."""
     now = _utcnow()
     async with session_scope() as session:
-        q = (
-            select(FamilyVpnGroup)
-            .where(FamilyVpnGroup.seats_total > 0)
-            .where(FamilyVpnGroup.active_until.is_not(None))
-            .where(FamilyVpnGroup.active_until <= now)
-            .limit(500)
-        )
-        groups = list((await session.execute(q)).scalars().all())
+        groups = list((await session.execute(select(FamilyVpnGroup).where(FamilyVpnGroup.seats_total > 0).limit(1000))).scalars().all())
         if not groups:
             return
-
         try:
             from app.services.vpn.service import vpn_service
         except Exception:
             vpn_service = None
 
         changed = False
-        notify_items: list[tuple[int, int]] = []
-        purge_notify: list[int] = []
+        notify_items: list[tuple[int, int, datetime]] = []
 
         for g in groups:
             owner = int(g.owner_tg_id)
-            grace_key = f"family_grace_started_ts:{owner}"
-            seats_key = f"family_grace_seats:{owner}"
-            grace_started = int(await get_app_setting_int(session, grace_key, default=0) or 0)
-
-            profs = list((await session.execute(
-                select(FamilyVpnProfile).where(FamilyVpnProfile.owner_tg_id == owner, FamilyVpnProfile.vpn_peer_id.is_not(None))
+            seats_total = int(g.seats_total or 0)
+            rows = list((await session.execute(
+                select(FamilyVpnProfile)
+                .where(FamilyVpnProfile.owner_tg_id == owner)
+                .order_by(FamilyVpnProfile.slot_no.asc())
             )).scalars().all())
-
-            if grace_started <= 0:
-                for p in profs:
-                    try:
-                        peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
-                        if not peer or not peer.is_active:
-                            continue
+            active_max = None
+            for p in rows[:seats_total]:
+                exp = getattr(p, 'expires_at', None)
+                if exp is not None:
+                    exp = _ensure_tz(exp)
+                if exp and exp > now:
+                    if active_max is None or exp > active_max:
+                        active_max = exp
+                    continue
+                if not p.vpn_peer_id:
+                    continue
+                try:
+                    peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
+                    if peer and peer.is_active:
                         if vpn_service:
                             try:
                                 await vpn_service.remove_peer_for_server(public_key=peer.client_public_key, server_code=(peer.server_code or '').upper() or None)
@@ -547,57 +549,38 @@ async def _job_expire_family_groups(bot: Bot) -> None:
                                     pass
                         peer.is_active = False
                         peer.revoked_at = now
-                        peer.rotation_reason = 'family_expired'
+                        peer.rotation_reason = f'family_slot_{int(p.slot_no or 0)}_expired'
                         changed = True
-                    except Exception:
-                        pass
-                await set_app_setting_int(session, grace_key, int(now.timestamp()))
-                await set_app_setting_int(session, seats_key, int(g.seats_total or 0))
-                notify_items.append((owner, int(g.seats_total or 0)))
-                changed = True
-                continue
-
-            if grace_started > 0 and (now.timestamp() - grace_started) >= 24 * 3600:
-                for p in profs:
-                    try:
-                        peer = await session.get(VpnPeer, int(p.vpn_peer_id or 0))
-                        if peer is not None:
-                            if vpn_service:
-                                try:
-                                    await vpn_service.remove_peer_for_server(public_key=peer.client_public_key, server_code=(peer.server_code or '').upper() or None)
-                                except Exception:
-                                    pass
-                            await session.delete(peer)
-                        p.vpn_peer_id = None
-                        changed = True
-                    except Exception:
-                        pass
-                await set_app_setting_int(session, grace_key, None)
-                await set_app_setting_int(session, seats_key, None)
-                g.seats_total = 0
-                purge_notify.append(owner)
-                changed = True
+                        if exp is not None:
+                            notify_items.append((owner, int(p.slot_no or 0), exp))
+                except Exception:
+                    pass
+            g.active_until = active_max
+            changed = True
 
         if changed:
             await session.commit()
 
-    for owner, seats in notify_items:
+    for owner, slot_no, exp in notify_items:
         try:
+            async with session_scope() as session:
+                sent_key = f"family_slot_expired_sent:{owner}:{slot_no}:{exp.date().isoformat()}"
+                if bool(await get_app_setting_int(session, sent_key, default=0)):
+                    continue
+                await set_app_setting_int(session, sent_key, 1)
+                await session.commit()
             await audit_send_message(
                 bot,
                 owner,
                 (
-                    '⚠️ Срок действия семейной группы закончился.\n\n'
-                    'Семейные конфиги уже отключены, но в течение <b>24 часов</b> их ещё можно восстановить без замены — '
-                    'достаточно оплатить продление.\n\n'
-                    f'Сейчас будет сохранено мест: <b>{seats}</b>.\n'
-                    'Если не оплатить в течение 24 часов, конфиги семейной группы будут удалены окончательно.'
+                    f"⛔️ Семейное место <b>№{slot_no}</b> истекло.\n\n"
+                    "Чтобы снова пользоваться этим профилем, продлите место в разделе семейной группы."
                 ),
-                kind='family_grace_started',
+                kind='family_slot_expired',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [InlineKeyboardButton(text='💳 Продлить семейную группу', callback_data='family:renew')],
+                        [InlineKeyboardButton(text='💳 Продлить места', callback_data='family:renew_menu')],
                         [InlineKeyboardButton(text='🏠 Главное меню', callback_data='nav:home')],
                     ]
                 ),
@@ -605,30 +588,7 @@ async def _job_expire_family_groups(bot: Bot) -> None:
         except Exception:
             pass
 
-    for owner in purge_notify:
-        try:
-            await audit_send_message(
-                bot,
-                owner,
-                '⛔️ 24 часа на продление семейной группы истекли. Старые семейные конфиги удалены окончательно.\n\nЕсли захотите вернуть семейную группу позже — будут выданы уже новые конфиги.',
-                kind='family_grace_purged',
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text='💳 Купить семейную группу заново', callback_data='family:seats')],
-                        [InlineKeyboardButton(text='🏠 Главное меню', callback_data='nav:home')],
-                    ]
-                ),
-            )
-        except Exception:
-            pass
 
-def _winback_kb(*, amount_rub: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить со скидкой", callback_data=f"pay:promo:{amount_rub}")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
-        ]
-    )
 
 
 async def _job_winback_discount_campaign(bot: Bot) -> None:
