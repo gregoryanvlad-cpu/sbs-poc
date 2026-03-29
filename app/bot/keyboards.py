@@ -165,6 +165,7 @@ def kb_admin_referrals_menu() -> InlineKeyboardMarkup:
     # (иначе будет "Update ... is not handled").
     b.button(text="👑 Забрать реферала себе", callback_data="admin:ref:take:self")
     b.button(text="🔁 Назначить реферала", callback_data="admin:ref:assign")
+    b.button(text="🧹 Сбросить реферала", callback_data="admin:ref:reset")
     b.button(text="🎯 Изменить % отчислений", callback_data="admin:ref:percent")
     b.button(text="🔍 Узнать владельца", callback_data="admin:ref:owner")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
