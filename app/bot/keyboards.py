@@ -24,9 +24,11 @@ def kb_back_home() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_cabinet(*, is_owner: bool = False) -> InlineKeyboardMarkup:
+def kb_cabinet(*, is_owner: bool = False, show_family_upsell: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💳 Продлить", callback_data="pay:buy:1m")
+    if show_family_upsell:
+        b.button(text="➕ Добавить место", callback_data="family:buy")
     b.button(text="👥 Рефералы", callback_data="nav:referrals")
     if is_owner:
         b.button(text="🛠 Админка", callback_data="admin:menu")
