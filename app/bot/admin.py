@@ -1366,6 +1366,7 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
             lines.append(
                 f"Семейная группа VPN: мест <b>{int(grp.seats_total)}</b> | профилей создано: <b>{int(prof_cnt or 0)}</b> | до: <b>{_fmt_dt_short(active_until)}</b>"
             )
+            lines.append(f"Автосчёт семьи: <b>{'да' if bool(getattr(grp, 'billing_opt_in', False)) else 'нет'}</b>")
         else:
             lines.append("Семейная группа VPN: —")
 
