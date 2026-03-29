@@ -166,18 +166,32 @@ class ReferralService:
     # WHO INVITED ME
     # =====================================================
 
-    async def get_inviter_tg_id(self, session, *, tg_id: int) -> int | None:
-        """Return inviter TG id if this user became an ACTIVE referral (after first payment)."""
+    async def get_current_referrer_tg_id(self, session, *, referred_tg_id: int) -> int | None:
+        """Return current referral owner for UI/admin.
+
+        Priority:
+        1) users.referred_by_tg_id (pending/current owner)
+        2) fallback to active Referral row for older data
+        """
+        referred_tg_id = int(referred_tg_id)
+        user = await session.get(User, referred_tg_id)
+        if user is not None and getattr(user, "referred_by_tg_id", None):
+            return int(user.referred_by_tg_id)
+
         inviter = await session.scalar(
             select(Referral.referrer_tg_id).where(
-                Referral.referred_tg_id == int(tg_id),
+                Referral.referred_tg_id == referred_tg_id,
                 Referral.status == "active",
             ).limit(1)
         )
         return int(inviter) if inviter is not None else None
 
+    async def get_inviter_tg_id(self, session, *, tg_id: int) -> int | None:
+        """Backward-compatible alias used in user-facing UI."""
+        return await self.get_current_referrer_tg_id(session, referred_tg_id=int(tg_id))
+
     async def get_my_referrer_label(self, session, *, tg_id: int) -> str:
-        inviter = await self.get_inviter_tg_id(session, tg_id=int(tg_id))
+        inviter = await self.get_current_referrer_tg_id(session, referred_tg_id=int(tg_id))
         return f"ID {inviter}" if inviter else "самостоятельно"
 
     # =====================================================
@@ -378,6 +392,39 @@ class ReferralService:
             ReferralEarning.__table__.update()
             .where(ReferralEarning.referred_tg_id == referred_tg_id)
             .values(referrer_tg_id=new_referrer_tg_id)
+        )
+
+        return True, int(prev) if prev is not None else None
+
+    async def admin_reset_referral(self, session, *, referred_tg_id: int) -> tuple[bool, int | None]:
+        """Reset current referral owner so the user becomes self-acquired.
+
+        Historical ReferralEarning rows are kept intact for accounting, but the
+        current linkage is removed and active Referral rows for this user are deleted.
+        Future payments will no longer be attributed to a referrer.
+        """
+        referred_tg_id = int(referred_tg_id)
+        if referred_tg_id <= 0:
+            return False, None
+
+        referred = await session.get(User, referred_tg_id)
+        if not referred:
+            referred = User(tg_id=referred_tg_id)
+            session.add(referred)
+            await session.flush()
+
+        prev = referred.referred_by_tg_id
+        if prev is None:
+            prev = await session.scalar(
+                select(Referral.referrer_tg_id).where(Referral.referred_tg_id == referred_tg_id).limit(1)
+            )
+
+        referred.referred_by_tg_id = None
+        referred.referred_at = None
+        await session.flush()
+
+        await session.execute(
+            Referral.__table__.delete().where(Referral.referred_tg_id == referred_tg_id)
         )
 
         return True, int(prev) if prev is not None else None
