@@ -5,6 +5,8 @@ from pathlib import Path
 
 from app.bot.keyboards import kb_main
 from app.db.session import session_scope
+from sqlalchemy import select, func
+from app.db.models import User, Payment, Subscription, Referral
 from app.repo import ensure_user, is_trial_available
 from app.services.referrals.service import referral_service
 
@@ -36,15 +38,27 @@ async def cmd_start(message: Message) -> None:
         )
 
         # Привязка по рефералке допустима только на самом первом входе.
-        # Если пользователь уже существовал в БД, не перезаписываем источник.
-        if existing_user is None and payload and payload.startswith("ref_"):
+        # Если пользователь уже существовал в БД, не назначаем реферера повторно.
+        if payload and payload.startswith("ref_"):
             code = payload.split("ref_", 1)[1].strip()
-            if code:
-                await referral_service.attach_pending_referrer(
-                    session,
-                    referred_tg_id=tg_id,
-                    ref_code=code,
-                )
+            if existing_user is None:
+                if code:
+                    await referral_service.attach_pending_referrer(
+                        session,
+                        referred_tg_id=tg_id,
+                        ref_code=code,
+                    )
+            else:
+                # Самовосстановление после старого бага: если зрелому пользователю
+                # ошибочно проставили pending-реферала, убираем только pending-метадату,
+                # не трогая уже оформленные referral-записи.
+                has_referral_row = bool(await session.scalar(select(Referral.referred_tg_id).where(Referral.referred_tg_id == int(tg_id)).limit(1)))
+                payments_cnt = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.tg_id == int(tg_id))) or 0)
+                has_sub = bool(await session.get(Subscription, int(tg_id)))
+                if getattr(existing_user, 'referred_by_tg_id', None) and not has_referral_row and (payments_cnt > 0 or has_sub):
+                    existing_user.referred_by_tg_id = None
+                    if hasattr(existing_user, 'referred_at'):
+                        existing_user.referred_at = None
 
         await referral_service.ensure_ref_code(session, tg_id)
         show_trial = await is_trial_available(session, tg_id)
