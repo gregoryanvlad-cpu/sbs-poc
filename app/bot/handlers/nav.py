@@ -78,7 +78,7 @@ async def _send_first_payment_family_upsell(bot: Bot, tg_id: int) -> None:
             int(tg_id),
             "➕ <b>Можно добавить ещё одно место</b>\n\n"
             "Если хотите подключить второе устройство или дать доступ мужу, жене или ребёнку — "
-            "добавьте ещё одно место в семейной группе. Это отдельный апселл без изменения вашей основной подписки.",
+            "добавьте ещё одно место в семейной группе.",
             kind="upsell_after_first_payment",
             reply_markup=_family_upsell_kb(),
             parse_mode="HTML",
