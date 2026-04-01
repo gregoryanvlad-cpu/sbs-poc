@@ -570,6 +570,7 @@ async def run_scheduler() -> None:
                 try:
                     await _job_reconcile_pending_platega_payments(bot)
                     await _job_expire_subscriptions(bot)
+                    await _job_finalize_pending_vpn_migrations(bot)
                     await _job_prune_wg_peers()
                     await _job_reconcile_vpn_server_state()
                     await _job_prune_regionvpn_clients()
@@ -969,56 +970,6 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         from app.repo import utcnow, deactivate_peers
         from app.db.models.vpn_peer import VpnPeer
         from app.services.vpn.service import VPNService
-
-        def _load_vpn_servers_for_scheduler() -> list[dict]:
-            """Load VPN servers from env without importing bot handlers.
-
-            This mirrors app/bot/handlers/nav.py::_load_vpn_servers so that
-            server_code mapping stays consistent.
-            """
-            import json
-            import os
-
-            servers_json = (os.environ.get("VPN_SERVERS_JSON") or "").strip()
-            servers: list[dict] = []
-            if servers_json:
-                try:
-                    v = json.loads(servers_json)
-                    if isinstance(v, list):
-                        servers = [x for x in v if isinstance(x, dict)]
-                except Exception:
-                    servers = []
-
-            if not servers:
-                pwd = os.environ.get("WG_SSH_PASSWORD")
-                if pwd is not None and pwd.strip() == "":
-                    pwd = None
-                servers = [
-                    {
-                        "code": os.environ.get("VPN_CODE", "NL"),
-                        "host": os.environ.get("WG_SSH_HOST"),
-                        "port": int(os.environ.get("WG_SSH_PORT", "22")),
-                        "user": os.environ.get("WG_SSH_USER"),
-                        "password": pwd,
-                        "interface": os.environ.get("VPN_INTERFACE", "wg0"),
-                    }
-                ]
-
-            out: list[dict] = []
-            for s in servers:
-                code = str(s.get("code") or "").upper() or "XX"
-                out.append(
-                    {
-                        "code": code,
-                        "host": s.get("host"),
-                        "port": int(s.get("port") or 22),
-                        "user": s.get("user"),
-                        "password": s.get("password"),
-                        "interface": str(s.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
-                    }
-                )
-            return out
-
         servers_by_code = {s.get("code"): s for s in _load_vpn_servers_for_scheduler()}
 
         # Best-effort: may fail if WG env vars are not configured.
