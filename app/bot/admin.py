@@ -2041,7 +2041,7 @@ async def _peer_delete_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboa
                 )
             ])
     kb_rows.append([InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{int(tg_id)}")])
-PLACEHOLDER
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_delete_menu:"))
