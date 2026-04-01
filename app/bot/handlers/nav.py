@@ -2568,32 +2568,7 @@ async def _start_vpn_migration_watch(
             # Trigger only when we observe a *new* handshake after watcher started.
             if hs and hs > hs0 and hs >= start_ts - 5:
                 # User has connected to the new location — disable old peers right away.
-                async with session_scope() as session:
-                    for old_srv, old_pub in old_peers:
-                        try:
-                            await vpn_service.remove_peer_for_server(
-                                public_key=old_pub,
-                                host=str(old_srv["host"]),
-                                port=int(old_srv.get("port") or 22),
-                                user=str(old_srv["user"]),
-                                password=old_srv.get("password"),
-                                interface=str(old_srv.get("interface") or "wg0"),
-                                tc_dev=str(old_srv.get("tc_dev") or old_srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
-                            )
-                        except Exception:
-                            pass
-
-                    # Mark old peer rows inactive in DB (best-effort)
-                    from app.db.models import VpnPeer
-                    q = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
-                    res = await session.execute(q)
-                    rows = list(res.scalars().all())
-                    for r in rows:
-                        if r.client_public_key != new_public_key:
-                            r.is_active = False
-                            r.revoked_at = utcnow()
-                            r.rotation_reason = "migrated"
-                    await session.commit()
+                await _finalize_pending_vpn_migration(tg_id=tg_id, new_peer_public_key=new_public_key)
 
                 try:
                     await bot.send_message(
@@ -2609,6 +2584,61 @@ async def _start_vpn_migration_watch(
             await asyncio.sleep(5)
 
     _VPN_MIGRATE_TASKS[tg_id] = asyncio.create_task(_run())
+
+
+async def _finalize_pending_vpn_migration(*, tg_id: int, new_peer_public_key: str) -> bool:
+    """Disable old peers marked as pending migration for this user.
+
+    Returns True when at least one old peer was disabled. Safe to call repeatedly.
+    """
+
+    if not new_peer_public_key:
+        return False
+
+    async with session_scope() as session:
+        q = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
+        res = await session.execute(q)
+        rows = list(res.scalars().all())
+        pending_old = [r for r in rows if r.client_public_key != new_peer_public_key and (r.rotation_reason or "") == "pending_migration"]
+        if not pending_old:
+            try:
+                await set_app_setting_int(session, f"vpn_migration_pending:{tg_id}", 0)
+                await set_app_setting_int(session, f"vpn_migration_target_peer:{tg_id}", None)
+                await set_app_setting_int(session, f"vpn_migration_started_ts:{tg_id}", None)
+                await session.commit()
+            except Exception:
+                pass
+            return False
+
+        servers = _load_vpn_servers()
+        servers_by_code = {str(s.get("code") or "").upper(): s for s in servers}
+
+        for r in pending_old:
+            code = (r.server_code or os.environ.get("VPN_CODE", "NL")).upper()
+            old_srv = servers_by_code.get(code)
+            if old_srv and _server_is_ready(old_srv):
+                try:
+                    await vpn_service.remove_peer_for_server(
+                        public_key=r.client_public_key,
+                        host=str(old_srv["host"]),
+                        port=int(old_srv.get("port") or 22),
+                        user=str(old_srv["user"]),
+                        password=old_srv.get("password"),
+                        interface=str(old_srv.get("interface") or "wg0"),
+                        tc_dev=str(old_srv.get("tc_dev") or old_srv.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+                    )
+                except Exception:
+                    pass
+
+            r.is_active = False
+            r.revoked_at = utcnow()
+            r.rotation_reason = "migrated"
+
+        await set_app_setting_int(session, f"vpn_migration_pending:{tg_id}", 0)
+        await set_app_setting_int(session, f"vpn_migration_target_peer:{tg_id}", None)
+        await set_app_setting_int(session, f"vpn_migration_started_ts:{tg_id}", None)
+        await session.commit()
+        return True
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("vpn:loc:sel:"))
@@ -2771,6 +2801,16 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
                 )
             except Exception:
                 pass
+            if old and peer.get("peer_id"):
+                q_pending = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
+                pending_rows = list((await session.execute(q_pending)).scalars().all())
+                for r in pending_rows:
+                    if r.id != int(peer.get("peer_id")) and (r.server_code or os.environ.get("VPN_CODE", "NL")).upper() != code:
+                        r.rotation_reason = "pending_migration"
+                await set_app_setting_int(session, f"vpn_migration_pending:{tg_id}", 1)
+                await set_app_setting_int(session, f"vpn_migration_target_peer:{tg_id}", int(peer.get("peer_id")))
+                await set_app_setting_int(session, f"vpn_migration_started_ts:{tg_id}", int(utcnow().timestamp()))
+
             await session.commit()
 
             filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, peer.get("peer_id"))
@@ -3126,6 +3166,16 @@ async def on_vpn_bundle(cb: CallbackQuery) -> None:
                 )
             except Exception:
                 pass
+            if old and peer.get("peer_id"):
+                q_pending = select(VpnPeer).where(VpnPeer.tg_id == tg_id, VpnPeer.is_active == True)  # noqa: E712
+                pending_rows = list((await session.execute(q_pending)).scalars().all())
+                for r in pending_rows:
+                    if r.id != int(peer.get("peer_id")) and (r.server_code or os.environ.get("VPN_CODE", "NL")).upper() != code:
+                        r.rotation_reason = "pending_migration"
+                await set_app_setting_int(session, f"vpn_migration_pending:{tg_id}", 1)
+                await set_app_setting_int(session, f"vpn_migration_target_peer:{tg_id}", int(peer.get("peer_id")))
+                await set_app_setting_int(session, f"vpn_migration_started_ts:{tg_id}", int(utcnow().timestamp()))
+
             await session.commit()
 
             filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, peer.get("peer_id"))
