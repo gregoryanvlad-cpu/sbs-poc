@@ -61,6 +61,32 @@ def _days_until(dt: datetime, now: datetime) -> int:
     return int((delta.total_seconds() + 86399) // 86400)
 
 
+def _load_vpn_servers_for_scheduler() -> list[dict]:
+    raw = (os.environ.get("VPN_SERVERS_JSON") or os.environ.get("VPN_SERVERS") or "").strip()
+    out: list[dict] = []
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and "servers" in data:
+                data = data["servers"]
+            if isinstance(data, list):
+                out = [x for x in data if isinstance(x, dict)]
+        except Exception:
+            out = []
+    if out:
+        return out
+    code = (os.environ.get("VPN_CODE") or "NL").upper()
+    return [{
+        "code": code,
+        "name": os.environ.get("VPN_NAME") or code,
+        "host": os.environ.get("WG_SSH_HOST"),
+        "port": int(os.environ.get("WG_SSH_PORT", "22") or 22),
+        "user": os.environ.get("WG_SSH_USER"),
+        "password": os.environ.get("WG_SSH_PASSWORD"),
+        "interface": os.environ.get("VPN_INTERFACE", "wg0"),
+    }]
+
+
 def _trial_activation_kb(day_no: int) -> InlineKeyboardMarkup:
     if int(day_no) == 1:
         return InlineKeyboardMarkup(
