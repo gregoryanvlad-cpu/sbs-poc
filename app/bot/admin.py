@@ -2066,9 +2066,9 @@ async def admin_user_peer_delete_confirm(cb: CallbackQuery) -> None:
         return
     await cb.answer()
     try:
-        _, _, _, _, tg_id_s, peer_id_s = (cb.data or "").split(":", 5)
-        tg_id = int(tg_id_s)
-        peer_id = int(peer_id_s)
+        parts = (cb.data or "").split(":")
+        tg_id = int(parts[-2])
+        peer_id = int(parts[-1])
     except Exception:
         return
     async with session_scope() as session:
@@ -2107,9 +2107,9 @@ async def admin_user_peer_delete_apply(cb: CallbackQuery) -> None:
         return
     await cb.answer("Удаляю peer…")
     try:
-        _, _, _, _, tg_id_s, peer_id_s = (cb.data or "").split(":", 5)
-        tg_id = int(tg_id_s)
-        peer_id = int(peer_id_s)
+        parts = (cb.data or "").split(":")
+        tg_id = int(parts[-2])
+        peer_id = int(parts[-1])
     except Exception:
         return
     remote_removed = None
