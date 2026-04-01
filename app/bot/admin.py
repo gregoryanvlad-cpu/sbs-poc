@@ -2140,7 +2140,7 @@ async def admin_user_peer_delete_apply(cb: CallbackQuery) -> None:
         await session.commit()
 
     remote_txt = "удалён с сервера" if remote_removed else "с сервера удалён best-effort"
-    text = (
+    summary_text = (
         f"✅ <b>{html.escape(peer_descr)} удалён</b>\n"
         f"Пользователь: <code>{tg_id}</code>\n"
         f"Удаление из БД выполнено, {remote_txt}."
@@ -2149,7 +2149,7 @@ async def admin_user_peer_delete_apply(cb: CallbackQuery) -> None:
         [InlineKeyboardButton(text="🗑 Удалить ещё peer", callback_data=f"admin:user:peer_delete_menu:{tg_id}")],
         [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
     ])
-    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await cb.message.edit_text(summary_text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:gift_revoke:"))
 async def admin_user_gift_revoke_menu(cb: CallbackQuery) -> None:
