@@ -484,6 +484,103 @@ def _is_main_success_payment(pay: Payment) -> bool:
     )
 
 
+def _clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _safe_div(n: float, d: float) -> float:
+    if not d:
+        return 0.0
+    return float(n) / float(d)
+
+
+def _forecast_sales_block(*, sales_last_30: int, revenue_last_30: int, sales_last_7: int, revenue_last_7: int,
+                          active_trial_using_now: int, hist_trial_conv: float, now: datetime) -> dict[str, object]:
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month_start = month_start + relativedelta(months=1)
+    next_next_month_start = next_month_start + relativedelta(months=1)
+    days_current_month = max(1, int((next_month_start - month_start).days))
+    days_next_month = max(1, int((next_next_month_start - next_month_start).days))
+
+    daily_sales_30 = _safe_div(sales_last_30, 30.0)
+    daily_sales_7 = _safe_div(sales_last_7, 7.0)
+    daily_rev_30 = _safe_div(revenue_last_30, 30.0)
+    daily_rev_7 = _safe_div(revenue_last_7, 7.0)
+    blended_daily_sales = (daily_sales_30 * 0.65) + (daily_sales_7 * 0.35)
+    blended_daily_revenue = (daily_rev_30 * 0.65) + (daily_rev_7 * 0.35)
+
+    pipeline_sales = int(round(active_trial_using_now * _clip(hist_trial_conv, 0.0, 1.0)))
+    trend_ratio = _safe_div(daily_sales_7, daily_sales_30) if daily_sales_30 > 0 else 1.0
+    next_month_growth = _clip(1.0 + ((trend_ratio - 1.0) * 0.45), 0.85, 1.20)
+
+    forecast_current_sales = int(round((blended_daily_sales * days_current_month) + pipeline_sales))
+    forecast_current_revenue = int(round((blended_daily_revenue * days_current_month) + (pipeline_sales * 224)))
+    forecast_next_sales = int(round((blended_daily_sales * days_next_month * next_month_growth)))
+    forecast_next_revenue = int(round((blended_daily_revenue * days_next_month * next_month_growth)))
+
+    forecast_next_sales_cons = int(round(forecast_next_sales * 0.85))
+    forecast_next_sales_real = int(round(forecast_next_sales))
+    forecast_next_sales_opt = int(round(forecast_next_sales * 1.15))
+    forecast_next_revenue_cons = int(round(forecast_next_revenue * 0.85))
+    forecast_next_revenue_real = int(round(forecast_next_revenue))
+    forecast_next_revenue_opt = int(round(forecast_next_revenue * 1.15))
+
+    return {
+        "month_start": month_start,
+        "next_month_start": next_month_start,
+        "days_current_month": days_current_month,
+        "days_next_month": days_next_month,
+        "daily_sales_30": daily_sales_30,
+        "daily_sales_7": daily_sales_7,
+        "daily_revenue_30": daily_rev_30,
+        "daily_revenue_7": daily_rev_7,
+        "blended_daily_sales": blended_daily_sales,
+        "blended_daily_revenue": blended_daily_revenue,
+        "trend_ratio": trend_ratio,
+        "pipeline_sales": pipeline_sales,
+        "forecast_current_sales": forecast_current_sales,
+        "forecast_current_revenue": forecast_current_revenue,
+        "forecast_next_sales_cons": forecast_next_sales_cons,
+        "forecast_next_sales_real": forecast_next_sales_real,
+        "forecast_next_sales_opt": forecast_next_sales_opt,
+        "forecast_next_revenue_cons": forecast_next_revenue_cons,
+        "forecast_next_revenue_real": forecast_next_revenue_real,
+        "forecast_next_revenue_opt": forecast_next_revenue_opt,
+    }
+
+
+def _ad_forecast_scenarios(avg_check_rub: int = 224) -> list[dict[str, object]]:
+    warm_niches = [
+        "мамские / женские",
+        "lifestyle / family",
+        "технологии / privacy / crypto",
+    ]
+    # Warm Telegram channels benchmark used for admin forecast.
+    base_cpm = 1400.0
+    ctr = 0.19
+    click_to_trial = 0.15
+    trial_to_paid = 0.30
+    paid_per_view = ctr * click_to_trial * trial_to_paid
+
+    scenarios: list[dict[str, object]] = []
+    for budget in (30000, 60000, 100000):
+        views = int(round((float(budget) / base_cpm) * 1000.0))
+        sales = int(round(views * paid_per_view))
+        revenue = int(round(sales * avg_check_rub))
+        profit = int(revenue - budget)
+        roi = (_safe_div(profit, budget) * 100.0) if budget > 0 else 0.0
+        scenarios.append({
+            "budget": budget,
+            "niches": ", ".join(warm_niches[:2] if budget == 30000 else warm_niches),
+            "views": views,
+            "sales": sales,
+            "revenue": revenue,
+            "profit": profit,
+            "roi": roi,
+        })
+    return scenarios
+
+
 async def _collect_full_bot_stats() -> dict[str, object]:
     now = _utcnow()
     window_start = now - timedelta(days=30)
@@ -500,20 +597,25 @@ async def _collect_full_bot_stats() -> dict[str, object]:
             or 0
         )
 
-        trial_keys = (
+        trial_rows = (
             await session.execute(
-                select(AppSetting.key).where(
-                    AppSetting.key.like("trial_used:%"),
-                    AppSetting.int_value == 1,
+                select(AppSetting.key, AppSetting.int_value).where(
+                    or_(AppSetting.key.like("trial_used:%"), AppSetting.key.like("trial_end_ts:%"))
                 )
             )
-        ).scalars().all()
+        ).all()
         trial_user_ids: set[int] = set()
-        for key in trial_keys:
+        trial_end_ts_by_user: dict[int, int] = {}
+        for key, int_value in trial_rows:
+            skey = str(key or "")
             try:
-                trial_user_ids.add(int(str(key).split(":", 1)[1]))
+                uid = int(skey.split(":", 1)[1])
             except Exception:
                 continue
+            if skey.startswith("trial_used:") and int(int_value or 0) == 1:
+                trial_user_ids.add(uid)
+            elif skey.startswith("trial_end_ts:") and int(int_value or 0) > 0:
+                trial_end_ts_by_user[uid] = int(int_value or 0)
         trial_periods = len(trial_user_ids)
 
         all_payments = (
@@ -521,6 +623,10 @@ async def _collect_full_bot_stats() -> dict[str, object]:
                 select(Payment).where(Payment.status == "success").order_by(Payment.tg_id.asc(), Payment.paid_at.asc(), Payment.id.asc())
             )
         ).scalars().all()
+
+        users_last_30 = int(
+            await session.scalar(select(func.count()).select_from(User).where(User.created_at >= window_start)) or 0
+        )
 
         message_rows = (
             await session.execute(
@@ -547,6 +653,12 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         except Exception:
             peers_total = int(await session.scalar(select(func.count()).select_from(VpnPeer).where(VpnPeer.is_active == True)) or 0)  # noqa: E712
 
+        active_peers = (
+            await session.execute(
+                select(VpnPeer.tg_id, VpnPeer.client_public_key).where(VpnPeer.is_active == True)  # noqa: E712
+            )
+        ).all()
+
     trial_to_paid_users: set[int] = set()
     active_paid_subscription_users = 0
     renewals_last_30_days = 0
@@ -556,6 +668,11 @@ async def _collect_full_bot_stats() -> dict[str, object]:
     upsell_99 = 0
     lte_99 = 0
     family_upsell_orders = 0
+    sales_last_30 = 0
+    revenue_last_30 = 0
+    sales_last_7 = 0
+    revenue_last_7 = 0
+    paid_users_all: set[int] = set()
 
     current_user_tg_id: int | None = None
     current_end: datetime | None = None
@@ -597,12 +714,19 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         if not _is_main_success_payment(pay):
             continue
 
+        paid_users_all.add(tg_id)
         if tg_id in trial_user_ids:
             trial_to_paid_users.add(tg_id)
         if amount == 199:
             pay_199 += 1
         if amount == 99:
             upsell_99 += 1
+        if paid_at >= window_start:
+            sales_last_30 += 1
+            revenue_last_30 += amount
+        if paid_at >= (now - timedelta(days=7)):
+            sales_last_7 += 1
+            revenue_last_7 += amount
         if paid_at >= window_start and had_prior_main_payment:
             renewals_last_30_days += 1
 
@@ -614,6 +738,45 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         had_prior_main_payment = True
 
     flush_user_state()
+
+    active_trial_users: set[int] = set()
+    for uid in trial_user_ids:
+        end_ts = int(trial_end_ts_by_user.get(uid, 0) or 0)
+        if end_ts <= 0:
+            continue
+        if datetime.fromtimestamp(end_ts, tz=timezone.utc) <= now:
+            continue
+        if uid in paid_users_all:
+            continue
+        active_trial_users.add(uid)
+
+    active_trial_using_now = 0
+    trial_public_keys: set[str] = set()
+    if active_trial_users:
+        for peer_uid, public_key in active_peers:
+            try:
+                if int(peer_uid) in active_trial_users and str(public_key or '').strip():
+                    trial_public_keys.add(str(public_key).strip())
+            except Exception:
+                continue
+    if trial_public_keys:
+        try:
+            recent_usage = await vpn_service.get_recent_peer_handshakes(window_seconds=86400)
+            active_trial_using_now = len({item.get("public_key") for item in recent_usage if str(item.get("public_key") or "") in trial_public_keys})
+        except Exception:
+            active_trial_using_now = 0
+
+    hist_trial_conv = _safe_div(len(trial_to_paid_users), trial_periods) if trial_periods > 0 else 0.0
+    forecast = _forecast_sales_block(
+        sales_last_30=sales_last_30,
+        revenue_last_30=revenue_last_30,
+        sales_last_7=sales_last_7,
+        revenue_last_7=revenue_last_7,
+        active_trial_using_now=active_trial_using_now,
+        hist_trial_conv=hist_trial_conv,
+        now=now,
+    )
+    ad_scenarios = _ad_forecast_scenarios(avg_check_rub=224)
 
     kinds_sent: dict[str, set[int]] = {}
     kinds_seen: dict[str, set[int]] = {}
@@ -631,6 +794,10 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         "peers_total": peers_total,
         "trial_periods": trial_periods,
         "trial_to_paid": len(trial_to_paid_users),
+        "active_trials_now": len(active_trial_users),
+        "active_trials_using_now": int(active_trial_using_now),
+        "active_trials_idle_now": max(0, int(len(active_trial_users) - int(active_trial_using_now))),
+        "hist_trial_conversion_percent": float(hist_trial_conv) * 100.0,
         "payments_199": pay_199,
         "upsells_99": upsell_99,
         "lte_99": lte_99,
@@ -650,6 +817,14 @@ async def _collect_full_bot_stats() -> dict[str, object]:
         "churn_count": churn_count,
         "churn_cohort": churn_cohort,
         "churn_percent": churn_percent,
+        "sales_last_30": sales_last_30,
+        "revenue_last_30": revenue_last_30,
+        "sales_last_7": sales_last_7,
+        "revenue_last_7": revenue_last_7,
+        "users_last_30": users_last_30,
+        "avg_new_users_per_day": _safe_div(users_last_30, 30.0),
+        "forecast": forecast,
+        "ad_scenarios": ad_scenarios,
         "window_start": window_start,
         "now": now,
     }
@@ -3181,32 +3356,70 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
         )
         return
 
-    text = f"""📈 <b>Полная статистика бота</b>
+    forecast = stats.get("forecast") or {}
+    ad_scenarios = list(stats.get("ad_scenarios") or [])
+    next_month_label = (forecast.get("next_month_start") or stats["now"]).strftime("%m.%Y")
+    ad_lines: list[str] = []
+    for item in ad_scenarios:
+        ad_lines.append(
+            f"• Бюджет <b>{int(item['budget'])} ₽</b> → ниши: <b>{html.escape(str(item['niches']))}</b>\n"
+            f"  Продажи: <b>{int(item['sales'])}</b> | Выручка: <b>{int(item['revenue'])} ₽</b> | Чистая прибыль: <b>{int(item['profit'])} ₽</b> | ROI: <b>{float(item['roi']):.1f}%</b>"
+        )
+    ad_block = "\n".join(ad_lines) if ad_lines else "—"
 
+    recommendation = "Закупать 60k ₽ в мамские / женские + lifestyle каналы 40–80k подписчиков" if ad_scenarios else "Держать органический рост и добивать активные trial"
+
+    text = f"""Прогноз продаж @sbsconnect_bot на следующий месяц
+
+📈 <b>Полная статистика бота</b>
+
+1. <b>Прогноз продаж на следующий месяц (без дополнительной рекламы)</b>
+Консервативный: <b>{int(forecast.get('forecast_next_sales_cons', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_cons', 0))} ₽</b>
+Реалистичный: <b>{int(forecast.get('forecast_next_sales_real', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_real', 0))} ₽</b>
+Оптимистичный: <b>{int(forecast.get('forecast_next_sales_opt', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_opt', 0))} ₽</b>
+Средний ежедневный приток новых пользователей: <b>{float(stats['avg_new_users_per_day']):.1f}</b>
+
+2. <b>Прогноз продаж на текущий месяц</b>
+Текущий месяц: <b>{int(forecast.get('forecast_current_sales', 0))}</b> продаж / <b>{int(forecast.get('forecast_current_revenue', 0))} ₽</b>
+Следующий месяц ({next_month_label}): <b>{int(forecast.get('forecast_next_sales_real', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_real', 0))} ₽</b>
+
+3. <b>Прогноз продаж на следующий месяц ПРИ ЗАКУПКЕ РЕКЛАМЫ</b>
+{ad_block}
+Рекомендация: <b>{html.escape(recommendation)}</b>
+
+4. <b>Срез по trial и продажам</b>
+🎁 Пробных периодов за всё время: <b>{int(stats['trial_periods'])}</b>
+⏳ Активных trial сейчас: <b>{int(stats['active_trials_now'])}</b>
+🟢 Реально пользуются trial сейчас (handshake ≤ 24ч): <b>{int(stats['active_trials_using_now'])}</b>
+😴 Взяли trial, но не пользуются сейчас: <b>{int(stats['active_trials_idle_now'])}</b>
+💳 Оформили подписку после trial: <b>{int(stats['trial_to_paid'])}</b>
+📊 Историческая trial → paid конверсия: <b>{float(stats['hist_trial_conversion_percent']):.1f}%</b>
+
+5. <b>Текущий операционный срез</b>
 👥 Всего пользователей: <b>{int(stats['total_users'])}</b>
 🚫 Отписались / заблокировали бота: <b>{int(stats['blocked_users'])}</b>
 🌐 Всего peer'ов на серверах: <b>{int(stats['peers_total'])}</b>
+🟢 Сейчас платящих пользователей: <b>{int(stats['active_paid_users'])}</b>
+🔁 Продлений за последние 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>
+📉 Churn за месяц: <b>{int(stats['churn_count'])}</b> / <b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)
 
-🎁 Пробных периодов: <b>{int(stats['trial_periods'])}</b>
-💳 Оформили подписку после триала: <b>{int(stats['trial_to_paid'])}</b>
-
+6. <b>Последние продажи и монетизация</b>
+30 дней: <b>{int(stats['sales_last_30'])}</b> продаж / <b>{int(stats['revenue_last_30'])} ₽</b>
+7 дней: <b>{int(stats['sales_last_7'])}</b> продаж / <b>{int(stats['revenue_last_7'])} ₽</b>
 💰 Оплат на 199 ₽: <b>{int(stats['payments_199'])}</b>
 📈 Апселлов на +99 ₽: <b>{int(stats['upsells_99'])}</b>
 📶 LTE-активаций на 99 ₽: <b>{int(stats['lte_99'])}</b>
 👨‍👩‍👧‍👦 Продаж семейного апселла: <b>{int(stats['family_upsell_orders'])}</b>
 
+7. <b>Коммуникации и рефералка</b>
 📨 D1 trial отправлено / прочитано: <b>{int(stats['trial_d1_sent'])}</b> / <b>{int(stats['trial_d1_seen'])}</b>
 📨 D2 trial отправлено / прочитано: <b>{int(stats['trial_d2_sent'])}</b> / <b>{int(stats['trial_d2_seen'])}</b>
 📨 Апселл после оплаты: <b>{int(stats['upsell_after_pay_sent'])}</b>
-👥 Рефка: переход / регистрация / оплата: <b>{int(stats['referral_link_opened'])}</b> / <b>{int(stats['referral_registered'])}</b> / <b>{int(stats['referral_paid'])}</b>
+👥 Рефка: старт / оплата: <b>{int(stats['referral_link_opened'])}</b> / <b>{int(stats['referral_paid'])}</b>
 💸 Рефка: начисление / выход из холда: <b>{int(stats['referral_earning_created'])}</b> / <b>{int(stats['referral_hold_released'])}</b>
 
-🟢 Сейчас платящих пользователей: <b>{int(stats['active_paid_users'])}</b>
-🔁 Продлений за последние 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>
-📉 Churn за месяц: <b>{int(stats['churn_count'])}</b> / <b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)
-
-<i>Churn считается по платящим пользователям, у которых платная подписка была активна на {stats['window_start'].strftime('%d.%m.%Y')} и не активна сейчас.</i>
-<i>«Отписались» — это пользователи, для которых бот получил Telegram FORBIDDEN при отправке сообщения.</i>"""
+<i>Модель без рекламы строится по последним 30 и 7 дням продаж + текущему pipeline активных trial.</i>
+<i>Рекламные сценарии считают тёплые ниши: мамские, женские, lifestyle, технологии/privacy. Новостные и военные каналы исключены.</i>"""
 
     try:
         await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
