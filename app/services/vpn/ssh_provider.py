@@ -119,6 +119,7 @@ class WireGuardSSHProvider:
         except Exception:
             log.warning("wg_quick_save_failed interface=%s", self.interface)
 
+
     async def _update_persisted_peer(self, public_key: str, client_ip: str | None) -> None:
         """Persist peer changes directly into /etc/wireguard/<iface>.conf.
 
@@ -134,8 +135,7 @@ class WireGuardSSHProvider:
                 }
             ).encode("utf-8")
         ).decode("ascii")
-        script_template = r'''
-from pathlib import Path
+        script_template = r'''from pathlib import Path
 import base64
 import json
 
@@ -148,11 +148,11 @@ if client_ip is not None:
 
 path = Path(f"/etc/wireguard/{iface}.conf")
 try:
-    text = path.read_text()
+    current_text = path.read_text()
 except FileNotFoundError:
-    text = ""
+    current_text = ""
 
-parts = text.split("[Peer]")
+parts = current_text.split("[Peer]")
 head = parts[0]
 peer_blocks = parts[1:]
 keep = []
@@ -168,7 +168,7 @@ for raw in peer_blocks:
             break
     if block_key == public_key:
         continue
-    keep.append("[Peer]\n" + "\n".join(lines))
+    keep.append("[Peer]\n" + \"\n".join(lines))
 
 result = head.rstrip() + "\n\n"
 if keep:
@@ -180,8 +180,10 @@ if client_ip:
 path.write_text(result.rstrip() + "\n")
 '''
         script = dedent(script_template).replace('__PAYLOAD__', repr(payload))
-        cmd = 'python3 - <<"PY"\n' + script + 'PY'
+        script_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        cmd = f"python3 -c 'import base64; exec(base64.b64decode(\"{script_b64}\").decode(\"utf-8\"))'"
         await self._run(cmd)
+
     async def _get_peer_ip_by_public_key(self, public_key: str) -> str | None:
         if not public_key:
             return None
