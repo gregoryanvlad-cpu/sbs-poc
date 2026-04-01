@@ -134,57 +134,54 @@ class WireGuardSSHProvider:
                 }
             ).encode("utf-8")
         ).decode("ascii")
-        script = dedent(
-            f"""            from pathlib import Path
-            import base64
-            import json
+        script_template = r'''
+from pathlib import Path
+import base64
+import json
 
-            payload = json.loads(base64.b64decode({payload!r}).decode('utf-8'))
-            iface = str(payload.get('iface') or 'wg0').strip() or 'wg0'
-            public_key = str(payload.get('public_key') or '').strip()
-            client_ip = payload.get('client_ip')
-            if client_ip is not None:
-                client_ip = str(client_ip).strip()
+payload = json.loads(base64.b64decode(__PAYLOAD__).decode("utf-8"))
+iface = str(payload.get("iface") or "wg0").strip() or "wg0"
+public_key = str(payload.get("public_key") or "").strip()
+client_ip = payload.get("client_ip")
+if client_ip is not None:
+    client_ip = str(client_ip).strip()
 
-            path = Path(f'/etc/wireguard/{{iface}}.conf')
-            try:
-                text = path.read_text()
-            except FileNotFoundError:
-                text = ''
+path = Path(f"/etc/wireguard/{iface}.conf")
+try:
+    text = path.read_text()
+except FileNotFoundError:
+    text = ""
 
-            parts = text.split('[Peer]')
-            head = parts[0]
-            peer_blocks = parts[1:]
-            keep = []
-            for raw in peer_blocks:
-                block = raw.strip()
-                if not block:
-                    continue
-                lines = [ln.rstrip() for ln in block.splitlines()]
-                block_key = None
-                for ln in lines:
-                    if ln.strip().startswith('PublicKey') and '=' in ln:
-                        block_key = ln.split('=', 1)[1].strip()
-                        break
-                if block_key == public_key:
-                    continue
-                keep.append('[Peer]\n' + '\n'.join(lines))
+parts = text.split("[Peer]")
+head = parts[0]
+peer_blocks = parts[1:]
+keep = []
+for raw in peer_blocks:
+    block = raw.strip()
+    if not block:
+        continue
+    lines = [ln.rstrip() for ln in block.splitlines()]
+    block_key = None
+    for ln in lines:
+        if ln.strip().startswith("PublicKey") and "=" in ln:
+            block_key = ln.split("=", 1)[1].strip()
+            break
+    if block_key == public_key:
+        continue
+    keep.append("[Peer]\n" + "\n".join(lines))
 
-            result = head.rstrip() + '\n\n'
-            if keep:
-                result += '\n\n'.join(keep).rstrip() + '\n'
-            if client_ip:
-                block = f'[Peer]\nPublicKey = {{public_key}}\nAllowedIPs = {{client_ip}}/32\n'
-                result = result.rstrip() + '\n\n' + block
+result = head.rstrip() + "\n\n"
+if keep:
+    result += "\n\n".join(keep).rstrip() + "\n"
+if client_ip:
+    block = f"[Peer]\nPublicKey = {public_key}\nAllowedIPs = {client_ip}/32\n"
+    result = result.rstrip() + "\n\n" + block
 
-            path.write_text(result.rstrip() + '\n')
-            """
-        )
-        cmd = f"""python3 - <<"PY"
-{script}
-PY"""
+path.write_text(result.rstrip() + "\n")
+'''
+        script = dedent(script_template).replace('__PAYLOAD__', repr(payload))
+        cmd = 'python3 - <<"PY"\n' + script + 'PY'
         await self._run(cmd)
-
     async def _get_peer_ip_by_public_key(self, public_key: str) -> str | None:
         if not public_key:
             return None
