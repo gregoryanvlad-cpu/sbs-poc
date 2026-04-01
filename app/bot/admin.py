@@ -1398,6 +1398,7 @@ def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🗓 Изменить дату окончания", callback_data=f"admin:user:set_end_at:{tg_id}"),
             ],
             [InlineKeyboardButton(text="💰 Цена места семьи", callback_data=f"admin:user:set_family_price:{tg_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить peer", callback_data=f"admin:user:peer_delete_menu:{tg_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
     )
@@ -2007,6 +2008,148 @@ async def _gift_revoke_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboa
     kb_rows.append([InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
+
+
+
+async def _peer_delete_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    peers = list(
+        (
+            await session.execute(
+                select(VpnPeer)
+                .where(VpnPeer.tg_id == int(tg_id))
+                .order_by(VpnPeer.is_active.desc(), VpnPeer.id.desc())
+                .limit(20)
+            )
+        ).scalars().all()
+    )
+    lines = ["🗑 <b>Удаление peer</b>", f"Пользователь: <code>{int(tg_id)}</code>"]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if not peers:
+        lines.extend(["", "У пользователя нет peer'ов."])
+    else:
+        lines.append("")
+        lines.append("Выберите peer для удаления:")
+        for peer in peers:
+            status = "✅" if bool(getattr(peer, 'is_active', False)) else "⛔️"
+            server = html.escape(str(getattr(peer, 'server_name', '') or getattr(peer, 'server_code', '') or '—'))
+            vpn_ip = html.escape(str(getattr(peer, 'assigned_ip', '') or '—'))
+            label = f"{status} peer#{int(peer.id)} | {server} | {vpn_ip}"
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=label[:64],
+                    callback_data=f"admin:user:peer_delete_confirm:{int(tg_id)}:{int(peer.id)}",
+                )
+            ])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{int(tg_id)}")])
+PLACEHOLDER
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_delete_menu:"))
+async def admin_user_peer_delete_menu(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        return
+    async with session_scope() as session:
+        text, kb = await _peer_delete_menu_text(session, tg_id)
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_delete_confirm:"))
+async def admin_user_peer_delete_confirm(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        _, _, _, _, tg_id_s, peer_id_s = (cb.data or "").split(":", 5)
+        tg_id = int(tg_id_s)
+        peer_id = int(peer_id_s)
+    except Exception:
+        return
+    async with session_scope() as session:
+        peer = await session.get(VpnPeer, peer_id)
+        if not peer or int(getattr(peer, 'tg_id', 0) or 0) != tg_id:
+            await cb.message.edit_text(
+                "❌ Peer не найден.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")]]),
+                parse_mode="HTML",
+            )
+            return
+        server = html.escape(str(getattr(peer, 'server_name', '') or getattr(peer, 'server_code', '') or '—'))
+        vpn_ip = html.escape(str(getattr(peer, 'assigned_ip', '') or '—'))
+        pub = html.escape(str(getattr(peer, 'client_public_key', '') or '—'))
+        text = (
+            "⚠️ <b>Подтверждение удаления peer</b>\n"
+            f"Пользователь: <code>{tg_id}</code>\n"
+            f"Peer: <b>#{peer_id}</b>\n"
+            f"Сервер: <b>{server}</b>\n"
+            f"VPN-IP: <b>{vpn_ip}</b>\n"
+            f"Public key: <code>{pub[:32]}…</code>\n\n"
+            "Peer будет удалён из базы и, по возможности, с VPN-сервера. Это действие необратимо."
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Удалить peer", callback_data=f"admin:user:peer_delete_apply:{tg_id}:{peer_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=f"admin:user:peer_delete_menu:{tg_id}")],
+        [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+    ])
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_delete_apply:"))
+async def admin_user_peer_delete_apply(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer("Удаляю peer…")
+    try:
+        _, _, _, _, tg_id_s, peer_id_s = (cb.data or "").split(":", 5)
+        tg_id = int(tg_id_s)
+        peer_id = int(peer_id_s)
+    except Exception:
+        return
+    remote_removed = None
+    peer_descr = f"peer#{peer_id}"
+    async with session_scope() as session:
+        peer = await session.get(VpnPeer, peer_id)
+        if not peer or int(getattr(peer, 'tg_id', 0) or 0) != tg_id:
+            await cb.message.edit_text(
+                "❌ Peer не найден или уже удалён.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")]]),
+                parse_mode="HTML",
+            )
+            return
+        peer_descr = f"peer#{peer_id}"
+        try:
+            remote_removed = await vpn_service.remove_peer_for_server(
+                str(getattr(peer, 'client_public_key', '') or ''),
+                server_code=getattr(peer, 'server_code', None),
+            )
+        except Exception:
+            log.exception("admin_user_peer_delete_remote_failed tg_id=%s peer_id=%s", tg_id, peer_id)
+            remote_removed = False
+        await session.execute(
+            text("UPDATE family_vpn_profiles SET vpn_peer_id = NULL WHERE vpn_peer_id = :peer_id"),
+            {"peer_id": peer_id},
+        )
+        await session.delete(peer)
+        await session.commit()
+
+    remote_txt = "удалён с сервера" if remote_removed else "с сервера удалён best-effort"
+    text = (
+        f"✅ <b>{html.escape(peer_descr)} удалён</b>\n"
+        f"Пользователь: <code>{tg_id}</code>\n"
+        f"Удаление из БД выполнено, {remote_txt}."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить ещё peer", callback_data=f"admin:user:peer_delete_menu:{tg_id}")],
+        [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+    ])
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:gift_revoke:"))
 async def admin_user_gift_revoke_menu(cb: CallbackQuery) -> None:
