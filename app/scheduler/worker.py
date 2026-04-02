@@ -61,7 +61,7 @@ def _days_until(dt: datetime, now: datetime) -> int:
     return int((delta.total_seconds() + 86399) // 86400)
 
 
-def _load_vpn_servers_for_scheduler() -> list[dict]:
+def _get_scheduler_vpn_servers() -> list[dict]:
     raw = (os.environ.get("VPN_SERVERS_JSON") or os.environ.get("VPN_SERVERS") or "").strip()
     out: list[dict] = []
     if raw:
@@ -75,6 +75,37 @@ def _load_vpn_servers_for_scheduler() -> list[dict]:
             out = []
     if out:
         return out
+    code = (os.environ.get("VPN_CODE") or "NL").upper()
+    return [{
+        "code": code,
+        "name": os.environ.get("VPN_NAME") or code,
+        "host": os.environ.get("WG_SSH_HOST"),
+        "port": int(os.environ.get("WG_SSH_PORT", "22") or 22),
+        "user": os.environ.get("WG_SSH_USER"),
+        "password": os.environ.get("WG_SSH_PASSWORD"),
+        "interface": os.environ.get("VPN_INTERFACE", "wg0"),
+    }]
+
+
+def _get_scheduler_vpn_servers() -> list[dict]:
+    loader = globals().get("_load_vpn_servers_for_scheduler")
+    if callable(loader):
+        try:
+            data = loader()
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    raw = (os.environ.get("VPN_SERVERS_JSON") or os.environ.get("VPN_SERVERS") or "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and "servers" in data:
+                data = data["servers"]
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict)]
+        except Exception:
+            pass
     code = (os.environ.get("VPN_CODE") or "NL").upper()
     return [{
         "code": code,
@@ -998,7 +1029,7 @@ async def _job_expire_subscriptions(bot: Bot) -> None:
         from app.repo import utcnow, deactivate_peers
         from app.db.models.vpn_peer import VpnPeer
         from app.services.vpn.service import VPNService
-        servers_by_code = {s.get("code"): s for s in _load_vpn_servers_for_scheduler()}
+        servers_by_code = {s.get("code"): s for s in _get_scheduler_vpn_servers()}
 
         # Best-effort: may fail if WG env vars are not configured.
         try:
