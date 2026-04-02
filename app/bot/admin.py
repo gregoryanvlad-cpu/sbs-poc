@@ -3004,8 +3004,10 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
 
     # Notify user (best-effort)
     notify_text = (
-        "🎁 <b>Подарок!</b>\n\n"
-        "Администратор подарил вам подписку на наш сервис, приятного пользования!"
+        "🎁 <b>Подарок от администрации</b>\n\n"
+        f"Администрация проекта подарила вам подписку на <b>{months}</b> мес.\n"
+        f"Новая дата окончания: <b>{new_end.astimezone(AMSTERDAM_TZ).strftime('%Y-%m-%d %H:%M')}</b>\n\n"
+        "Приятного пользования!"
     )
     try:
         await audit_send_message(message.bot, target_tg_id, notify_text, kind="admin_gift", reply_markup=None)
@@ -3089,39 +3091,83 @@ async def admin_sub_gift_days_finish(message: Message, state: FSMContext) -> Non
             rows = await session.execute(select(User.tg_id))
             target_ids = [int(x) for x in rows.scalars().all()]
 
+        target_ids = sorted({int(x) for x in target_ids if int(x) > 0})
         touched = 0
         activated = 0
+        restored_peers = 0
+        new_end_by_tg: dict[int, datetime] = {}
+
         for tg_id in target_ids:
             sub = await session.get(Subscription, tg_id)
             if not sub:
                 sub = await get_subscription(session, tg_id)
 
             was_active = bool(sub.is_active and sub.end_at and sub.end_at > now)
-            base = sub.end_at if sub.end_at and sub.end_at > now else now
-            sub.end_at = base + timedelta(days=days)
-            if not sub.start_at:
-                sub.start_at = now
-            sub.is_active = True
-            sub.status = "active"
+            await extend_subscription(
+                session,
+                tg_id,
+                period_days=days,
+                amount_rub=0,
+                provider="gift",
+                status="success",
+                provider_payment_id=f"gift_days:{mode}:{message.from_user.id}:{tg_id}:{days}:{int(now.timestamp())}",
+            )
+            sub = await session.get(Subscription, tg_id)
             touched += 1
             if not was_active:
                 activated += 1
+            if sub and sub.end_at:
+                new_end_by_tg[tg_id] = sub.end_at
+
+            try:
+                from app.services.vpn.service import vpn_service
+                restored = await vpn_service.restore_expired_peers(session, tg_id, grace_hours=72)
+                if restored:
+                    restored_peers += int(restored)
+            except Exception:
+                pass
 
         await session.commit()
 
+    notified = 0
+    mode_label = "активным пользователям" if mode == "active" else "всем пользователям"
+    for tg_id in target_ids:
+        end_at = new_end_by_tg.get(tg_id)
+        if not end_at:
+            continue
+        try:
+            await audit_send_message(
+                message.bot,
+                tg_id,
+                (
+                    "🎁 <b>Подарок от администрации</b>\n\n"
+                    f"Администрация проекта подарила вам <b>{days}</b> дн. подписки.\n"
+                    f"Новая дата окончания: <b>{end_at.astimezone(AMSTERDAM_TZ).strftime('%Y-%m-%d %H:%M')}</b>\n\n"
+                    "Приятного пользования!"
+                ),
+                kind="admin_gift_days",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
+                ),
+            )
+            notified += 1
+        except Exception:
+            pass
+
     await state.clear()
 
-    mode_label = "активным пользователям" if mode == "active" else "всем пользователям"
     await message.answer(
         "✅ Дни подарены.\n\n"
         f"Кому: <b>{mode_label}</b>\n"
         f"Дней: <b>{days}</b>\n"
         f"Обработано пользователей: <b>{touched}</b>\n"
-        f"Продлено подписок: <b>{touched}</b>\n"
-        f"Из них были неактивны и стали активны: <b>{activated}</b>",
+        f"Из них были неактивны и стали активны: <b>{activated}</b>\n"
+        f"Восстановлено WG peer (best-effort): <b>{restored_peers}</b>\n"
+        f"Уведомлений отправлено: <b>{notified}</b>",
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+
 
 @router.callback_query(lambda c: c.data == "admin:broadcast:all")
 async def admin_broadcast_all_start(cb: CallbackQuery, state: FSMContext) -> None:
