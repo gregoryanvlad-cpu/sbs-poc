@@ -301,6 +301,67 @@ class VPNService:
                 return s
         raise RuntimeError("All VPN servers are full")
 
+    def _server_to_peer_meta(self, server: dict, *, server_code: str) -> dict[str, Any]:
+        return {
+            "server_code": str(server_code).upper(),
+            "server_public_key": str(server.get("server_public_key") or self.server_pub),
+            "endpoint": str(server.get("endpoint") or self.endpoint),
+            "dns": str(server.get("dns") or self.dns),
+            "host": str(server.get("host") or ""),
+            "port": int(server.get("port") or 22),
+            "user": str(server.get("user") or ""),
+            "password": server.get("password"),
+            "interface": str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            "tc_dev": str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+        }
+
+    async def _create_peer_on_server(self, session: AsyncSession, *, tg_id: int, client_ip: str, client_priv: str, client_pub: str, server: dict) -> Dict[str, Any]:
+        server_code = str(server.get("code") or self._default_server_code()).upper()
+        provider = self._provider_for(
+            host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
+            port=int(server.get("port") or 22),
+            user=str(server.get("user") or os.environ.get("WG_SSH_USER") or ""),
+            password=server.get("password"),
+            interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
+            tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
+            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
+        )
+        log.info("vpn_create_peer_attempt tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
+        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
+        row = VpnPeer(
+            tg_id=tg_id,
+            client_public_key=client_pub,
+            client_private_key_enc=crypto.encrypt(client_priv),
+            client_ip=client_ip,
+            server_code=server_code,
+            is_active=True,
+            revoked_at=None,
+            rotation_reason=None,
+        )
+        session.add(row)
+        await session.flush()
+        meta = self._server_to_peer_meta(server, server_code=server_code)
+        return {
+            "peer_id": row.id,
+            "tg_id": tg_id,
+            "client_ip": client_ip,
+            "public_key": client_pub,
+            "client_private_key_enc": row.client_private_key_enc,
+            "client_private_key_plain": client_priv,
+            **meta,
+        }
+
+    async def _candidate_servers_for_code(self, session: AsyncSession, preferred_code: str | None = None) -> list[dict]:
+        servers = await self._enabled_servers(session)
+        if not servers:
+            raise RuntimeError("No VPN servers configured")
+        if not preferred_code:
+            return servers
+        preferred_code = str(preferred_code).upper()
+        exact = [s for s in servers if str(s.get("code") or "").upper() == preferred_code]
+        rest = [s for s in servers if str(s.get("code") or "").upper() != preferred_code]
+        return exact + rest
+
     async def create_extra_peer(self, session: AsyncSession, tg_id: int, *, prefer_current_server: bool = True) -> Dict[str, Any]:
         """Create an additional active peer for the same tg_id.
 
@@ -329,51 +390,29 @@ class VPNService:
         if not inherited_code and prefer_current_server:
             inherited_code = (os.environ.get("VPN_CODE") or "NL").upper()
 
-        server = await self._pick_server_for_extra_peer(session, inherited_code=inherited_code if prefer_current_server else None)
-        server_code = str(server.get("code") or inherited_code or os.environ.get("VPN_CODE") or "NL").upper()
-        provider = self._provider_for(
-            host=str(server.get("host") or os.environ.get("WG_SSH_HOST") or ""),
-            port=int(server.get("port") or 22),
-            user=str(server.get("user") or os.environ.get("WG_SSH_USER") or ""),
-            password=server.get("password"),
-            interface=str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
-            tc_dev=str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
-            tc_parent_rate_mbit=int(server.get("tc_parent_rate_mbit") or server.get("wg_tc_parent_rate_mbit") or os.environ.get("WG_TC_PARENT_RATE_MBIT") or os.environ.get("VPN_TC_PARENT_RATE_MBIT") or 1000),
-        )
-
-        log.info("vpn_create_extra_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, server_code)
-        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
-
-        row = VpnPeer(
-            tg_id=tg_id,
-            client_public_key=client_pub,
-            client_private_key_enc=crypto.encrypt(client_priv),
-            client_ip=client_ip,
-            server_code=server_code,
-            is_active=True,
-            revoked_at=None,
-            rotation_reason=None,
-        )
-        session.add(row)
-        await session.flush()
-        return {
-            "peer_id": row.id,
-            "tg_id": tg_id,
-            "client_ip": client_ip,
-            "public_key": client_pub,
-            "client_private_key_enc": row.client_private_key_enc,
-            "client_private_key_plain": client_priv,
-            "server_code": server_code,
-            "server_public_key": str(server.get("server_public_key") or self.server_pub),
-            "endpoint": str(server.get("endpoint") or self.endpoint),
-            "dns": str(server.get("dns") or self.dns),
-            "host": str(server.get("host") or ""),
-            "port": int(server.get("port") or 22),
-            "user": str(server.get("user") or ""),
-            "password": server.get("password"),
-            "interface": str(server.get("interface") or os.environ.get("VPN_INTERFACE", "wg0")),
-            "tc_dev": str(server.get("tc_dev") or server.get("wg_tc_dev") or os.environ.get("WG_TC_DEV") or os.environ.get("VPN_TC_DEV") or ""),
-        }
+        candidates = await self._candidate_servers_for_code(session, inherited_code if prefer_current_server else None)
+        last_exc = None
+        for server in candidates:
+            try:
+                return await self._create_peer_on_server(
+                    session,
+                    tg_id=tg_id,
+                    client_ip=client_ip,
+                    client_priv=client_priv,
+                    client_pub=client_pub,
+                    server=server,
+                )
+            except Exception as exc:
+                last_exc = exc
+                log.exception(
+                    "vpn_create_extra_peer_failed tg_id=%s ip=%s server=%s",
+                    tg_id,
+                    client_ip,
+                    str(server.get("code") or ""),
+                )
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("No VPN servers available for extra peer")
 
     def _default_server_code(self) -> str:
         return (os.environ.get("VPN_CODE") or "NL").upper()
@@ -901,7 +940,6 @@ class VPNService:
     async def rotate_peer(self, session: AsyncSession, tg_id: int, reason: str = "manual_reset") -> Dict[str, Any]:
         """Manual reset for the owner's main profile only."""
 
-        # Serialize resets per user (see ensure_peer).
         try:
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
         except Exception:
@@ -909,62 +947,60 @@ class VPNService:
 
         active = await self._get_active_peer(session, tg_id)
         target_server_code = self._default_server_code()
-
-        if active:
-            target_server_code = str(getattr(active, "server_code", None) or target_server_code).upper()
+        old_server_code = None
+        if active and getattr(active, "server_code", None):
+            old_server_code = str(getattr(active, "server_code", None) or "").upper()
+            target_server_code = old_server_code
             if not await self._is_server_enabled(session, target_server_code):
                 preferred = await self._pick_server_for_new_peer(session)
                 target_server_code = str(preferred.get("code") or self._default_server_code()).upper()
-            provider, target_server_code = self._provider_for_server_code(target_server_code)
+
+        client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
+        client_priv, client_pub = gen_keys()
+        candidates = await self._candidate_servers_for_code(session, target_server_code)
+        last_exc = None
+        peer_payload = None
+        for server in candidates:
             try:
-                await provider.remove_peer(active.client_public_key)
+                peer_payload = await self._create_peer_on_server(
+                    session,
+                    tg_id=tg_id,
+                    client_ip=client_ip,
+                    client_priv=client_priv,
+                    client_pub=client_pub,
+                    server=server,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                log.exception(
+                    "vpn_rotate_create_peer_failed tg_id=%s ip=%s server=%s",
+                    tg_id,
+                    client_ip,
+                    str(server.get("code") or ""),
+                )
+        if peer_payload is None:
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("No VPN servers available for reset")
+
+        if active:
+            try:
+                old_provider, old_server_code_norm = self._provider_for_server_code(old_server_code or target_server_code)
+                await old_provider.remove_peer(active.client_public_key)
             except Exception:
                 log.exception(
                     "vpn_remove_old_peer_failed tg_id=%s peer_id=%s server=%s",
                     tg_id,
                     active.id,
-                    target_server_code,
+                    old_server_code or target_server_code,
                 )
-
-            active.server_code = target_server_code
             active.is_active = False
             active.revoked_at = utcnow()
             active.rotation_reason = reason
             await session.flush()
-        else:
-            if not await self._is_server_enabled(session, target_server_code):
-                preferred = await self._pick_server_for_new_peer(session)
-                target_server_code = str(preferred.get("code") or self._default_server_code()).upper()
-            _, target_server_code = self._provider_for_server_code(target_server_code)
 
-        client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
-        client_priv, client_pub = gen_keys()
-
-        provider, target_server_code = self._provider_for_server_code(target_server_code)
-        log.info("vpn_rotate_create_peer tg_id=%s ip=%s server=%s", tg_id, client_ip, target_server_code)
-        await provider.add_peer(client_pub, client_ip, tg_id=tg_id)
-
-        row = VpnPeer(
-            tg_id=tg_id,
-            client_public_key=client_pub,
-            client_private_key_enc=crypto.encrypt(client_priv),
-            client_ip=client_ip,
-            server_code=target_server_code,
-            is_active=True,
-            revoked_at=None,
-            rotation_reason=None,
-        )
-        session.add(row)
-        await session.flush()
-
-        return {
-            "peer_id": row.id,
-            "tg_id": tg_id,
-            "client_ip": client_ip,
-            "public_key": client_pub,
-            "client_private_key_enc": row.client_private_key_enc,
-            "client_private_key_plain": client_priv,
-        }
+        return peer_payload
 
     def build_wg_conf(
         self,
