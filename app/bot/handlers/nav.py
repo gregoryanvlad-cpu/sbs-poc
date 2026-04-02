@@ -47,6 +47,7 @@ from app.bot.keyboards import (
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
 from app.db.models import Payment, User, LteVpnClient, Referral, ReferralEarning
+from app.db.models.app_setting import AppSetting
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
 from app.repo import extend_subscription, get_subscription, get_price_rub, is_trial_available, set_trial_used, has_used_trial, set_app_setting_int, get_app_setting_int, has_successful_payments
@@ -899,7 +900,7 @@ async def _vpn_seats_by_server_nav() -> dict[str, int]:
     """
     from app.db.models import VpnPeer
 
-    servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
+    servers = await _enabled_vpn_servers_nav(include_not_ready=False)
     default_code = (os.environ.get("VPN_CODE") or "NL").upper()
     default_code_lit = literal(default_code)
 
@@ -956,7 +957,7 @@ def _vpn_capacity_limit(server: dict | None = None) -> int:
 
 
 async def _pick_available_vpn_server(*, preferred_code: str | None = None, current_tg_id: int | None = None) -> dict | None:
-    servers = [s for s in _load_vpn_servers() if _server_is_ready(s)]
+    servers = await _enabled_vpn_servers_nav(include_not_ready=False)
     if not servers:
         return None
 
@@ -2347,7 +2348,7 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
 
         # Determine user's current location for the active peer (best-effort).
         code = (active.server_code or os.environ.get("VPN_CODE", "NL")).upper()
-        servers = _load_vpn_servers()
+        servers = await _enabled_vpn_servers_nav()
         srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
 
         # Rebuild the exact same config from the stored peer row (no re-issue, no rotation).
@@ -2453,6 +2454,28 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
 # --- VPN location selection / migration ---
 
 
+async def _vpn_server_enabled_map_nav() -> dict[str, bool]:
+    servers = _load_vpn_servers()
+    codes = [str((s or {}).get("code") or "").strip().upper() for s in servers if str((s or {}).get("code") or "").strip()]
+    if not codes:
+        return {}
+    async with session_scope() as session:
+        rows = (await session.execute(
+            select(AppSetting.key, AppSetting.int_value).where(AppSetting.key.in_([f"vpn_server_enabled:{c}" for c in codes]))
+        )).all()
+    raw = {str(k).split(":", 1)[1].upper(): (None if v is None else int(v)) for k, v in rows}
+    return {c: (raw.get(c, 1) != 0) for c in codes}
+
+
+async def _enabled_vpn_servers_nav(*, include_not_ready: bool = True) -> list[dict]:
+    servers = _load_vpn_servers()
+    enabled = await _vpn_server_enabled_map_nav()
+    filtered = [s for s in servers if enabled.get(str((s or {}).get("code") or "").strip().upper(), True)]
+    if not include_not_ready:
+        filtered = [s for s in filtered if _server_is_ready(s)]
+    return filtered
+
+
 def _server_is_ready(srv: dict) -> bool:
     return bool(srv.get("host") and srv.get("user") and srv.get("server_public_key") and srv.get("endpoint"))
 
@@ -2485,7 +2508,7 @@ async def _vpn_server_label(srv: dict) -> str:
 
 @router.callback_query(lambda c: c.data == "vpn:loc")
 async def on_vpn_location_menu(cb: CallbackQuery) -> None:
-    servers = _load_vpn_servers()
+    servers = await _enabled_vpn_servers_nav()
 
     lines = ["🌍 <b>Выбор локации VPN</b>", "", "Выберите сервер."]
 
@@ -2659,7 +2682,7 @@ async def on_vpn_location_select(cb: CallbackQuery) -> None:
             await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
-    servers = _load_vpn_servers()
+    servers = await _enabled_vpn_servers_nav()
     srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
     if not srv or not _server_is_ready(srv):
         await cb.answer(
@@ -2745,7 +2768,7 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
             await _show_subscription_required_prompt(cb, session, tg_id)
             return
 
-    servers = _load_vpn_servers()
+    servers = await _enabled_vpn_servers_nav()
     requested_srv = next((s for s in servers if str(s.get("code")).upper() == code), None)
     if not requested_srv or not _server_is_ready(requested_srv):
         await cb.answer("Сервер пока недоступен", show_alert=True)
