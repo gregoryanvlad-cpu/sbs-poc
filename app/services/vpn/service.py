@@ -14,6 +14,7 @@ from sqlalchemy import select, text, func, literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.vpn_peer import VpnPeer
+from app.db.models.app_setting import AppSetting
 from app.repo import utcnow
 from app.services.vpn import crypto
 from app.services.vpn.ssh_provider import WireGuardSSHProvider
@@ -163,6 +164,31 @@ class VPNService:
             "max_active": int(os.environ.get("VPN_MAX_ACTIVE", "40") or 40),
         }]
 
+
+    async def _server_enabled_map(self, session: AsyncSession) -> dict[str, bool]:
+        codes = [str((s or {}).get("code") or "").strip().upper() for s in (self._load_vpn_servers() or [])]
+        codes = [c for c in codes if c]
+        if not codes:
+            return {}
+        rows = (await session.execute(
+            select(AppSetting.key, AppSetting.int_value).where(AppSetting.key.in_([f"vpn_server_enabled:{c}" for c in codes]))
+        )).all()
+        raw = {str(k).split(':', 1)[1].upper(): (None if v is None else int(v)) for k, v in rows}
+        return {c: (raw.get(c, 1) != 0) for c in codes}
+
+    async def _enabled_servers(self, session: AsyncSession) -> list[dict]:
+        servers = self._load_vpn_servers()
+        enabled = await self._server_enabled_map(session)
+        out = [s for s in servers if enabled.get(str((s or {}).get("code") or "").strip().upper(), True)]
+        return out or servers
+
+    async def _is_server_enabled(self, session: AsyncSession, code: str | None) -> bool:
+        code_u = str(code or "").strip().upper()
+        if not code_u:
+            return True
+        enabled = await self._server_enabled_map(session)
+        return enabled.get(code_u, True)
+
     def _server_aliases(self, servers: list[dict], code: str) -> set[str]:
         code_u = str(code or "").strip().upper()
         if not code_u:
@@ -204,7 +230,7 @@ class VPNService:
             return 40
 
     async def _vpn_seats_by_server(self, session: AsyncSession) -> dict[str, int]:
-        servers = self._load_vpn_servers()
+        servers = await self._enabled_servers(session)
         default_code = (os.environ.get("VPN_CODE") or "NL").upper()
         canonical_for_alias: dict[str, str] = {}
         result: dict[str, int] = {}
@@ -253,7 +279,7 @@ class VPNService:
         return result
 
     async def _pick_server_for_extra_peer(self, session: AsyncSession, *, inherited_code: str | None = None) -> dict:
-        servers = self._load_vpn_servers()
+        servers = await self._enabled_servers(session)
         if not servers:
             raise RuntimeError("No VPN servers configured")
         used = await self._vpn_seats_by_server(session)
@@ -363,6 +389,9 @@ class VPNService:
     async def _get_active_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
         reason_expr = func.coalesce(VpnPeer.rotation_reason, "")
         family_peer_ids = await self._family_peer_subquery(tg_id)
+        if not await self._is_server_enabled(session, server_code):
+            raise RuntimeError(f"Server {server_code} is disabled")
+
         q = (
             select(VpnPeer)
             .where(
@@ -439,7 +468,7 @@ class VPNService:
         deterministic by walking servers in configured order and taking the
         first server with free capacity.
         """
-        servers = self._load_vpn_servers()
+        servers = await self._enabled_servers(session)
         if not servers:
             raise RuntimeError("No VPN servers configured")
         used = await self._vpn_seats_by_server(session)
@@ -484,15 +513,16 @@ class VPNService:
 
             if eligible:
                 server_code = str(getattr(last, "server_code", None) or self._default_server_code()).upper()
-                provider, server_code = self._provider_for_server_code(server_code)
-                log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
-                await provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
-                last.server_code = server_code
-                last.is_active = True
-                last.revoked_at = None
-                last.rotation_reason = None
-                await session.flush()
-                return self._row_to_peer_dict(last)
+                if await self._is_server_enabled(session, server_code):
+                    provider, server_code = self._provider_for_server_code(server_code)
+                    log.info("vpn_restore_peer tg_id=%s peer_id=%s server=%s", tg_id, last.id, server_code)
+                    await provider.add_peer(last.client_public_key, last.client_ip, tg_id=tg_id)
+                    last.server_code = server_code
+                    last.is_active = True
+                    last.revoked_at = None
+                    last.rotation_reason = None
+                    await session.flush()
+                    return self._row_to_peer_dict(last)
 
         client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
         client_priv, client_pub = gen_keys()
@@ -556,6 +586,9 @@ class VPNService:
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": int(tg_id)})
         except Exception:
             pass
+
+        if not await self._is_server_enabled(session, server_code):
+            raise RuntimeError(f"Server {server_code} is disabled")
 
         q = (
             select(VpnPeer)
@@ -674,7 +707,7 @@ class VPNService:
         for p in rows:
             try:
                 code = (p.server_code or "").upper() or None
-                if code and code in servers_by_code:
+                if code and code in servers_by_code and await self._is_server_enabled(session, code):
                     srv = servers_by_code[code]
                     provider = self._provider_for(
                         host=str(srv.get("host")),
@@ -879,6 +912,9 @@ class VPNService:
 
         if active:
             target_server_code = str(getattr(active, "server_code", None) or target_server_code).upper()
+            if not await self._is_server_enabled(session, target_server_code):
+                preferred = await self._pick_server_for_new_peer(session)
+                target_server_code = str(preferred.get("code") or self._default_server_code()).upper()
             provider, target_server_code = self._provider_for_server_code(target_server_code)
             try:
                 await provider.remove_peer(active.client_public_key)
@@ -896,6 +932,9 @@ class VPNService:
             active.rotation_reason = reason
             await session.flush()
         else:
+            if not await self._is_server_enabled(session, target_server_code):
+                preferred = await self._pick_server_for_new_peer(session)
+                target_server_code = str(preferred.get("code") or self._default_server_code()).upper()
             _, target_server_code = self._provider_for_server_code(target_server_code)
 
         client_ip = await self._alloc_ip_unique(session, tg_id=tg_id)
