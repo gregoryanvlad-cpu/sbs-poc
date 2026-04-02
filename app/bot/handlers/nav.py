@@ -2381,7 +2381,13 @@ async def on_vpn_my_config(cb: CallbackQuery) -> None:
                 await vpn_service.ensure_rate_limit(tg_id=tg_id, ip=str(active.client_ip))
             except Exception:
                 pass
-            conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+            conf_text = vpn_service.build_wg_conf(
+                peer,
+                user_label=str(tg_id),
+                server_public_key=str(peer.get("server_public_key") or ""),
+                endpoint=str(peer.get("endpoint") or ""),
+                dns=str(peer.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+            )
             loc_title = "<b>ваша локация</b>"
 
         filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, getattr(active, 'id', None))
@@ -3036,7 +3042,13 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
                 filename = await _get_or_assign_vpn_bundle_filename_for_peer(session, peer.get("peer_id"))
                 await session.commit()
 
-            conf_text = vpn_service.build_wg_conf(peer, user_label=str(tg_id))
+            conf_text = vpn_service.build_wg_conf(
+                peer,
+                user_label=str(tg_id),
+                server_public_key=str(peer.get("server_public_key") or ""),
+                endpoint=str(peer.get("endpoint") or ""),
+                dns=str(peer.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+            )
 
             qr_img = qrcode.make(conf_text)
             buf = io.BytesIO()
@@ -3076,7 +3088,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
             try:
                 await cb.bot.send_message(
                     chat_id=chat_id,
-                    text="⚠️ Не удалось сбросить VPN из-за временной ошибки. Попробуй ещё раз через минуту.",
+                    text="⚠️ Не удалось сразу сбросить VPN на текущем сервере. Мы попробовали выдать новый конфиг на доступном сервере, но сейчас это тоже не удалось. Попробуй ещё раз через минуту.",
                 )
             except Exception:
                 pass
@@ -4265,7 +4277,13 @@ async def on_family_reset_slot(cb: CallbackQuery) -> None:
         prof.vpn_peer_id = int(peer_dict.get("peer_id"))
         await session.commit()
 
-    conf_text = vpn_service.build_wg_conf(peer_dict, user_label=f"family:{tg_id}:{slot_no}")
+    conf_text = vpn_service.build_wg_conf(
+        peer_dict,
+        user_label=f"family:{tg_id}:{slot_no}",
+        server_public_key=str(peer_dict.get("server_public_key") or ""),
+        endpoint=str(peer_dict.get("endpoint") or ""),
+        dns=str(peer_dict.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+    )
     conf_file = BufferedInputFile(conf_text.encode(), filename=f"wgf{slot_no}.conf")
     await cb.message.answer_document(
         conf_file,
@@ -4402,7 +4420,13 @@ async def on_family_share_slot(cb: CallbackQuery) -> None:
         await session.commit()
 
     # Build and send config (no QR)
-    conf_text = vpn_service.build_wg_conf(peer_dict, user_label=f"family:{tg_id}:{slot_no}")
+    conf_text = vpn_service.build_wg_conf(
+        peer_dict,
+        user_label=f"family:{tg_id}:{slot_no}",
+        server_public_key=str(peer_dict.get("server_public_key") or ""),
+        endpoint=str(peer_dict.get("endpoint") or ""),
+        dns=str(peer_dict.get("dns") or os.environ.get("VPN_DNS", "1.1.1.1")),
+    )
     conf_file = BufferedInputFile(conf_text.encode(), filename=f"wgf{slot_no}.conf")
     await cb.message.answer_document(
         conf_file,
