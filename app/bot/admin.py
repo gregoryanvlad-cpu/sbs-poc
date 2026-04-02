@@ -191,6 +191,34 @@ def _load_vpn_servers_admin() -> list[dict]:
 
 
 
+async def _vpn_server_enabled_map_admin(session, servers: list[dict] | None = None) -> dict[str, bool]:
+    servers = servers or _load_vpn_servers_admin()
+    codes = [str((s or {}).get("code") or "").strip().upper() for s in servers if str((s or {}).get("code") or "").strip()]
+    if not codes:
+        return {}
+    rows = (await session.execute(
+        select(AppSetting.key, AppSetting.int_value).where(AppSetting.key.in_([f"vpn_server_enabled:{c}" for c in codes]))
+    )).all()
+    raw = {str(k).split(":", 1)[1].upper(): (None if v is None else int(v)) for k, v in rows}
+    return {c: (raw.get(c, 1) != 0) for c in codes}
+
+
+def _kb_admin_vpn_servers(servers: list[dict], enabled_map: dict[str, bool]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for s in servers:
+        code = str((s or {}).get("code") or "").strip().upper()
+        if not code:
+            continue
+        name = str((s or {}).get("name") or code)
+        enabled = enabled_map.get(code, True)
+        prefix = "🟢" if enabled else "🔴"
+        action = "выкл" if enabled else "вкл"
+        b.button(text=f"{prefix} {name} ({code})", callback_data=f"admin:vpn:servers:view:{code}")
+        b.button(text=f"{action.upper()} {code}", callback_data=f"admin:vpn:servers:toggle:{code}")
+    b.button(text="⬅️ Назад", callback_data="admin:back")
+    b.adjust(1, 1, 1)
+    return b.as_markup()
+
 
 def _server_code_aliases(servers: list[dict], code: str) -> set[str]:
     """Return DB aliases for the same logical server code.
@@ -3429,6 +3457,91 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
         else:
             raise
 
+
+
+
+@router.callback_query(lambda c: c.data == "admin:vpn:servers")
+async def admin_vpn_servers(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    servers = _load_vpn_servers_admin()
+    async with session_scope() as session:
+        enabled_map = await _vpn_server_enabled_map_admin(session, servers)
+
+    lines = ["🛠 <b>Управление VPN-серверами</b>", "", "Отключённый сервер больше не будет выдаваться новым пользователям, при сбросе, при смене локации и для семейных профилей."]
+    for s in servers:
+        code = str((s or {}).get("code") or "").strip().upper()
+        if not code:
+            continue
+        name = str((s or {}).get("name") or code)
+        state = "🟢 включён" if enabled_map.get(code, True) else "🔴 отключён"
+        lines.append(f"• <b>{html.escape(name)}</b> ({html.escape(code)}) — {state}")
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=_kb_admin_vpn_servers(servers, enabled_map), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:vpn:servers:view:"))
+async def admin_vpn_servers_view(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    code = (cb.data or "").split(":")[-1].upper()
+    servers = _load_vpn_servers_admin()
+    srv = next((s for s in servers if str((s or {}).get("code") or "").strip().upper() == code), None)
+    if not srv:
+        await cb.answer("Сервер не найден", show_alert=True)
+        return
+    async with session_scope() as session:
+        enabled_map = await _vpn_server_enabled_map_admin(session, servers)
+    enabled = enabled_map.get(code, True)
+    name = str((srv or {}).get("name") or code)
+    txt = (
+        "🛠 <b>VPN-сервер</b>\n\n"
+        f"Название: <b>{html.escape(name)}</b>\n"
+        f"Код: <code>{html.escape(code)}</code>\n"
+        f"Статус выдачи: <b>{'включён' if enabled else 'отключён'}</b>\n\n"
+        "Когда сервер отключён, новая выдача на него не идёт по обычной логике проекта."
+    )
+    await cb.message.edit_text(txt, reply_markup=_kb_admin_vpn_servers(servers, enabled_map), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:vpn:servers:toggle:"))
+async def admin_vpn_servers_toggle(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    code = (cb.data or "").split(":")[-1].upper()
+    servers = _load_vpn_servers_admin()
+    codes = [str((s or {}).get("code") or "").strip().upper() for s in servers if str((s or {}).get("code") or "").strip()]
+    if code not in codes:
+        await cb.answer("Сервер не найден", show_alert=True)
+        return
+    async with session_scope() as session:
+        enabled_map = await _vpn_server_enabled_map_admin(session, servers)
+        current = enabled_map.get(code, True)
+        if current and sum(1 for c in codes if enabled_map.get(c, True)) <= 1:
+            await cb.answer("Нельзя отключить последний активный сервер", show_alert=True)
+            return
+        await set_app_setting_int(session, f"vpn_server_enabled:{code}", 0 if current else 1)
+        await session.commit()
+        enabled_map = await _vpn_server_enabled_map_admin(session, servers)
+
+    await cb.answer(("Сервер отключён" if current else "Сервер включён"), show_alert=False)
+    lines = ["🛠 <b>Управление VPN-серверами</b>", "", "Отключённый сервер больше не будет выдаваться новым пользователям, при сбросе, при смене локации и для семейных профилей."]
+    for s in servers:
+        c = str((s or {}).get("code") or "").strip().upper()
+        if not c:
+            continue
+        name = str((s or {}).get("name") or c)
+        state = "🟢 включён" if enabled_map.get(c, True) else "🔴 отключён"
+        lines.append(f"• <b>{html.escape(name)}</b> ({html.escape(c)}) — {state}")
+    await cb.message.edit_text("\n".join(lines), reply_markup=_kb_admin_vpn_servers(servers, enabled_map), parse_mode="HTML")
 
 @router.callback_query(lambda c: c.data == "admin:vpn:status")
 async def admin_vpn_status(cb: CallbackQuery) -> None:
