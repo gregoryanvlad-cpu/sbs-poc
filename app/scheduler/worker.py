@@ -37,6 +37,16 @@ SLEEP_SECONDS = 30
 JOBSTATE_DAILY_KICK_REPORT_LAST_DATE = "daily_kick_report_last_date"  # YYYY-MM-DD
 
 
+async def _job_finalize_pending_vpn_migrations(bot: Bot) -> None:
+    """Best-effort compatibility stub.
+
+    Older deployments reference this scheduler job, but the actual migration
+    finalization logic may be absent in the current code snapshot. We keep a
+    no-op coroutine here so the scheduler loop does not crash.
+    """
+    return
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
