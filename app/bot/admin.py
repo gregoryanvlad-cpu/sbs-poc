@@ -1924,14 +1924,14 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
                     tc_dev=str(srv.get('tc_dev') or srv.get('wg_tc_dev') or os.environ.get('WG_TC_DEV') or os.environ.get('VPN_TC_DEV') or ''),
                 )
                 try:
-                    eps = await prov.get_peer_endpoints()
+                    eps = await asyncio.wait_for(prov.get_peer_endpoints(), timeout=2.5)
                     for k in keys:
                         if k in eps:
                             endpoints_by_key[k] = eps[k]
                 except Exception:
                     pass
                 try:
-                    hs = await prov.get_latest_handshakes()
+                    hs = await asyncio.wait_for(prov.get_latest_handshakes(), timeout=2.5)
                     for k in keys:
                         if k in hs:
                             handshakes_by_key[k] = int(hs[k] or 0)
@@ -2152,11 +2152,29 @@ async def admin_user_inspect_input(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Не удалось распознать пользователя. Укажите tg_id числом или @username.")
         return
 
-    async with session_scope() as session:
-        text = await _render_user_card(session, message.bot, tg_id)
-
     await state.clear()
-    await message.answer(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+    progress = await message.answer("⏳ Загружаю карточку пользователя…")
+    try:
+        async with session_scope() as session:
+            card_text = await _render_user_card(session, message.bot, tg_id)
+        try:
+            await progress.edit_text(card_text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+        except Exception:
+            await message.answer(card_text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+    except Exception:
+        log.exception("admin_user_inspect_input_failed tg_id=%s raw=%s", tg_id, raw)
+        try:
+            await progress.edit_text(
+                "❌ Не удалось загрузить карточку пользователя. Попробуйте ещё раз через минуту.",
+                reply_markup=_kb_admin_back(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            await message.answer(
+                "❌ Не удалось загрузить карточку пользователя. Попробуйте ещё раз через минуту.",
+                reply_markup=_kb_admin_back(),
+                parse_mode="HTML",
+            )
 
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:card:"))
