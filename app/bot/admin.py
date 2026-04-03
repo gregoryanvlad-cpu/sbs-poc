@@ -2053,6 +2053,32 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
             lines.append(f"Создан: <b>{_fmt_dt_short(u.created_at)}</b>")
         except Exception:
             pass
+
+    # Acquisition / referral source
+    try:
+        inviter_id = await referral_service.get_current_owner_tg_id(session, referred_tg_id=tg_id)
+    except Exception:
+        inviter_id = None
+
+    if inviter_id:
+        inviter = (await session.execute(select(User).where(User.tg_id == int(inviter_id)))).scalar_one_or_none()
+        inviter_username = html.escape(f"@{inviter.tg_username}") if inviter and inviter.tg_username else "—"
+        inviter_raw_name = " ".join([p for p in [getattr(inviter, 'first_name', None), getattr(inviter, 'last_name', None)] if p]) if inviter else "—"
+        inviter_name = html.escape(inviter_raw_name) if inviter_raw_name else "—"
+        active_ref = (await session.execute(
+            select(Referral)
+            .where(Referral.referred_tg_id == tg_id, Referral.status == "active")
+            .order_by(Referral.id.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        ref_state = "активирован" if active_ref else "ожидает первой оплаты"
+        lines.append("Источник: <b>👥 По реферальной ссылке</b>")
+        lines.append(
+            f"Пригласил: {inviter_username} | {inviter_name} | ID: <code>{int(inviter_id)}</code> | Статус: <b>{ref_state}</b>"
+        )
+    else:
+        lines.append("Источник: <b>🧍 Пришёл самостоятельно</b>")
+
     if sub_end:
         lines.append(
             f"Подписка: <b>{'активна' if sub_active else 'не активна'}</b> | до: <b>{_fmt_dt_short(sub_end)}</b>"
