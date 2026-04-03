@@ -428,8 +428,6 @@ class VPNService:
     async def _get_active_peer(self, session: AsyncSession, tg_id: int) -> Optional[VpnPeer]:
         reason_expr = func.coalesce(VpnPeer.rotation_reason, "")
         family_peer_ids = await self._family_peer_subquery(tg_id)
-        if not await self._is_server_enabled(session, server_code):
-            raise RuntimeError(f"Server {server_code} is disabled")
 
         q = (
             select(VpnPeer)
@@ -979,6 +977,24 @@ class VPNService:
                     client_ip,
                     str(server.get("code") or ""),
                 )
+        if peer_payload is None:
+            # Preferred/current server may be down even if still enabled. As a second
+            # chance, try any other enabled server using the normal seat-aware logic.
+            try:
+                fallback_server = await self._pick_server_for_new_peer(session)
+                fallback_code = str(fallback_server.get("code") or self._default_server_code()).upper()
+                if fallback_code != str(target_server_code or "").upper():
+                    peer_payload = await self._create_peer_on_server(
+                        session,
+                        tg_id=tg_id,
+                        client_ip=client_ip,
+                        client_priv=client_priv,
+                        client_pub=client_pub,
+                        server=fallback_server,
+                    )
+            except Exception as exc:
+                last_exc = exc if last_exc is None else last_exc
+                log.exception("vpn_rotate_fallback_create_peer_failed tg_id=%s ip=%s", tg_id, client_ip)
         if peer_payload is None:
             if last_exc:
                 raise last_exc
