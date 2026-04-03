@@ -24,8 +24,9 @@ from dateutil.relativedelta import relativedelta
 from app.bot.auth import is_owner, is_admin
 from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
 from app.core.config import settings
-from app.db.models import ReferralEarning, Subscription, User, Payment
+from app.db.models import Referral, ReferralEarning, Subscription, User, Payment
 from app.db.models.vpn_peer import VpnPeer
+from app.db.models.family_vpn_group import FamilyVpnGroup
 from app.db.models.family_vpn_profile import FamilyVpnProfile
 from app.db.models.lte_vpn_client import LteVpnClient
 from app.db.models import MessageAudit
@@ -858,6 +859,327 @@ async def _collect_full_bot_stats() -> dict[str, object]:
     }
 
 
+async def _collect_full_bot_stats_v2() -> dict[str, object]:
+    now = _utcnow()
+    window30 = now - timedelta(days=30)
+    window7 = now - timedelta(days=7)
+    window3 = now - timedelta(days=3)
+
+    async with session_scope() as session:
+        total_users = int(await session.scalar(select(func.count()).select_from(User)) or 0)
+        blocked_users = int(await session.scalar(select(func.count(func.distinct(MessageAudit.tg_id))).where(MessageAudit.text_preview.like("[SEND_FAILED:FORBIDDEN]%"))) or 0)
+        users_last_30 = int(await session.scalar(select(func.count()).select_from(User).where(User.created_at >= window30)) or 0)
+
+        trial_rows = (await session.execute(select(AppSetting.key, AppSetting.int_value).where(or_(AppSetting.key.like("trial_used:%"), AppSetting.key.like("trial_end_ts:%"))))).all()
+        trial_user_ids: set[int] = set()
+        trial_end_ts_by_user: dict[int, int] = {}
+        for key, int_value in trial_rows:
+            skey = str(key or "")
+            try:
+                uid = int(skey.split(":", 1)[1])
+            except Exception:
+                continue
+            if skey.startswith("trial_used:") and int(int_value or 0) == 1:
+                trial_user_ids.add(uid)
+            elif skey.startswith("trial_end_ts:") and int(int_value or 0) > 0:
+                trial_end_ts_by_user[uid] = int(int_value or 0)
+
+        users = list((await session.execute(select(User))).scalars().all())
+        user_created = {int(u.tg_id): _ensure_tz_utc(getattr(u, 'created_at', None)) or now for u in users}
+
+        payments = list((await session.execute(select(Payment).where(Payment.status == "success").order_by(Payment.tg_id.asc(), Payment.paid_at.asc(), Payment.id.asc()))).scalars().all())
+        peers = list((await session.execute(select(VpnPeer))).scalars().all())
+        active_peers = [p for p in peers if bool(getattr(p, 'is_active', False))]
+        referrals = list((await session.execute(select(Referral))).scalars().all())
+        ref_earnings = list((await session.execute(select(ReferralEarning))).scalars().all())
+        family_groups = list((await session.execute(select(FamilyVpnGroup))).scalars().all())
+        family_profiles = list((await session.execute(select(FamilyVpnProfile))).scalars().all())
+        msg_rows = list((await session.execute(select(MessageAudit))).scalars().all())
+
+    trial_starts: dict[int, datetime] = {}
+    first_main_paid: dict[int, datetime] = {}
+    first_gift_at: dict[int, datetime] = {}
+    distinct_payers_30: set[int] = set()
+    trial_to_paid_users: set[int] = set()
+    paid_users_all: set[int] = set()
+    pay_199 = upsells_99 = lte_99 = family_upsell_orders = 0
+    sales_last_30 = revenue_last_30 = sales_last_7 = revenue_last_7 = 0
+    renewals_last_30_days = 0
+    active_paid_subscription_users = 0
+    churn_cohort = churn_count = 0
+    current_user_tg_id = None
+    current_end = None
+    active_at_window_start = False
+    had_prior_main_payment = False
+
+    def flush_user_state() -> None:
+        nonlocal active_paid_subscription_users, churn_cohort, churn_count
+        if current_user_tg_id is None:
+            return
+        active_now = bool(current_end and current_end > now)
+        if active_now:
+            active_paid_subscription_users += 1
+        if active_at_window_start:
+            churn_cohort += 1
+            if not active_now:
+                churn_count += 1
+
+    for pay in payments:
+        tg_id = int(pay.tg_id)
+        provider = str(getattr(pay, 'provider', '') or '')
+        amount = int(getattr(pay, 'amount', 0) or 0)
+        paid_at = _ensure_tz_utc(getattr(pay, 'paid_at', None)) or now
+        if provider == 'trial' and tg_id not in trial_starts:
+            trial_starts[tg_id] = paid_at
+        if provider == 'gift' and tg_id not in first_gift_at:
+            first_gift_at[tg_id] = paid_at
+        if provider in {"platega_lte", "mock_lte"} and amount == 99:
+            lte_99 += 1
+            continue
+        if provider.startswith("platega_family_") or provider == "mock_family":
+            family_upsell_orders += 1
+            continue
+        if not _is_main_success_payment(pay):
+            continue
+        if tg_id not in first_main_paid:
+            first_main_paid[tg_id] = paid_at
+        if tg_id in trial_user_ids:
+            trial_to_paid_users.add(tg_id)
+        paid_users_all.add(tg_id)
+        if amount == 199:
+            pay_199 += 1
+        if amount == 99:
+            upsells_99 += 1
+        if paid_at >= window30:
+            sales_last_30 += 1
+            revenue_last_30 += amount
+            distinct_payers_30.add(tg_id)
+        if paid_at >= window7:
+            sales_last_7 += 1
+            revenue_last_7 += amount
+        if current_user_tg_id != tg_id:
+            flush_user_state()
+            current_user_tg_id = tg_id
+            current_end = None
+            active_at_window_start = False
+            had_prior_main_payment = False
+        if paid_at >= window30 and had_prior_main_payment:
+            renewals_last_30_days += 1
+        start_at = current_end if current_end and current_end > paid_at else paid_at
+        end_at = start_at + timedelta(days=_main_payment_duration_days(pay))
+        if start_at <= window30 < end_at:
+            active_at_window_start = True
+        current_end = end_at
+        had_prior_main_payment = True
+    flush_user_state()
+
+    active_trial_users = {uid for uid in trial_user_ids if int(trial_end_ts_by_user.get(uid, 0) or 0) > int(now.timestamp()) and uid not in paid_users_all}
+    peer_by_user: dict[int, list] = {}
+    for peer in peers:
+        peer_by_user.setdefault(int(peer.tg_id), []).append(peer)
+    active_peer_keys = {str(p.client_public_key): p for p in active_peers if str(p.client_public_key or '').strip()}
+    ever_connected_trial_users = {uid for uid in trial_user_ids if peer_by_user.get(uid)}
+
+    try:
+        recent24 = await vpn_service.get_recent_peer_handshakes(window_seconds=86400)
+    except Exception:
+        recent24 = []
+    try:
+        recent3d = await vpn_service.get_recent_peer_handshakes(window_seconds=3 * 86400)
+    except Exception:
+        recent3d = []
+    try:
+        recent7d = await vpn_service.get_recent_peer_handshakes(window_seconds=7 * 86400)
+    except Exception:
+        recent7d = []
+
+    recent24_keys = {str(i.get('public_key') or ''): i for i in recent24}
+    recent3_keys = {str(i.get('public_key') or ''): i for i in recent3d}
+    recent7_keys = {str(i.get('public_key') or ''): i for i in recent7d}
+
+    active_trial_using_now = len({uid for uid in active_trial_users for p in peer_by_user.get(uid, []) if str(p.client_public_key or '') in recent24_keys})
+
+    activation_deltas = []
+    ttfh_deltas = []
+    for uid in trial_user_ids:
+        start = trial_starts.get(uid) or user_created.get(uid)
+        plist = sorted(peer_by_user.get(uid, []), key=lambda p: _ensure_tz_utc(getattr(p, 'created_at', None)) or now)
+        if plist:
+            first_peer_at = _ensure_tz_utc(getattr(plist[0], 'created_at', None)) or now
+            delta = max(0.0, (first_peer_at - start).total_seconds() / 3600.0)
+            activation_deltas.append(delta)
+            if uid in ever_connected_trial_users:
+                ttfh_deltas.append(delta)
+    time_to_paid = []
+    for uid, paid_at in first_main_paid.items():
+        start = trial_starts.get(uid)
+        if start:
+            time_to_paid.append(max(0.0, (paid_at - start).total_seconds() / 3600.0))
+
+    gifts_total = len([p for p in payments if str(getattr(p, 'provider', '')) == 'gift'])
+    gift_users = {int(p.tg_id) for p in payments if str(getattr(p, 'provider', '')) == 'gift'}
+    gift_days_total = sum(int(getattr(p, 'period_days', 0) or 0) + (int(getattr(p, 'period_months', 0) or 0) * 30) for p in payments if str(getattr(p, 'provider', '')) == 'gift')
+    gift_to_paid = len({uid for uid in gift_users if uid in first_main_paid and first_main_paid[uid] > (first_gift_at.get(uid) or now)})
+
+    # server distribution
+    servers = _load_vpn_servers_admin()
+    label_by_code = {str((s or {}).get('code') or '').upper(): _server_numbered_label(servers, str((s or {}).get('code') or '').upper()) for s in servers}
+    active_by_server: dict[str, int] = {}
+    hs24_by_server: dict[str, int] = {}
+    for p in active_peers:
+        code = str(getattr(p, 'server_code', '') or '').upper() or 'DEFAULT'
+        active_by_server[code] = active_by_server.get(code, 0) + 1
+    for item in recent24:
+        code = str(item.get('server_code') or '').upper() or 'DEFAULT'
+        hs24_by_server[code] = hs24_by_server.get(code, 0) + 1
+    peers_total = len(active_peers)
+    server_distribution = []
+    for code, cnt in sorted(active_by_server.items(), key=lambda kv: kv[1], reverse=True):
+        server_distribution.append({
+            'code': code,
+            'label': label_by_code.get(code, code),
+            'active_peers': cnt,
+            'share': (cnt / peers_total * 100.0) if peers_total else 0.0,
+            'handshakes_24h': hs24_by_server.get(code, 0),
+        })
+
+    # renewal funnel
+    msg_by_kind = [m for m in msg_rows if str(m.kind or '') in {'sub_warn_3d', 'sub_warn_1d', 'trial_d1', 'trial_d2', 'upsell_after_first_payment', 'referral_link_opened', 'referral_paid', 'referral_earning_created', 'referral_hold_released'}]
+    def _renewed_after(uid: int, sent_at: datetime, within_days: int) -> bool:
+        paid_at = first_main_paid.get(uid)
+        if not paid_at:
+            return False
+        return sent_at <= paid_at <= (sent_at + timedelta(days=within_days))
+    sub_warn_3d_sent = [m for m in msg_rows if str(m.kind or '') == 'sub_warn_3d' and m.message_id is not None]
+    sub_warn_1d_sent = [m for m in msg_rows if str(m.kind or '') == 'sub_warn_1d' and m.message_id is not None]
+    renew_after_3d = len({int(m.tg_id) for m in sub_warn_3d_sent if _renewed_after(int(m.tg_id), _ensure_tz_utc(m.sent_at) or now, 4)})
+    renew_after_1d = len({int(m.tg_id) for m in sub_warn_1d_sent if _renewed_after(int(m.tg_id), _ensure_tz_utc(m.sent_at) or now, 2)})
+
+    # reset health via rotated peers
+    reset_7 = len([p for p in peers if str(getattr(p, 'rotation_reason', '') or '') == 'manual_reset' and (_ensure_tz_utc(getattr(p, 'created_at', None)) or now) >= window7])
+    reset_30 = len([p for p in peers if str(getattr(p, 'rotation_reason', '') or '') == 'manual_reset' and (_ensure_tz_utc(getattr(p, 'created_at', None)) or now) >= window30])
+
+    # referral
+    ref_active = len([r for r in referrals if str(getattr(r, 'status', '') or '') == 'active'])
+    ref_pending = len([e for e in ref_earnings if str(getattr(e, 'status', '') or '') == 'pending'])
+    ref_available = len([e for e in ref_earnings if str(getattr(e, 'status', '') or '') == 'available'])
+    ref_paid_out = len([e for e in ref_earnings if str(getattr(e, 'status', '') or '') == 'paid'])
+
+    # family analytics
+    family_profiles_active = len([fp for fp in family_profiles if getattr(fp, 'vpn_peer_id', None)])
+    family_groups_active = len([g for g in family_groups if (_ensure_tz_utc(getattr(g, 'active_until', None)) or datetime(1970,1,1,tzinfo=timezone.utc)) > now and int(getattr(g, 'seats_total', 0) or 0) > 0])
+    upsell_seen = len({int(m.tg_id) for m in msg_rows if str(m.kind or '') == 'upsell_after_first_payment'})
+
+    # risk metrics
+    active_paid_users_set = set()
+    current_user_tg_id = None
+    current_end = None
+    for pay in payments:
+        if not _is_main_success_payment(pay):
+            continue
+        tg_id = int(pay.tg_id)
+        paid_at = _ensure_tz_utc(getattr(pay, 'paid_at', None)) or now
+        if current_user_tg_id != tg_id:
+            current_user_tg_id = tg_id
+            current_end = None
+        start_at = current_end if current_end and current_end > paid_at else paid_at
+        current_end = start_at + timedelta(days=_main_payment_duration_days(pay))
+        if current_end > now:
+            active_paid_users_set.add(tg_id)
+    silent_3 = silent_7 = 0
+    for uid in active_paid_users_set:
+        plist = [p for p in active_peers if int(p.tg_id) == uid]
+        has3 = any(str(p.client_public_key or '') in recent3_keys for p in plist)
+        has7 = any(str(p.client_public_key or '') in recent7_keys for p in plist)
+        if not has3:
+            silent_3 += 1
+        if not has7:
+            silent_7 += 1
+
+    payer_count_30 = len(distinct_payers_30)
+    arppu_30 = (revenue_last_30 / payer_count_30) if payer_count_30 else 0.0
+    mrr_current = active_paid_subscription_users * 224
+    mrr_after_churn = int(round(mrr_current * max(0.0, (100.0 - ((churn_count / churn_cohort * 100.0) if churn_cohort else 0.0)) / 100.0)))
+    trial_periods = len(trial_user_ids)
+    trial_activation_rate = (len(ever_connected_trial_users) / trial_periods * 100.0) if trial_periods else 0.0
+    hist_trial_conv = (len(trial_to_paid_users) / trial_periods) if trial_periods else 0.0
+    family_conv = (family_upsell_orders / upsell_seen * 100.0) if upsell_seen else 0.0
+    churn_percent = (churn_count / churn_cohort * 100.0) if churn_cohort else 0.0
+
+    kinds_sent: dict[str, set[int]] = {}
+    kinds_seen: dict[str, set[int]] = {}
+    for m in msg_by_kind:
+        k = str(m.kind or '')
+        uid = int(m.tg_id)
+        kinds_sent.setdefault(k, set()).add(uid)
+        if m.seen_at is not None:
+            kinds_seen.setdefault(k, set()).add(uid)
+
+    return {
+        'now': now,
+        'total_users': total_users,
+        'blocked_users': blocked_users,
+        'peers_total': peers_total,
+        'trial_periods': trial_periods,
+        'active_trials_now': len(active_trial_users),
+        'active_trials_using_now': int(active_trial_using_now),
+        'active_trials_idle_now': max(0, len(active_trial_users) - int(active_trial_using_now)),
+        'trial_to_paid': len(trial_to_paid_users),
+        'hist_trial_conversion_percent': hist_trial_conv * 100.0,
+        'payments_199': pay_199,
+        'upsells_99': upsells_99,
+        'lte_99': lte_99,
+        'family_upsell_orders': family_upsell_orders,
+        'active_paid_users': active_paid_subscription_users,
+        'renewals_last_30_days': renewals_last_30_days,
+        'churn_count': churn_count,
+        'churn_cohort': churn_cohort,
+        'churn_percent': churn_percent,
+        'sales_last_30': sales_last_30,
+        'revenue_last_30': revenue_last_30,
+        'sales_last_7': sales_last_7,
+        'revenue_last_7': revenue_last_7,
+        'users_last_30': users_last_30,
+        'avg_new_users_per_day': _safe_div(users_last_30, 30.0),
+        'mrr_current': mrr_current,
+        'mrr_after_churn': mrr_after_churn,
+        'arppu_30': arppu_30,
+        'trial_activation_rate': trial_activation_rate,
+        'avg_hours_to_first_handshake': _safe_div(sum(ttfh_deltas), len(ttfh_deltas)) if ttfh_deltas else 0.0,
+        'avg_hours_to_paid': _safe_div(sum(time_to_paid), len(time_to_paid)) if time_to_paid else 0.0,
+        'renew_warn_3d_sent': len({int(m.tg_id) for m in sub_warn_3d_sent}),
+        'renew_after_3d': renew_after_3d,
+        'renew_warn_1d_sent': len({int(m.tg_id) for m in sub_warn_1d_sent}),
+        'renew_after_1d': renew_after_1d,
+        'reset_7': reset_7,
+        'reset_30': reset_30,
+        'server_distribution': server_distribution,
+        'gift_count': gifts_total,
+        'gift_users': len(gift_users),
+        'gift_days_total': gift_days_total,
+        'gift_to_paid': gift_to_paid,
+        'referral_active': ref_active,
+        'referral_earning_pending': ref_pending,
+        'referral_earning_available': ref_available,
+        'referral_earning_paid': ref_paid_out,
+        'family_groups_active': family_groups_active,
+        'family_profiles_active': family_profiles_active,
+        'family_upsell_seen': upsell_seen,
+        'family_upsell_conversion': family_conv,
+        'silent_risk_3d': silent_3,
+        'silent_risk_7d': silent_7,
+        'trial_d1_sent': len(kinds_sent.get('trial_d1', set())),
+        'trial_d1_seen': len(kinds_seen.get('trial_d1', set())),
+        'trial_d2_sent': len(kinds_sent.get('trial_d2', set())),
+        'trial_d2_seen': len(kinds_seen.get('trial_d2', set())),
+        'upsell_after_pay_sent': len(kinds_sent.get('upsell_after_first_payment', set())),
+        'referral_link_opened': len(kinds_sent.get('referral_link_opened', set())),
+        'referral_paid': len(kinds_sent.get('referral_paid', set())),
+        'referral_earning_created': len(kinds_sent.get('referral_earning_created', set())),
+        'referral_hold_released': len(kinds_sent.get('referral_hold_released', set())),
+    }
+
+
 def _kb_admin_self_cleanup_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить", callback_data="admin:vpn:self_cleanup:do")],
@@ -1669,8 +1991,9 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
     sub = await get_subscription(session, tg_id)
     now = _utcnow()
 
-    username = f"@{u.tg_username}" if u and u.tg_username else "—"
-    name = " ".join([p for p in [getattr(u, 'first_name', None), getattr(u, 'last_name', None)] if p]) if u else "—"
+    username = html.escape(f"@{u.tg_username}") if u and u.tg_username else "—"
+    raw_name = " ".join([p for p in [getattr(u, 'first_name', None), getattr(u, 'last_name', None)] if p]) if u else "—"
+    name = html.escape(raw_name) if raw_name else "—"
 
     sub_end = None
     sub_active = False
@@ -1836,11 +2159,11 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
         if ym:
             if ym.removed_at is None:
                 lines.append(
-                    f"Yandex: ✅ в семье | label: <b>{ym.account_label or '—'}</b> | слот: <b>{ym.slot_index if ym.slot_index is not None else '—'}</b> | покрытие до: <b>{_fmt_dt_short(ym.coverage_end_at)}</b>"
+                    f"Yandex: ✅ в семье | label: <b>{html.escape(str(ym.account_label or '—'))}</b> | слот: <b>{ym.slot_index if ym.slot_index is not None else '—'}</b> | покрытие до: <b>{_fmt_dt_short(ym.coverage_end_at)}</b>"
                 )
             else:
                 lines.append(
-                    f"Yandex: ❌ исключён | label: <b>{ym.account_label or '—'}</b> | слот: <b>{ym.slot_index if ym.slot_index is not None else '—'}</b> | removed: <b>{_fmt_dt_short(ym.removed_at)}</b>"
+                    f"Yandex: ❌ исключён | label: <b>{html.escape(str(ym.account_label or '—'))}</b> | слот: <b>{ym.slot_index if ym.slot_index is not None else '—'}</b> | removed: <b>{_fmt_dt_short(ym.removed_at)}</b>"
                 )
         else:
             lines.append("Yandex: ❗️нет записи")
@@ -1968,10 +2291,10 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
             sent = _fmt_dt_short(m.sent_at)
             seen = _fmt_dt_short(m.seen_at) if m.seen_at else "не подтверждено"
             # concise preview
-            preview = (m.text_preview or "").replace("\n", " ").strip()
+            preview = html.escape((m.text_preview or "").replace("\n", " ").strip())
             if len(preview) > 120:
                 preview = preview[:119] + "…"
-            lines.append(f"• <b>{m.kind}</b> | {sent} | 👁 {seen}\n  {preview}")
+            lines.append(f"• <b>{html.escape(str(m.kind or '—'))}</b> | {sent} | 👁 {seen}\n  {preview}")
 
         lines.append("")
         lines.append("<i>👁 Статус «прочитано» — это best-effort: считается прочитанным, если пользователь взаимодействовал с ботом после отправки.</i>")
@@ -3164,6 +3487,7 @@ async def admin_sub_gift_days_finish(message: Message, state: FSMContext) -> Non
                     "Приятного пользования!"
                 ),
                 kind="admin_gift_days",
+                parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")]]
                 ),
@@ -3432,96 +3756,90 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
         await cb.answer()
         return
-
     try:
-        await cb.answer()
+        await cb.answer("Собираю полную статистику…")
     except Exception:
         pass
-
     try:
-        stats = await _collect_full_bot_stats()
+        stats = await _collect_full_bot_stats_v2()
     except Exception:
         log.exception("admin_full_stats_failed")
-        await cb.message.answer(
-            "❌ Не удалось собрать полную статистику бота. Проверь логи.",
-            reply_markup=_kb_admin_back(),
-        )
+        await cb.message.answer("❌ Не удалось собрать полную статистику бота. Проверь логи.", reply_markup=_kb_admin_back())
         return
 
-    forecast = stats.get("forecast") or {}
-    ad_scenarios = list(stats.get("ad_scenarios") or [])
-    next_month_label = (forecast.get("next_month_start") or stats["now"]).strftime("%m.%Y")
-    ad_lines: list[str] = []
-    for item in ad_scenarios:
-        ad_lines.append(
-            f"• Бюджет <b>{int(item['budget'])} ₽</b> → ниши: <b>{html.escape(str(item['niches']))}</b>\n"
-            f"  Продажи: <b>{int(item['sales'])}</b> | Выручка: <b>{int(item['revenue'])} ₽</b> | Чистая прибыль: <b>{int(item['profit'])} ₽</b> | ROI: <b>{float(item['roi']):.1f}%</b>"
-        )
-    ad_block = "\n".join(ad_lines) if ad_lines else "—"
-
-    recommendation = "Закупать 60k ₽ в мамские / женские + lifestyle каналы 40–80k подписчиков" if ad_scenarios else "Держать органический рост и добивать активные trial"
-
-    text = f"""Прогноз продаж @sbsconnect_bot на следующий месяц
-
-📈 <b>Полная статистика бота</b>
-
-1. <b>Прогноз продаж на следующий месяц (без дополнительной рекламы)</b>
-Консервативный: <b>{int(forecast.get('forecast_next_sales_cons', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_cons', 0))} ₽</b>
-Реалистичный: <b>{int(forecast.get('forecast_next_sales_real', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_real', 0))} ₽</b>
-Оптимистичный: <b>{int(forecast.get('forecast_next_sales_opt', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_opt', 0))} ₽</b>
-Средний ежедневный приток новых пользователей: <b>{float(stats['avg_new_users_per_day']):.1f}</b>
-
-2. <b>Прогноз продаж на текущий месяц</b>
-Текущий месяц: <b>{int(forecast.get('forecast_current_sales', 0))}</b> продаж / <b>{int(forecast.get('forecast_current_revenue', 0))} ₽</b>
-Следующий месяц ({next_month_label}): <b>{int(forecast.get('forecast_next_sales_real', 0))}</b> продаж / <b>{int(forecast.get('forecast_next_revenue_real', 0))} ₽</b>
-
-3. <b>Прогноз продаж на следующий месяц ПРИ ЗАКУПКЕ РЕКЛАМЫ</b>
-{ad_block}
-Рекомендация: <b>{html.escape(recommendation)}</b>
-
-4. <b>Срез по trial и продажам</b>
-🎁 Пробных периодов за всё время: <b>{int(stats['trial_periods'])}</b>
-⏳ Активных trial сейчас: <b>{int(stats['active_trials_now'])}</b>
-🟢 Реально пользуются trial сейчас (handshake ≤ 24ч): <b>{int(stats['active_trials_using_now'])}</b>
-😴 Взяли trial, но не пользуются сейчас: <b>{int(stats['active_trials_idle_now'])}</b>
-💳 Оформили подписку после trial: <b>{int(stats['trial_to_paid'])}</b>
-📊 Историческая trial → paid конверсия: <b>{float(stats['hist_trial_conversion_percent']):.1f}%</b>
-
-5. <b>Текущий операционный срез</b>
-👥 Всего пользователей: <b>{int(stats['total_users'])}</b>
-🚫 Отписались / заблокировали бота: <b>{int(stats['blocked_users'])}</b>
-🌐 Всего peer'ов на серверах: <b>{int(stats['peers_total'])}</b>
-🟢 Сейчас платящих пользователей: <b>{int(stats['active_paid_users'])}</b>
-🔁 Продлений за последние 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>
-📉 Churn за месяц: <b>{int(stats['churn_count'])}</b> / <b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)
-
-6. <b>Последние продажи и монетизация</b>
-30 дней: <b>{int(stats['sales_last_30'])}</b> продаж / <b>{int(stats['revenue_last_30'])} ₽</b>
-7 дней: <b>{int(stats['sales_last_7'])}</b> продаж / <b>{int(stats['revenue_last_7'])} ₽</b>
-💰 Оплат на 199 ₽: <b>{int(stats['payments_199'])}</b>
-📈 Апселлов на +99 ₽: <b>{int(stats['upsells_99'])}</b>
-📶 LTE-активаций на 99 ₽: <b>{int(stats['lte_99'])}</b>
-👨‍👩‍👧‍👦 Продаж семейного апселла: <b>{int(stats['family_upsell_orders'])}</b>
-
-7. <b>Коммуникации и рефералка</b>
-📨 D1 trial отправлено / прочитано: <b>{int(stats['trial_d1_sent'])}</b> / <b>{int(stats['trial_d1_seen'])}</b>
-📨 D2 trial отправлено / прочитано: <b>{int(stats['trial_d2_sent'])}</b> / <b>{int(stats['trial_d2_seen'])}</b>
-📨 Апселл после оплаты: <b>{int(stats['upsell_after_pay_sent'])}</b>
-👥 Рефка: старт / оплата: <b>{int(stats['referral_link_opened'])}</b> / <b>{int(stats['referral_paid'])}</b>
-💸 Рефка: начисление / выход из холда: <b>{int(stats['referral_earning_created'])}</b> / <b>{int(stats['referral_hold_released'])}</b>
-
-<i>Модель без рекламы строится по последним 30 и 7 дням продаж + текущему pipeline активных trial.</i>
-<i>Рекламные сценарии считают тёплые ниши: мамские, женские, lifestyle, технологии/privacy. Новостные и военные каналы исключены.</i>"""
-
-    try:
-        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
-        else:
-            raise
-
-
+    lines = [
+        "📈 <b>Полная статистика бота</b>",
+        "",
+        "1️⃣ <b>💸 MRR / expected MRR</b>",
+        f"• Текущий MRR: <b>{int(stats['mrr_current'])} ₽</b>",
+        f"• Expected MRR после текущего churn: <b>{int(stats['mrr_after_churn'])} ₽</b>",
+        "",
+        "2️⃣ <b>🧾 ARPPU</b>",
+        f"• Средняя выручка на платящего за 30 дней: <b>{float(stats['arppu_30']):.1f} ₽</b>",
+        "",
+        "3️⃣ <b>🎁 Trial activation rate</b>",
+        f"• Всего trial: <b>{int(stats['trial_periods'])}</b>",
+        f"• Активных trial сейчас: <b>{int(stats['active_trials_now'])}</b>",
+        f"• Реально пользуются сейчас: <b>{int(stats['active_trials_using_now'])}</b>",
+        f"• Activation rate: <b>{float(stats['trial_activation_rate']):.1f}%</b>",
+        f"• Trial → paid: <b>{float(stats['hist_trial_conversion_percent']):.1f}%</b>",
+        "",
+        "4️⃣ <b>⏱ Time-to-first-handshake</b>",
+        f"• Среднее время до первого VPN-подключения: <b>{float(stats['avg_hours_to_first_handshake']):.1f} ч</b>",
+        "",
+        "5️⃣ <b>💳 Time-to-paid</b>",
+        f"• Среднее время от trial до первой оплаты: <b>{float(stats['avg_hours_to_paid']):.1f} ч</b>",
+        "",
+        "6️⃣ <b>🔁 Renewal funnel</b>",
+        f"• Warn -3d: <b>{int(stats['renew_warn_3d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_3d'])}</b>",
+        f"• Warn -1d: <b>{int(stats['renew_warn_1d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_1d'])}</b>",
+        f"• Продлений за 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>",
+        f"• Churn: <b>{int(stats['churn_count'])}</b>/<b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)",
+        "",
+        "7️⃣ <b>♻️ Reset health</b>",
+        f"• Успешных reset-перевыпусков за 7 дней: <b>{int(stats['reset_7'])}</b>",
+        f"• Успешных reset-перевыпусков за 30 дней: <b>{int(stats['reset_30'])}</b>",
+        "",
+        "8️⃣ <b>🌍 Server distribution</b>",
+    ]
+    if stats.get('server_distribution'):
+        for item in stats['server_distribution']:
+            lines.append(f"• {html.escape(str(item['label']))}: <b>{int(item['active_peers'])}</b> peer ({float(item['share']):.1f}%) | 🟢 handshake 24ч: <b>{int(item['handshakes_24h'])}</b>")
+    else:
+        lines.append("• —")
+    lines += [
+        "",
+        "9️⃣ <b>🎁 Promo / gift analytics</b>",
+        f"• Подарков выдано: <b>{int(stats['gift_count'])}</b>",
+        f"• Уникальных получателей: <b>{int(stats['gift_users'])}</b>",
+        f"• Подарочных дней суммарно: <b>{int(stats['gift_days_total'])}</b>",
+        f"• Gift → paid: <b>{int(stats['gift_to_paid'])}</b>",
+        "",
+        "🔟 <b>👥 Referral funnel</b>",
+        f"• Переходов по ссылкам: <b>{int(stats['referral_link_opened'])}</b>",
+        f"• Активных рефералов: <b>{int(stats['referral_active'])}</b>",
+        f"• Реферал оплатил: <b>{int(stats['referral_paid'])}</b>",
+        f"• Начисления: pending <b>{int(stats['referral_earning_pending'])}</b> / available <b>{int(stats['referral_earning_available'])}</b> / paid <b>{int(stats['referral_earning_paid'])}</b>",
+        "",
+        "1️⃣1️⃣ <b>👨‍👩‍👧‍👦 Family upsell analytics</b>",
+        f"• Увидели апселл: <b>{int(stats['family_upsell_seen'])}</b>",
+        f"• Купили family seat: <b>{int(stats['family_upsell_orders'])}</b>",
+        f"• Конверсия: <b>{float(stats['family_upsell_conversion']):.1f}%</b>",
+        f"• Активных family-групп: <b>{int(stats['family_groups_active'])}</b> | профилей: <b>{int(stats['family_profiles_active'])}</b>",
+        "",
+        "1️⃣2️⃣ <b>😶 Silent risk metrics</b>",
+        f"• Платят, но без handshake 3+ дня: <b>{int(stats['silent_risk_3d'])}</b>",
+        f"• Платят, но без handshake 7+ дней: <b>{int(stats['silent_risk_7d'])}</b>",
+        "",
+        "📌 <b>Базовый операционный срез</b>",
+        f"• 👥 Пользователей: <b>{int(stats['total_users'])}</b> | 🚫 заблокировали: <b>{int(stats['blocked_users'])}</b>",
+        f"• 🌐 Активных peer: <b>{int(stats['peers_total'])}</b> | 🟢 платящих сейчас: <b>{int(stats['active_paid_users'])}</b>",
+        f"• 💰 199 ₽: <b>{int(stats['payments_199'])}</b> | ➕ +99 ₽: <b>{int(stats['upsells_99'])}</b> | 📶 LTE 99 ₽: <b>{int(stats['lte_99'])}</b>",
+        f"• 📨 D1: <b>{int(stats['trial_d1_sent'])}</b>/<b>{int(stats['trial_d1_seen'])}</b> | D2: <b>{int(stats['trial_d2_sent'])}</b>/<b>{int(stats['trial_d2_seen'])}</b>",
+        f"• 📅 Продажи 30д: <b>{int(stats['sales_last_30'])}</b> / <b>{int(stats['revenue_last_30'])} ₽</b> | 7д: <b>{int(stats['sales_last_7'])}</b> / <b>{int(stats['revenue_last_7'])} ₽</b>",
+    ]
+    parts = _split_html_lines(lines, limit=3400)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
 
 
 @router.callback_query(lambda c: c.data == "admin:vpn:servers")
@@ -4357,6 +4675,7 @@ async def admin_vpn_server_users_list(cb: CallbackQuery) -> None:
 
     from app.db.models.vpn_peer import VpnPeer
     from app.db.models.subscription import Subscription
+    from app.db.models.family_vpn_group import FamilyVpnGroup
     from app.db.models.family_vpn_profile import FamilyVpnProfile
 
     now = datetime.now(timezone.utc)
