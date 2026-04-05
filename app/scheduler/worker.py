@@ -71,6 +71,126 @@ def _days_until(dt: datetime, now: datetime) -> int:
     return int((delta.total_seconds() + 86399) // 86400)
 
 
+
+def _trial_device_help_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Android", callback_data="trialhelp:howto:android")],
+            [InlineKeyboardButton(text="🍎 iPhone / iPad", callback_data="trialhelp:howto:ios")],
+            [InlineKeyboardButton(text="💻 Windows", callback_data="trialhelp:howto:windows")],
+            [InlineKeyboardButton(text="🍏 macOS", callback_data="trialhelp:howto:macos")],
+            [InlineKeyboardButton(text="🐧 Linux", callback_data="trialhelp:howto:linux")],
+            [InlineKeyboardButton(text="🌍 Открыть раздел VPN", callback_data="nav:vpn")],
+        ]
+    )
+
+
+async def _job_trial_no_handshake_nudges(bot: Bot) -> None:
+    now = _utcnow()
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(AppSetting.key, AppSetting.int_value).where(
+                    or_(AppSetting.key.like("trial_used:%"), AppSetting.key.like("trial_end_ts:%"))
+                )
+            )
+        ).all()
+
+        trial_users: set[int] = set()
+        trial_end_ts_by_user: dict[int, int] = {}
+        for key, int_value in rows:
+            skey = str(key or "")
+            try:
+                uid = int(skey.split(":", 1)[1])
+            except Exception:
+                continue
+            if skey.startswith("trial_used:") and int(int_value or 0) == 1:
+                trial_users.add(uid)
+            elif skey.startswith("trial_end_ts:") and int(int_value or 0) > 0:
+                trial_end_ts_by_user[uid] = int(int_value or 0)
+
+        if not trial_users:
+            return
+
+        # Users with successful paid purchases are not part of this activation flow.
+        paid_rows = (
+            await session.execute(
+                select(Payment.tg_id).where(
+                    Payment.status == "success",
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
+                    Payment.tg_id.in_(list(trial_users)),
+                )
+            )
+        ).all()
+        paid_users = {int(tg_id) for (tg_id,) in paid_rows if tg_id is not None}
+
+        active_peer_rows = (
+            await session.execute(
+                select(VpnPeer.tg_id, VpnPeer.client_public_key).where(
+                    VpnPeer.is_active == True,
+                    VpnPeer.tg_id.in_(list(trial_users)),
+                    VpnPeer.client_public_key.is_not(None),
+                )
+            )
+        ).all()
+        pubkeys_by_user: dict[int, set[str]] = {}
+        for tg_id, pub in active_peer_rows:
+            if tg_id is None or not pub:
+                continue
+            pubkeys_by_user.setdefault(int(tg_id), set()).add(str(pub))
+
+        used_stats = await vpn_service.get_used_peer_stats()
+        used_keys = {str(item.get("public_key") or "") for item in used_stats if item.get("public_key")}
+
+        changed = False
+        for tg_id in trial_users:
+            if tg_id in paid_users:
+                continue
+            end_ts = int(trial_end_ts_by_user.get(tg_id, 0) or 0)
+            if end_ts <= 0:
+                continue
+            trial_end_at = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+            trial_start_at = trial_end_at - timedelta(days=5)
+            age_hours = (now - trial_start_at).total_seconds() / 3600.0
+            if age_hours < 6:
+                continue
+            # stop if the trial already touched VPN usage
+            if any(k in used_keys for k in pubkeys_by_user.get(int(tg_id), set())):
+                continue
+
+            first_sent = bool(await get_app_setting_int(session, f"trial_no_hs_6h_1_sent:{tg_id}", default=0))
+            second_sent = bool(await get_app_setting_int(session, f"trial_no_hs_6h_2_sent:{tg_id}", default=0))
+
+            send_stage = 0
+            if age_hours >= 12 and not second_sent:
+                send_stage = 2
+            elif age_hours >= 6 and not first_sent:
+                send_stage = 1
+            if not send_stage:
+                continue
+
+            msg = (
+                "👀 <b>Мы заметили, что вы ещё не подключились к VPN</b>\n\n"
+                "Выберите ваше устройство — и мы сразу отправим подробную инструкцию по подключению."
+            )
+            try:
+                await audit_send_message(
+                    bot,
+                    int(tg_id),
+                    msg,
+                    kind=f"trial_no_hs_{send_stage}",
+                    reply_markup=_trial_device_help_kb(),
+                    parse_mode="HTML",
+                )
+                await set_app_setting_int(session, f"trial_no_hs_6h_{send_stage}_sent:{tg_id}", 1)
+                changed = True
+            except Exception:
+                pass
+
+        if changed:
+            await session.commit()
+
 def _get_scheduler_vpn_servers() -> list[dict]:
     raw = (os.environ.get("VPN_SERVERS_JSON") or os.environ.get("VPN_SERVERS") or "").strip()
     out: list[dict] = []
@@ -652,6 +772,7 @@ async def run_scheduler() -> None:
                     await _job_subscription_end_at_notifications(bot)
                     await _job_trial_activation_notifications(bot)
                     await _job_trial_expiring_notifications(bot)
+                    await _job_trial_no_handshake_nudges(bot)
                     await _job_trial_reengagement_notifications(bot)
                     await _job_family_group_expiring_notifications(bot)
                     await _job_lte_expiring_notifications(bot)
