@@ -2048,6 +2048,17 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
         if r.kind not in last_by_kind:
             last_by_kind[r.kind] = r
 
+    current_cycle_by_kind: dict[str, MessageAudit] = {}
+    if sub_end is not None:
+        cycle_from = sub_end - timedelta(days=8)
+        cycle_to = sub_end + timedelta(days=2)
+        for r in expiry_rows:
+            sent_at = _ensure_tz_utc(getattr(r, 'sent_at', None))
+            if sent_at is None or not (cycle_from <= sent_at <= cycle_to):
+                continue
+            if r.kind in {"sub_warn_7d", "sub_warn_3d", "sub_warn_1d", "sub_expired"} and r.kind not in current_cycle_by_kind:
+                current_cycle_by_kind[r.kind] = r
+
     lines = []
     lines.append("👤 <b>Карточка пользователя</b>")
     lines.append(f"ID: <code>{tg_id}</code>")
@@ -2354,8 +2365,15 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
         seen = _fmt_dt_short(m.seen_at) if m.seen_at else "не подтверждено"
         return f"• {title}: ✅ {sent} | 👁 {seen}"
 
+    current_cycle_kinds = {"sub_warn_7d", "sub_warn_3d", "sub_warn_1d", "sub_expired"}
     for kind, title in expiry_kinds:
-        lines.append(_fmt_audit_line(last_by_kind.get(kind), title))
+        row = current_cycle_by_kind.get(kind) if kind in current_cycle_kinds else last_by_kind.get(kind)
+        lines.append(_fmt_audit_line(row, title))
+
+    if sub_end is not None:
+        lines.append(
+            f"<i>ℹ️ Напоминания по подписке в этом блоке показаны для текущей даты окончания: {_fmt_dt_short(sub_end)}. После продления или подарочных дней цикл уведомлений пересчитывается заново.</i>"
+        )
 
     return "\n".join(lines)
 
