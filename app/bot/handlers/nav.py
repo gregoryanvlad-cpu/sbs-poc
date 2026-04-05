@@ -2906,6 +2906,83 @@ async def on_vpn_location_go(cb: CallbackQuery) -> None:
         old_peers=old,
     )
 
+
+
+@router.callback_query(lambda c: c.data == "trialhelp:devices")
+async def on_trialhelp_devices(cb: CallbackQuery) -> None:
+    await cb.message.edit_text(
+        "📲 <b>Выберите ваше устройство</b>\n\nМы отправим подробную инструкцию и подскажем, что делать дальше.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📱 Android", callback_data="trialhelp:howto:android")],
+                [InlineKeyboardButton(text="🍎 iPhone / iPad", callback_data="trialhelp:howto:ios")],
+                [InlineKeyboardButton(text="💻 Windows", callback_data="trialhelp:howto:windows")],
+                [InlineKeyboardButton(text="🍏 macOS", callback_data="trialhelp:howto:macos")],
+                [InlineKeyboardButton(text="🐧 Linux", callback_data="trialhelp:howto:linux")],
+                [InlineKeyboardButton(text="🌍 Открыть раздел VPN", callback_data="nav:vpn")],
+            ]
+        ),
+        parse_mode="HTML",
+    )
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("trialhelp:howto:"))
+async def on_trialhelp_howto(cb: CallbackQuery) -> None:
+    platform = cb.data.split(":", 2)[2]
+    instructions = _load_wg_instructions()
+    lines = instructions.get(platform, [])
+    if platform == "linux" and not lines:
+        lines = [
+            "1) Установите WireGuard: <code>sudo apt update && sudo apt install wireguard</code>",
+            "2) Скопируйте конфиг в <code>/etc/wireguard/wg0.conf</code>",
+            "3) Запустите: <code>sudo wg-quick up wg0</code>",
+        ]
+    if platform != "ios" and not lines:
+        lines = [
+            "1) Установите приложение WireGuard на устройство.",
+            "2) В боте откройте раздел VPN и получите конфиг.",
+            "3) Импортируйте .conf в приложение WireGuard.",
+            "4) Включите VPN.",
+        ]
+    title_map = {
+        "android": "📱 Android",
+        "ios": "🍎 iPhone / iPad",
+        "windows": "💻 Windows",
+        "macos": "🍏 macOS",
+        "linux": "🐧 Linux",
+    }
+    title = title_map.get(platform, platform)
+    if platform == "ios":
+        text = (
+            "🍎 <b>iPhone / iPad — подключение WireGuard</b>\n\n"
+            "1) Установите WireGuard из App Store\n"
+            "2) В боте откройте раздел VPN\n"
+            "3) Нажмите «Подключиться к серверу»\n"
+            "4) Откройте .conf и импортируйте его в WireGuard\n\n"
+            "Ниже после этого сможете сразу перейти к подключению."
+        )
+    else:
+        text = f"{title} — <b>подключение WireGuard</b>\n\n{_fmt_instruction_block(lines)}"
+    await cb.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🌍 Перейти к подключению", callback_data="nav:vpn")],
+                [InlineKeyboardButton(text="📲 Другое устройство", callback_data="trialhelp:devices")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home_vpn")],
+            ]
+        ),
+        parse_mode="HTML",
+    )
+    await cb.message.answer(
+        "🌍 Теперь откройте раздел VPN и нажмите «Подключиться к серверу», чтобы получить конфиг и подключиться.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🌍 Открыть VPN", callback_data="nav:vpn")]]
+        ),
+    )
+    await _safe_cb_answer(cb)
+
 @router.callback_query(lambda c: c.data and c.data.startswith("vpn:howto:"))
 async def on_vpn_howto(cb: CallbackQuery) -> None:
     platform = cb.data.split(":", 2)[2]
