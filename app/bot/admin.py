@@ -1089,11 +1089,15 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
     silent_3 = silent_7 = 0
     for uid in active_paid_users_set:
         plist = [p for p in active_peers if int(p.tg_id) == uid]
-        has3 = any(str(p.client_public_key or '') in recent3_keys for p in plist)
-        has7 = any(str(p.client_public_key or '') in recent7_keys for p in plist)
-        if not has3:
+        if not plist:
+            continue
+        old3 = [p for p in plist if (_ensure_tz_utc(getattr(p, 'created_at', None)) or now) <= window3]
+        old7 = [p for p in plist if (_ensure_tz_utc(getattr(p, 'created_at', None)) or now) <= window7]
+        has3 = any(str(p.client_public_key or '') in recent3_keys for p in old3) if old3 else True
+        has7 = any(str(p.client_public_key or '') in recent7_keys for p in old7) if old7 else True
+        if old3 and not has3:
             silent_3 += 1
-        if not has7:
+        if old7 and not has7:
             silent_7 += 1
 
     payer_count_30 = len(distinct_payers_30)
@@ -2079,6 +2083,15 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
     else:
         lines.append("Источник: <b>🧍 Пришёл самостоятельно</b>")
 
+    # Referral balance snapshot
+    try:
+        bal_available, bal_pending, bal_paid = await referral_service.get_balances(session, tg_id)
+        lines.append(
+            f"Реф-баланс: доступно <b>{int(bal_available)} ₽</b> | в холде <b>{int(bal_pending)} ₽</b> | выплачено <b>{int(bal_paid)} ₽</b>"
+        )
+    except Exception:
+        pass
+
     if sub_end:
         lines.append(
             f"Подписка: <b>{'активна' if sub_active else 'не активна'}</b> | до: <b>{_fmt_dt_short(sub_end)}</b>"
@@ -2292,10 +2305,10 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
         for p in peers:
             active_txt = '✅' if p.is_active else '⛔️'
             code = (p.server_code or '—').upper() if p.server_code else '—'
-            srv_label = _server_numbered_label(servers, code)
-            vpn_ip = p.client_ip or '—'
+            srv_label = html.escape(_server_numbered_label(servers, code))
+            vpn_ip = html.escape(str(p.client_ip or '—'))
             ep = endpoints_by_key.get(p.client_public_key)
-            ep_txt = ep if ep else '—'
+            ep_txt = html.escape(str(ep if ep else '—'))
             hs_ts = int(handshakes_by_key.get(p.client_public_key, 0) or 0)
             hs_txt = '—'
             if hs_ts > 0:
@@ -3133,7 +3146,8 @@ async def admin_vpn_grace_list(cb: CallbackQuery) -> None:
     lines = [
         "🕒 <b>WG grace (24ч)</b>",
         "",
-        "Пиры уже отключены, но их можно восстановить при оплате в течение 24 часов (без смены конфига):",
+        f"Сейчас в окне восстановления: <b>{len(by_tg)}</b> пользовател(ей)",
+        "Пиры уже отключены, но их можно восстановить при оплате в течение 24 часов без смены конфига:",
         "",
     ]
     for tid, p in list(by_tg.items())[:80]:
@@ -3377,7 +3391,7 @@ async def admin_sub_gift_months(message: Message, state: FSMContext) -> None:
         "Приятного пользования!"
     )
     try:
-        await audit_send_message(message.bot, target_tg_id, notify_text, kind="admin_gift", reply_markup=None)
+        await audit_send_message(message.bot, target_tg_id, notify_text, kind="admin_gift", reply_markup=None, parse_mode="HTML")
     except Exception:
         pass
 
@@ -3796,73 +3810,73 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
     lines = [
         "📈 <b>Полная статистика бота</b>",
         "",
-        "1️⃣ <b>💸 MRR / expected MRR</b>",
-        f"• Текущий MRR: <b>{int(stats['mrr_current'])} ₽</b>",
-        f"• Expected MRR после текущего churn: <b>{int(stats['mrr_after_churn'])} ₽</b>",
+        "1️⃣ <b>💸 Доход от текущей платящей базы</b>",
+        f"• Ожидаемый месячный доход сейчас: <b>{int(stats['mrr_current'])} ₽</b>",
+        f"• С учётом текущего оттока: <b>{int(stats['mrr_after_churn'])} ₽</b>",
         "",
-        "2️⃣ <b>🧾 ARPPU</b>",
-        f"• Средняя выручка на платящего за 30 дней: <b>{float(stats['arppu_30']):.1f} ₽</b>",
+        "2️⃣ <b>🧾 Средний доход с одного платящего</b>",
+        f"• В среднем за 30 дней: <b>{float(stats['arppu_30']):.1f} ₽</b>",
         "",
-        "3️⃣ <b>🎁 Trial activation rate</b>",
-        f"• Всего trial: <b>{int(stats['trial_periods'])}</b>",
-        f"• Активных trial сейчас: <b>{int(stats['active_trials_now'])}</b>",
-        f"• Реально пользуются сейчас: <b>{int(stats['active_trials_using_now'])}</b>",
-        f"• Activation rate: <b>{float(stats['trial_activation_rate']):.1f}%</b>",
-        f"• Trial → paid: <b>{float(stats['hist_trial_conversion_percent']):.1f}%</b>",
+        "3️⃣ <b>🎁 Использование пробного периода</b>",
+        f"• Всего брали пробный: <b>{int(stats['trial_periods'])}</b>",
+        f"• Сейчас на пробном: <b>{int(stats['active_trials_now'])}</b>",
+        f"• Из них реально пользуются VPN: <b>{int(stats['active_trials_using_now'])}</b>",
+        f"• Не подключились или не пользуются: <b>{int(stats['active_trials_idle_now'])}</b>",
+        f"• Конверсия пробный → оплата: <b>{float(stats['hist_trial_conversion_percent']):.1f}%</b>",
         "",
-        "4️⃣ <b>⏱ Time-to-first-handshake</b>",
-        f"• Среднее время до первого VPN-подключения: <b>{float(stats['avg_hours_to_first_handshake']):.1f} ч</b>",
+        "4️⃣ <b>⏱ Как быстро люди начинают пользоваться VPN</b>",
+        f"• Среднее время до первого подключения: <b>{float(stats['avg_hours_to_first_handshake']):.1f} ч</b>",
         "",
-        "5️⃣ <b>💳 Time-to-paid</b>",
-        f"• Среднее время от trial до первой оплаты: <b>{float(stats['avg_hours_to_paid']):.1f} ч</b>",
+        "5️⃣ <b>💳 Как быстро люди доходят до оплаты</b>",
+        f"• Среднее время от пробного до первой оплаты: <b>{float(stats['avg_hours_to_paid']):.1f} ч</b>",
         "",
-        "6️⃣ <b>🔁 Renewal funnel</b>",
-        f"• Warn -3d: <b>{int(stats['renew_warn_3d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_3d'])}</b>",
-        f"• Warn -1d: <b>{int(stats['renew_warn_1d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_1d'])}</b>",
-        f"• Продлений за 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>",
-        f"• Churn: <b>{int(stats['churn_count'])}</b>/<b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)",
+        "6️⃣ <b>🔁 Продления подписки</b>",
+        f"• Получили напоминание за 3 дня: <b>{int(stats['renew_warn_3d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_3d'])}</b>",
+        f"• Получили напоминание за 1 день: <b>{int(stats['renew_warn_1d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_1d'])}</b>",
+        f"• Всего продлений за 30 дней: <b>{int(stats['renewals_last_30_days'])}</b>",
+        f"• Отток за месяц: <b>{int(stats['churn_count'])}</b> из <b>{int(stats['churn_cohort'])}</b> (<b>{float(stats['churn_percent']):.1f}%</b>)",
         "",
-        "7️⃣ <b>♻️ Reset health</b>",
-        f"• Успешных reset-перевыпусков за 7 дней: <b>{int(stats['reset_7'])}</b>",
-        f"• Успешных reset-перевыпусков за 30 дней: <b>{int(stats['reset_30'])}</b>",
+        "7️⃣ <b>♻️ Сбросы VPN</b>",
+        f"• Успешных сбросов за 7 дней: <b>{int(stats['reset_7'])}</b>",
+        f"• Успешных сбросов за 30 дней: <b>{int(stats['reset_30'])}</b>",
         "",
-        "8️⃣ <b>🌍 Server distribution</b>",
+        "8️⃣ <b>🌍 Нагрузка по серверам</b>",
     ]
     if stats.get('server_distribution'):
         for item in stats['server_distribution']:
-            lines.append(f"• {html.escape(str(item['label']))}: <b>{int(item['active_peers'])}</b> peer ({float(item['share']):.1f}%) | 🟢 handshake 24ч: <b>{int(item['handshakes_24h'])}</b>")
+            lines.append(f"• {html.escape(str(item['label']))}: <b>{int(item['active_peers'])}</b> активных peer ({float(item['share']):.1f}%) | 🟢 активных подключений за 24ч: <b>{int(item['handshakes_24h'])}</b>")
     else:
-        lines.append("• —")
+        lines.append("• Пока данных нет")
     lines += [
         "",
-        "9️⃣ <b>🎁 Promo / gift analytics</b>",
-        f"• Подарков выдано: <b>{int(stats['gift_count'])}</b>",
+        "9️⃣ <b>🎁 Подарки от администрации</b>",
+        f"• Всего выдано подарков: <b>{int(stats['gift_count'])}</b>",
         f"• Уникальных получателей: <b>{int(stats['gift_users'])}</b>",
         f"• Подарочных дней суммарно: <b>{int(stats['gift_days_total'])}</b>",
-        f"• Gift → paid: <b>{int(stats['gift_to_paid'])}</b>",
+        f"• После подарка сами оплатили: <b>{int(stats['gift_to_paid'])}</b>",
         "",
-        "🔟 <b>👥 Referral funnel</b>",
-        f"• Переходов по ссылкам: <b>{int(stats['referral_link_opened'])}</b>",
+        "🔟 <b>👥 Реферальная воронка</b>",
+        f"• Нажали Start по реф-ссылке: <b>{int(stats['referral_link_opened'])}</b>",
         f"• Активных рефералов: <b>{int(stats['referral_active'])}</b>",
-        f"• Реферал оплатил: <b>{int(stats['referral_paid'])}</b>",
-        f"• Начисления: pending <b>{int(stats['referral_earning_pending'])}</b> / available <b>{int(stats['referral_earning_available'])}</b> / paid <b>{int(stats['referral_earning_paid'])}</b>",
+        f"• Реферал дошёл до оплаты: <b>{int(stats['referral_paid'])}</b>",
+        f"• Начисления: в холде <b>{int(stats['referral_earning_pending'])}</b> / доступны <b>{int(stats['referral_earning_available'])}</b> / выплачены <b>{int(stats['referral_earning_paid'])}</b>",
         "",
-        "1️⃣1️⃣ <b>👨‍👩‍👧‍👦 Family upsell analytics</b>",
-        f"• Увидели апселл: <b>{int(stats['family_upsell_seen'])}</b>",
-        f"• Купили family seat: <b>{int(stats['family_upsell_orders'])}</b>",
-        f"• Конверсия: <b>{float(stats['family_upsell_conversion']):.1f}%</b>",
-        f"• Активных family-групп: <b>{int(stats['family_groups_active'])}</b> | профилей: <b>{int(stats['family_profiles_active'])}</b>",
+        "1️⃣1️⃣ <b>👨‍👩‍👧‍👦 Семейные места</b>",
+        f"• Увидели предложение семейного места: <b>{int(stats['family_upsell_seen'])}</b>",
+        f"• Купили семейное место: <b>{int(stats['family_upsell_orders'])}</b>",
+        f"• Конверсия в покупку: <b>{float(stats['family_upsell_conversion']):.1f}%</b>",
+        f"• Активных семейных групп: <b>{int(stats['family_groups_active'])}</b> | активных профилей: <b>{int(stats['family_profiles_active'])}</b>",
         "",
-        "1️⃣2️⃣ <b>😶 Silent risk metrics</b>",
-        f"• Платят, но без handshake 3+ дня: <b>{int(stats['silent_risk_3d'])}</b>",
-        f"• Платят, но без handshake 7+ дней: <b>{int(stats['silent_risk_7d'])}</b>",
+        "1️⃣2️⃣ <b>😶 Кто платит, но почти не пользуется VPN</b>",
+        f"• Есть активный VPN, но не было подключений 3+ дня: <b>{int(stats['silent_risk_3d'])}</b>",
+        f"• Есть активный VPN, но не было подключений 7+ дней: <b>{int(stats['silent_risk_7d'])}</b>",
         "",
-        "📌 <b>Базовый операционный срез</b>",
-        f"• 👥 Пользователей: <b>{int(stats['total_users'])}</b> | 🚫 заблокировали: <b>{int(stats['blocked_users'])}</b>",
-        f"• 🌐 Активных peer: <b>{int(stats['peers_total'])}</b> | 🟢 платящих сейчас: <b>{int(stats['active_paid_users'])}</b>",
-        f"• 💰 199 ₽: <b>{int(stats['payments_199'])}</b> | ➕ +99 ₽: <b>{int(stats['upsells_99'])}</b> | 📶 LTE 99 ₽: <b>{int(stats['lte_99'])}</b>",
+        "📌 <b>Основные цифры по боту</b>",
+        f"• 👥 Всего пользователей: <b>{int(stats['total_users'])}</b> | 🚫 заблокировали бота: <b>{int(stats['blocked_users'])}</b>",
+        f"• 🌐 Активных peer: <b>{int(stats['peers_total'])}</b> | 💳 Платящих сейчас: <b>{int(stats['active_paid_users'])}</b>",
+        f"• 💰 Покупок на 199 ₽: <b>{int(stats['payments_199'])}</b> | ➕ Апселлов +99 ₽: <b>{int(stats['upsells_99'])}</b> | 📶 LTE на 99 ₽: <b>{int(stats['lte_99'])}</b>",
         f"• 📨 D1: <b>{int(stats['trial_d1_sent'])}</b>/<b>{int(stats['trial_d1_seen'])}</b> | D2: <b>{int(stats['trial_d2_sent'])}</b>/<b>{int(stats['trial_d2_seen'])}</b>",
-        f"• 📅 Продажи 30д: <b>{int(stats['sales_last_30'])}</b> / <b>{int(stats['revenue_last_30'])} ₽</b> | 7д: <b>{int(stats['sales_last_7'])}</b> / <b>{int(stats['revenue_last_7'])} ₽</b>",
+        f"• 📅 Продажи за 30 дней: <b>{int(stats['sales_last_30'])}</b> / <b>{int(stats['revenue_last_30'])} ₽</b> | за 7 дней: <b>{int(stats['sales_last_7'])}</b> / <b>{int(stats['revenue_last_7'])} ₽</b>",
     ]
     parts = _split_html_lines(lines, limit=3400)
     await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
@@ -4599,7 +4613,7 @@ async def admin_vpn_active_profiles(cb: CallbackQuery) -> None:
         shown += 1
         who = tg_label.get(int(row.tg_id)) or f"ID {row.tg_id}"
         code = (item.get("server_code") or row.server_code or os.environ.get("VPN_CODE", "NL")).upper()
-        srv_label = _server_numbered_label(servers, code)
+        srv_label = html.escape(_server_numbered_label(servers, code))
         # keep tg_id in the end for unambiguous matching
         lines.append(
             f"{shown}. {who} | {srv_label} | <code>{row.client_public_key[:8]}…</code> | "
