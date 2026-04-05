@@ -26,6 +26,18 @@ def _ensure_tz(dt: datetime) -> datetime:
     return dt
 
 
+def _reset_membership_notifications(membership: YandexMembership) -> None:
+    """Re-open 7/3/1 day reminder windows for a new coverage period.
+
+    These fields are cycle-bound, so whenever coverage_end_at is refreshed after
+    renewal/gift/manual reissue we must clear the sent markers. Otherwise users
+    may miss the next reminder cycle.
+    """
+    membership.notified_7d_at = None
+    membership.notified_3d_at = None
+    membership.notified_1d_at = None
+
+
 def _plus_has_one_month_left(acc: YandexAccount, *, now: datetime) -> bool:
     """Manual rule: allow issuing to this account only if it will live >= 1 calendar month.
 
@@ -208,6 +220,7 @@ class YandexService:
                 invite_issued_at=now,
                 coverage_end_at=sub_end,
             )
+            _reset_membership_notifications(new_m)
             session.add(new_m)
             await session.flush()
             return slot.invite_link
@@ -220,6 +233,7 @@ class YandexService:
         membership.invite_link = slot.invite_link
         membership.invite_issued_at = now
         membership.coverage_end_at = sub_end
+        _reset_membership_notifications(membership)
         membership.status = "issued"
         membership.updated_at = now
 
@@ -263,6 +277,7 @@ class YandexService:
             membership.invite_link = slot.invite_link
             membership.invite_issued_at = now
             membership.coverage_end_at = _ensure_tz(sub.end_at)  # re-freeze to the new paid end
+            _reset_membership_notifications(membership)
             membership.status = "issued"
             membership.updated_at = now
 
@@ -299,6 +314,7 @@ class YandexService:
         membership.invite_link = slot.invite_link
         membership.invite_issued_at = now
         membership.coverage_end_at = _ensure_tz(sub.end_at)
+        _reset_membership_notifications(membership)
         membership.status = 'issued'
         membership.updated_at = now
         await session.flush()
