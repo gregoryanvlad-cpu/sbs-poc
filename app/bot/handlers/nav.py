@@ -10,6 +10,8 @@ from datetime import datetime, timezone, timedelta
 
 import qrcode
 from aiogram import Router, Bot
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -58,6 +60,63 @@ from app.services.lte_vpn.service import lte_vpn_service
 from app.services.message_audit import audit_send_message
 
 router = Router()
+
+
+class PromoCodeFSM(StatesGroup):
+    waiting_code = State()
+
+
+def _promo_norm(code: str) -> str:
+    code = (code or "").strip().upper()
+    code = "".join(ch for ch in code if ch.isalnum() or ch in "_-")
+    return code[:32]
+
+
+async def _promo_defs(session) -> dict[str, int]:
+    rows = (await session.execute(select(AppSetting).where(AppSetting.key.like("promo:def:%")))).scalars().all()
+    out: dict[str, int] = {}
+    for row in rows:
+        code = str(row.key or "").split(":", 2)[-1].strip().upper()
+        try:
+            price = int(row.int_value or 0)
+        except Exception:
+            price = 0
+        if code and price > 0:
+            out[code] = price
+    return out
+
+
+async def _get_user_active_promo(session, tg_id: int) -> tuple[str, int] | None:
+    rows = (await session.execute(select(AppSetting).where(AppSetting.key.like(f"promo:applied:{int(tg_id)}:%")))).scalars().all()
+    for row in rows:
+        code = str(row.key or "").split(":")[-1].strip().upper()
+        price = int(row.int_value or 0)
+        if code and price > 0:
+            return code, price
+    return None
+
+
+async def _render_pay_screen(message, tg_id: int) -> None:
+    async with session_scope() as session:
+        base_price = int(await get_price_rub(session) or 0)
+        active_promo = await _get_user_active_promo(session, tg_id)
+    if active_promo:
+        promo_code, promo_price = active_promo
+        text = (
+            "💳 <b>Оплата</b>\n\n"
+            f"Тариф: <s>{base_price} ₽</s> <b>{promo_price} ₽</b> / {settings.period_months} мес.\n"
+            f"🎟 Применён промокод: <code>{html_escape(promo_code)}</code>\n\n"
+            "Промокод уже применён к вашему аккаунту и будет использован при ближайшей оплате."
+        )
+        kb = kb_pay(price_rub=promo_price, original_price_rub=base_price, promo_code=promo_code)
+    else:
+        text = f"💳 <b>Оплата</b>\n\nТариф: <b>{base_price} ₽</b> / {settings.period_months} мес."
+        kb = kb_pay(price_rub=base_price)
+    try:
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
 
 TG_PROXY_URL = "https://t.me/proxy?server=mt.masterpix.org&port=443&secret=7ix9qzx1rb59pdRm9E7ivEp4cC5hcHBsZS5jb20"
 
@@ -1356,15 +1415,7 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     if where == "pay":
-        async with session_scope() as session:
-            price_rub = await get_price_rub(session)
-        try:
-            await cb.message.edit_text(
-                f"💳 Оплата\n\nТариф: {price_rub} ₽ / {settings.period_months} мес.",
-                reply_markup=kb_pay(price_rub=price_rub),
-            )
-        except Exception:
-            pass
+        await _render_pay_screen(cb.message, cb.from_user.id)
         await _safe_cb_answer(cb)
         return
 
@@ -1527,6 +1578,62 @@ async def on_yandex_issue_now(cb: CallbackQuery) -> None:
 
 
 
+
+
+@router.callback_query(lambda c: c.data == "pay:promo:enter")
+async def pay_promo_enter(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PromoCodeFSM.waiting_code)
+    await cb.answer()
+    text = (
+        "🎟 <b>Промокод</b>\n\n"
+        "Отправьте промокод одним сообщением.\n\n"
+        "Промокод применяется к вашему аккаунту и будет использован при ближайшей оплате. Отменить применение нельзя."
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:pay")]]), parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:pay")]]), parse_mode="HTML")
+
+
+@router.message(PromoCodeFSM.waiting_code)
+async def pay_promo_apply(message, state: FSMContext) -> None:
+    code = _promo_norm(message.text or "")
+    if not code:
+        await message.answer("❌ Введите промокод буквами и цифрами.", reply_markup=kb_back_home())
+        return
+    tg_id = int(message.from_user.id)
+    async with session_scope() as session:
+        used = await session.get(AppSetting, f"promo:used:{tg_id}:{code}")
+        if used and int(used.int_value or 0) == 1:
+            await state.clear()
+            await message.answer("❌ Этот промокод уже был применён ранее и не может быть использован повторно.", reply_markup=kb_back_home())
+            return
+        active = await _get_user_active_promo(session, tg_id)
+        if active:
+            active_code, _ = active
+            await state.clear()
+            if active_code == code:
+                await message.answer(f"ℹ️ Промокод <code>{html_escape(code)}</code> уже применён к вашему аккаунту и ждёт оплаты.", parse_mode="HTML", reply_markup=kb_back_home())
+            else:
+                await message.answer(f"❌ У вас уже применён другой промокод: <code>{html_escape(active_code)}</code>. Отменить его нельзя.", parse_mode="HTML", reply_markup=kb_back_home())
+            return
+        defs = await _promo_defs(session)
+        promo_price = int(defs.get(code) or 0)
+        if promo_price <= 0:
+            await state.clear()
+            await message.answer("❌ Промокод не найден или больше не действует.", reply_markup=kb_back_home())
+            return
+        base_price = int(await get_price_rub(session) or 0)
+        if promo_price >= base_price:
+            await state.clear()
+            await message.answer("❌ Этот промокод сейчас недействителен.", reply_markup=kb_back_home())
+            return
+        await set_app_setting_int(session, f"promo:applied:{tg_id}:{code}", promo_price)
+        await session.commit()
+    await state.clear()
+    await _render_pay_screen(message, tg_id)
+
+
 @router.callback_query(lambda c: c.data and (c.data.startswith("pay:buy") or c.data.startswith("pay:mock") or c.data.startswith("pay:promo:")))
 async def on_buy(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
@@ -1547,6 +1654,13 @@ async def on_buy(cb: CallbackQuery) -> None:
             promo_months = 1
         else:
             promo_amount = None
+
+    if promo_amount is None and promo_code is None and (cb.data or "").startswith("pay:buy"):
+        async with session_scope() as session:
+            active_promo = await _get_user_active_promo(session, tg_id)
+        if active_promo:
+            promo_code, promo_amount = active_promo
+            promo_months = 1
 
     # legacy support: old buttons used pay:mock
     provider = settings.payment_provider
@@ -1783,10 +1897,16 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                         provider_payment_id=provider_tid,
                     )
 
-                    # Mark one-time winback promo as consumed if this payment was promo.
+                    # Mark promo as consumed for successful discounted payment.
                     try:
-                        if (pay.provider or "").startswith("platega_winback_"):
+                        provider_name = str(pay.provider or "")
+                        if provider_name.startswith("platega_winback_"):
                             await set_app_setting_int(session, f"winback_promo_consumed:{tg_id}", 1)
+                        elif provider_name.startswith("platega_promo_"):
+                            used_code = provider_name.split("platega_promo_", 1)[1].strip().upper()
+                            if used_code:
+                                await set_app_setting_int(session, f"promo:used:{tg_id}:{used_code}", 1)
+                                await set_app_setting_int(session, f"promo:applied:{tg_id}:{used_code}", None)
                     except Exception:
                         pass
 
@@ -1950,7 +2070,7 @@ async def _start_platega_payment(
             tg_id=tg_id,
             amount=price_rub,
             currency="RUB",
-            provider=(f"platega_{promo_code}" if promo_code else "platega"),
+            provider=(f"platega_promo_{promo_code}" if (promo_code and promo_code not in {"lte", "winback_69", "winback_29"}) else (f"platega_{promo_code}" if promo_code else "platega")),
             status="pending",
             period_days=pay_days,
             period_months=pay_months,
@@ -2131,10 +2251,16 @@ async def on_pay_check(cb: CallbackQuery) -> None:
                 provider_payment_id=pay.provider_payment_id,
             )
 
-            # Mark one-time winback promo as consumed if this payment was promo.
+            # Mark promo as consumed for successful discounted payment.
             try:
-                if (pay.provider or "").startswith("platega_winback_"):
+                provider_name = str(pay.provider or "")
+                if provider_name.startswith("platega_winback_"):
                     await set_app_setting_int(session, f"winback_promo_consumed:{cb.from_user.id}", 1)
+                elif provider_name.startswith("platega_promo_"):
+                    used_code = provider_name.split("platega_promo_", 1)[1].strip().upper()
+                    if used_code:
+                        await set_app_setting_int(session, f"promo:used:{cb.from_user.id}:{used_code}", 1)
+                        await set_app_setting_int(session, f"promo:applied:{cb.from_user.id}:{used_code}", None)
             except Exception:
                 pass
 
