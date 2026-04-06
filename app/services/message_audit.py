@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from html import unescape as html_unescape
 from datetime import datetime, timezone
 
 from aiogram import Bot
@@ -11,8 +12,18 @@ from app.db.models.message_audit import MessageAudit
 from app.db.session import session_scope
 
 
-def _preview(text: str, limit: int = 700) -> str:
+def _strip_markup(text: str) -> str:
+    t = text or ""
+    t = re.sub(r"<[^>]+>", "", t)
+    t = html_unescape(t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _preview(text: str, limit: int = 700, *, parse_mode: str | None = None) -> str:
     t = (text or "").strip()
+    if str(parse_mode or "").upper() == "HTML":
+        t = _strip_markup(t)
     if len(t) <= limit:
         return t
     return t[: limit - 1] + "…"
@@ -74,7 +85,7 @@ async def audit_send_message(
         if len(err_text) > 240:
             err_text = err_text[:239] + "…"
 
-    preview = _preview(("[PHOTO]\n" if photo else "") + (text or ""))
+    preview = _preview(("[PHOTO]\n" if photo else "") + (text or ""), parse_mode=parse_mode)
     if not ok:
         preview = f"[SEND_FAILED:{err_tag}] {err_text}\n{preview}".strip()
 
