@@ -138,6 +138,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="⏳ Холды (рефералка)", callback_data="admin:ref:holds")
     b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
     b.button(text="💲 Цена подписки", callback_data="admin:price")
+    b.button(text="🎟 Промокоды", callback_data="admin:promos")
     b.button(text="📶 Цена VPN LTE", callback_data="admin:lte_price")
     b.button(text="💳 Проверить оплаты", callback_data="admin:payments:reconcile")
     b.button(text="📶 Починить LTE", callback_data="admin:lte:repair")
