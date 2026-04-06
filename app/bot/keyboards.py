@@ -37,9 +37,11 @@ def kb_cabinet(*, is_owner: bool = False, show_family_upsell: bool = False) -> I
     return b.as_markup()
 
 
-def kb_pay(*, price_rub: int) -> InlineKeyboardMarkup:
+def kb_pay(*, price_rub: int, original_price_rub: int | None = None, promo_code: str | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text=f"✅ Оплатить {int(price_rub)} ₽", callback_data="pay:buy:1m")
+    if not promo_code:
+        b.button(text="🎟 Ввести промокод", callback_data="pay:promo:enter")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
