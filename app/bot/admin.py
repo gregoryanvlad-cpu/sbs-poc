@@ -1591,6 +1591,40 @@ class AdminBroadcastFSM(StatesGroup):
     waiting_text = State()
 
 
+class AdminPromoCreateFSM(StatesGroup):
+    waiting_code = State()
+    waiting_price = State()
+
+
+class AdminPromoDeleteFSM(StatesGroup):
+    waiting_code = State()
+
+
+def _promo_norm(code: str) -> str:
+    code = (code or "").strip().upper()
+    code = "".join(ch for ch in code if ch.isalnum() or ch in "_-")
+    return code[:32]
+
+
+async def _promo_defs(session) -> dict[str, int]:
+    rows = (await session.execute(select(AppSetting).where(AppSetting.key.like("promo:def:%")))).scalars().all()
+    out: dict[str, int] = {}
+    for row in rows:
+        code = str(row.key or "").split(":", 2)[-1].strip().upper()
+        price = int(getattr(row, "int_value", 0) or 0)
+        if code and price > 0:
+            out[code] = price
+    return dict(sorted(out.items()))
+
+
+def _kb_admin_promos() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать промокод", callback_data="admin:promos:create")],
+        [InlineKeyboardButton(text="🗑 Удалить промокод", callback_data="admin:promos:delete")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
+    ])
+
+
 # ==========================
 # ADMIN MENU
 # ==========================
@@ -2341,7 +2375,8 @@ async def _render_user_card(session, bot, tg_id: int) -> str:
             sent = _fmt_dt_short(m.sent_at)
             seen = _fmt_dt_short(m.seen_at) if m.seen_at else "не подтверждено"
             # concise preview
-            preview = html.escape((m.text_preview or "").replace("\n", " ").strip())
+            preview_raw = re.sub(r"<[^>]+>", "", (m.text_preview or "").replace("\n", " ").strip())
+            preview = html.escape(preview_raw)
             if len(preview) > 120:
                 preview = preview[:119] + "…"
             lines.append(f"• <b>{html.escape(str(m.kind or '—'))}</b> | {sent} | 👁 {seen}\n  {preview}")
@@ -3272,6 +3307,106 @@ async def admin_lte_price_set(message: Message, state: FSMContext) -> None:
         reply_markup=kb_admin_menu(),
         parse_mode="HTML",
     )
+
+
+
+
+@router.callback_query(lambda c: c.data == "admin:promos")
+async def admin_promos(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.clear()
+    async with session_scope() as session:
+        defs = await _promo_defs(session)
+        base_price = int(await get_price_rub(session) or 0)
+    lines = ["🎟 <b>Промокоды</b>", "", f"Базовая цена подписки: <b>{base_price} ₽</b>", ""]
+    if defs:
+        lines.append("Активные промокоды:")
+        for code, price in defs.items():
+            lines.append(f"• <code>{html.escape(code)}</code> → <b>{price} ₽</b>")
+    else:
+        lines.append("Активных промокодов пока нет.")
+    await cb.message.edit_text("\n".join(lines), reply_markup=_kb_admin_promos(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin:promos:create")
+async def admin_promos_create_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.set_state(AdminPromoCreateFSM.waiting_code)
+    await cb.message.edit_text("🎟 <b>Создание промокода</b>\n\nОтправьте код промокода.\nДопустимы буквы, цифры, <code>_</code> и <code>-</code>.", reply_markup=_kb_admin_back(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.message(AdminPromoCreateFSM.waiting_code)
+async def admin_promos_create_code(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    code = _promo_norm(message.text or "")
+    if not code:
+        await message.answer("❌ Некорректный код промокода.", reply_markup=_kb_admin_back())
+        return
+    await state.update_data(promo_code=code)
+    await state.set_state(AdminPromoCreateFSM.waiting_price)
+    await message.answer(f"Код: <code>{html.escape(code)}</code>\n\nТеперь отправьте новую цену в рублях.", reply_markup=_kb_admin_back(), parse_mode="HTML")
+
+
+@router.message(AdminPromoCreateFSM.waiting_price)
+async def admin_promos_create_price(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    raw = re.sub(r"[^0-9]", "", (message.text or "").strip())
+    if not raw:
+        await message.answer("❌ Введите цену числом, например: 149", reply_markup=_kb_admin_back())
+        return
+    price = int(raw)
+    data = await state.get_data()
+    code = _promo_norm(str(data.get("promo_code") or ""))
+    if not code or price <= 0:
+        await message.answer("❌ Не удалось создать промокод.", reply_markup=kb_admin_menu())
+        await state.clear()
+        return
+    async with session_scope() as session:
+        base_price = int(await get_price_rub(session) or 0)
+        if price >= base_price:
+            await message.answer(f"❌ Цена по промокоду должна быть ниже базовой цены <b>{base_price} ₽</b>.", reply_markup=_kb_admin_back(), parse_mode="HTML")
+            return
+        await set_app_setting_int(session, f"promo:def:{code}", price)
+        await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Промокод <code>{html.escape(code)}</code> создан. Новая цена: <b>{price} ₽</b>", reply_markup=kb_admin_menu(), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data == "admin:promos:delete")
+async def admin_promos_delete_start(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.set_state(AdminPromoDeleteFSM.waiting_code)
+    await cb.message.edit_text("🗑 <b>Удаление промокода</b>\n\nОтправьте код промокода, который нужно удалить.", reply_markup=_kb_admin_back(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.message(AdminPromoDeleteFSM.waiting_code)
+async def admin_promos_delete_finish(message: Message, state: FSMContext) -> None:
+    if not is_owner(message.from_user.id):
+        return
+    code = _promo_norm(message.text or "")
+    if not code:
+        await message.answer("❌ Укажите код промокода.", reply_markup=_kb_admin_back())
+        return
+    async with session_scope() as session:
+        row = await session.get(AppSetting, f"promo:def:{code}")
+        if not row:
+            await message.answer("❌ Такой промокод не найден.", reply_markup=_kb_admin_back())
+            return
+        await session.delete(row)
+        await session.commit()
+    await state.clear()
+    await message.answer(f"✅ Промокод <code>{html.escape(code)}</code> удалён.", reply_markup=kb_admin_menu(), parse_mode="HTML")
 
 
 # ==========================
