@@ -121,6 +121,14 @@ def _fmt_countdown_to(dt: datetime | None) -> str:
         return "—"
 
 
+def _normalize_utc(dt: datetime | None) -> datetime | None:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 async def _render_pay_screen(message, tg_id: int) -> None:
     async with session_scope() as session:
         base_price = int(await get_price_rub(session) or 0)
@@ -1504,8 +1512,8 @@ async def on_nav(cb: CallbackQuery) -> None:
         target_end = cov or sub_end
         rotate_hint = ""
         try:
-            coverage_dt = _ensure_tz(cov) if cov else None
-            sub_end_dt = _ensure_tz(sub_end) if sub_end else None
+            coverage_dt = _normalize_utc(cov)
+            sub_end_dt = _normalize_utc(sub_end)
             has_scheduled_reissue = bool(coverage_dt and sub_end_dt and sub_end_dt > coverage_dt)
 
             if target_end:
