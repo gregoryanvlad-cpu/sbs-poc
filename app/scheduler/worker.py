@@ -1076,6 +1076,15 @@ async def _job_expire_family_groups(bot: Bot) -> None:
 
 
 
+def _winback_kb(*, amount_rub: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить за {int(amount_rub)} ₽", callback_data=f"pay:discount:{int(amount_rub)}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+        ]
+    )
+
+
 async def _job_winback_discount_campaign(bot: Bot) -> None:
     """One-time winback discount campaign.
 
