@@ -1498,31 +1498,35 @@ async def on_nav(cb: CallbackQuery) -> None:
 
         buttons: list[list[InlineKeyboardButton]] = []
 
+        cov = getattr(ym, "coverage_end_at", None) if ym else None
+        rotate_hint = ""
+        try:
+            if cov:
+                if not has_paid_purchase:
+                    rotate_hint = (
+                        "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n"
+                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(cov)}</b>\n\n"
+                    )
+                elif sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
+                    rotate_hint = (
+                        f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(cov)}</b>\n"
+                        f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(cov)}</b>\n\n"
+                    )
+                    if ym and ym.invite_link:
+                        buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
+                else:
+                    rotate_hint = (
+                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(cov)}</b>\n"
+                        "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
+                    )
+            elif not has_paid_purchase and sub and _is_sub_active(sub.end_at):
+                rotate_hint = "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
+        except Exception:
+            pass
+
         # Если ссылка уже есть — показываем кнопку открыть.
         if ym and ym.invite_link:
-            buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
-            rotate_hint = ""
-            try:
-                cov = getattr(ym, 'coverage_end_at', None)
-                if cov:
-                    if not has_paid_purchase:
-                        rotate_hint = (
-                            "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
-                        )
-                    elif sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
-                        buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
-                        rotate_hint = (
-                            f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(cov)}</b>\n"
-                            f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(cov)}</b>\n\n"
-                        )
-                    else:
-                        rotate_hint = (
-                            f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(cov)}</b>\n"
-                            "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
-                        )
-            except Exception:
-                pass
-            # Главное — ссылка всегда доступна здесь.
+            buttons.insert(0, [InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
                 "✅ Приглашение уже выдано и доступно по кнопке ниже.\n\n"
@@ -1540,13 +1544,15 @@ async def on_nav(cb: CallbackQuery) -> None:
                     "🟡 <b>Yandex Plus</b>\n\n"
                     "⚠️ <b>Сейчас места в семейной подписке временно заняты.</b>\n\n"
                     "Наша команда уже знает об этом и скоро загрузит новые аккаунты. "
-                    "Как только появятся новые места, выдача приглашений возобновится."
+                    "Как только появятся новые места, выдача приглашений возобновится.\n\n"
+                    + rotate_hint
                 )
             else:
                 buttons.append([InlineKeyboardButton(text="Получить приглашение", callback_data="yandex:issue")])
                 info = (
                     "🟡 <b>Yandex Plus</b>\n\n"
-                    "Нажмите кнопку ниже — вам будет выслано приглашение в семейную подписку.\n\n"
+                    + rotate_hint
+                    + "Нажмите кнопку ниже — вам будет выслано приглашение в семейную подписку.\n\n"
                     "⚠️ <b>Важно:</b> после получения ссылки перейдите по ней <b>сразу сейчас</b>.\n"
                     "Ссылка-приглашение действует ограниченное время и позже может устареть."
                 )
