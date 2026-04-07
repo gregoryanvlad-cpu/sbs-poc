@@ -96,6 +96,31 @@ async def _get_user_active_promo(session, tg_id: int) -> tuple[str, int] | None:
     return None
 
 
+def _fmt_countdown_to(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        now = datetime.now(timezone.utc)
+        target = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        total = int((target - now).total_seconds())
+        if total <= 0:
+            return "меньше минуты"
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days} дн.")
+        if days or hours:
+            parts.append(f"{hours} ч.")
+        if days or hours or minutes:
+            parts.append(f"{minutes} мин.")
+        parts.append(f"{seconds} сек.")
+        return " ".join(parts)
+    except Exception:
+        return "—"
+
+
 async def _render_pay_screen(message, tg_id: int) -> None:
     async with session_scope() as session:
         base_price = int(await get_price_rub(session) or 0)
@@ -1466,10 +1491,15 @@ async def on_nav(cb: CallbackQuery) -> None:
         # Если ссылка уже есть — показываем кнопку открыть.
         if ym and ym.invite_link:
             buttons.append([InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
+            rotate_hint = ""
             try:
                 cov = getattr(ym, 'coverage_end_at', None)
                 if cov and sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
                     buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
+                    rotate_hint = (
+                        f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(cov)}</b>\n"
+                        f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(cov)}</b>\n\n"
+                    )
             except Exception:
                 pass
             # Главное — ссылка всегда доступна здесь.
@@ -1478,9 +1508,10 @@ async def on_nav(cb: CallbackQuery) -> None:
                 "✅ Приглашение уже выдано и доступно по кнопке ниже.\n\n"
                 f"Семья: <code>{getattr(ym, 'account_label', '—') or '—'}</code>\n"
                 f"Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n\n"
-                "⚠️ <b>Важно: откройте приглашение сразу ⚠️</b>\n"
-                "Ссылка-приглашение действует ограниченное время и позже может устареть.\n\n"
-                "Если ссылка уже не открывается — запроси новую у поддержки: @sbsmanager_bot."
+                + rotate_hint
+                + "⚠️ <b>Важно: откройте приглашение сразу ⚠️</b>\n"
+                + "Ссылка-приглашение действует ограниченное время и позже может устареть.\n\n"
+                + "Если ссылка уже не открывается — запроси новую у поддержки: @sbsmanager_bot."
             )
         else:
             invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
