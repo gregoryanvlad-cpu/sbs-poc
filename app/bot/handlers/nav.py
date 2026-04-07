@@ -1471,8 +1471,18 @@ async def on_nav(cb: CallbackQuery) -> None:
         async with session_scope() as session:
             sub = await get_subscription(session, cb.from_user.id)
             ym = await _get_yandex_membership(session, cb.from_user.id)
+            has_paid_purchase = bool(await session.scalar(
+                select(Payment.id)
+                .where(
+                    Payment.tg_id == int(cb.from_user.id),
+                    Payment.status == "success",
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
+                )
+                .order_by(Payment.id.desc())
+                .limit(1)
+            ))
 
-        
         if not _is_sub_active(sub.end_at):
             try:
                 await cb.message.edit_text(
@@ -1494,12 +1504,22 @@ async def on_nav(cb: CallbackQuery) -> None:
             rotate_hint = ""
             try:
                 cov = getattr(ym, 'coverage_end_at', None)
-                if cov and sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
-                    buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
-                    rotate_hint = (
-                        f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(cov)}</b>\n"
-                        f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(cov)}</b>\n\n"
-                    )
+                if cov:
+                    if not has_paid_purchase:
+                        rotate_hint = (
+                            "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
+                        )
+                    elif sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
+                        buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
+                        rotate_hint = (
+                            f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(cov)}</b>\n"
+                            f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(cov)}</b>\n\n"
+                        )
+                    else:
+                        rotate_hint = (
+                            f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(cov)}</b>\n"
+                            "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
+                        )
             except Exception:
                 pass
             # Главное — ссылка всегда доступна здесь.
