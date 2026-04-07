@@ -15,7 +15,7 @@ from sqlalchemy.orm import aliased
 from app.core.config import settings
 from app.db.locks import advisory_unlock, try_advisory_lock
 from app.db.session import session_scope
-from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, FamilyVpnProfile, Referral, ReferralEarning
+from app.db.models import Payment, Subscription, VpnPeer, FamilyVpnGroup, FamilyVpnProfile, Referral, ReferralEarning, AppSetting, User
 from app.db.models import LteVpnClient
 from app.db.models.region_vpn_session import RegionVpnSession
 from app.db.models.yandex_membership import YandexMembership
@@ -87,6 +87,10 @@ def _trial_device_help_kb() -> InlineKeyboardMarkup:
 
 async def _job_trial_no_handshake_nudges(bot: Bot) -> None:
     now = _utcnow()
+    try:
+        from app.services.vpn.service import vpn_service
+    except Exception:
+        vpn_service = None
     async with session_scope() as session:
         rows = (
             await session.execute(
@@ -140,7 +144,7 @@ async def _job_trial_no_handshake_nudges(bot: Bot) -> None:
                 continue
             pubkeys_by_user.setdefault(int(tg_id), set()).add(str(pub))
 
-        used_stats = await vpn_service.get_used_peer_stats()
+        used_stats = await vpn_service.get_used_peer_stats() if vpn_service else []
         used_keys = {str(item.get("public_key") or "") for item in used_stats if item.get("public_key")}
 
         changed = False
@@ -184,6 +188,108 @@ async def _job_trial_no_handshake_nudges(bot: Bot) -> None:
                     parse_mode="HTML",
                 )
                 await set_app_setting_int(session, f"trial_no_hs_6h_{send_stage}_sent:{tg_id}", 1)
+                changed = True
+            except Exception:
+                pass
+
+        if changed:
+            await session.commit()
+
+
+def _start_device_help_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Android", callback_data="trialhelp:howto:android")],
+            [InlineKeyboardButton(text="🍎 iPhone / iPad", callback_data="trialhelp:howto:ios")],
+            [InlineKeyboardButton(text="💻 Windows", callback_data="trialhelp:howto:windows")],
+            [InlineKeyboardButton(text="🍏 macOS", callback_data="trialhelp:howto:macos")],
+            [InlineKeyboardButton(text="🐧 Linux", callback_data="trialhelp:howto:linux")],
+            [InlineKeyboardButton(text="🎁 Активировать пробный период", callback_data="trial:start")],
+            [InlineKeyboardButton(text="🌍 Открыть раздел VPN", callback_data="nav:vpn")],
+        ]
+    )
+
+
+async def _job_start_no_action_nudges(bot: Bot) -> None:
+    """Users who pressed Start but still didn't activate trial/use VPN."""
+    now = _utcnow()
+    async with session_scope() as session:
+        users = (
+            await session.execute(
+                select(User.tg_id, User.created_at).where(User.created_at.is_not(None)).order_by(User.created_at.desc()).limit(5000)
+            )
+        ).all()
+        if not users:
+            return
+
+        user_ids = [int(tg_id) for tg_id, _ in users if tg_id is not None]
+        if not user_ids:
+            return
+
+        rows = (
+            await session.execute(
+                select(AppSetting.key, AppSetting.int_value).where(AppSetting.key.like("trial_used:%"))
+            )
+        ).all()
+        trial_used_users: set[int] = set()
+        for key, int_value in rows:
+            skey = str(key or "")
+            try:
+                uid = int(skey.split(":", 1)[1])
+            except Exception:
+                continue
+            if int(int_value or 0) == 1:
+                trial_used_users.add(uid)
+
+        paid_rows = (
+            await session.execute(
+                select(Payment.tg_id).where(
+                    Payment.status == "success",
+                    Payment.amount.is_not(None),
+                    Payment.amount > 0,
+                    Payment.tg_id.in_(user_ids),
+                )
+            )
+        ).all()
+        paid_users = {int(tg_id) for (tg_id,) in paid_rows if tg_id is not None}
+
+        changed = False
+        for tg_id, created_at in users:
+            if tg_id is None or created_at is None:
+                continue
+            tg_id = int(tg_id)
+            created_at = _ensure_tz(created_at)
+            if tg_id in trial_used_users or tg_id in paid_users:
+                continue
+            age_hours = (now - created_at).total_seconds() / 3600.0
+            if age_hours < 6:
+                continue
+
+            first_sent = bool(await get_app_setting_int(session, f"start_no_action_6h_1_sent:{tg_id}", default=0))
+            second_sent = bool(await get_app_setting_int(session, f"start_no_action_6h_2_sent:{tg_id}", default=0))
+
+            send_stage = 0
+            if age_hours >= 12 and not second_sent:
+                send_stage = 2
+            elif age_hours >= 6 and not first_sent:
+                send_stage = 1
+            if not send_stage:
+                continue
+
+            msg = (
+                "👀 <b>Мы заметили, что вы ещё не начали пользоваться VPN</b>\n\n"
+                "Выберите ваше устройство — и мы сразу отправим подробную инструкцию. Затем вы сможете активировать пробный период и подключиться."
+            )
+            try:
+                await audit_send_message(
+                    bot,
+                    tg_id,
+                    msg,
+                    kind=f"start_no_action_{send_stage}",
+                    reply_markup=_start_device_help_kb(),
+                    parse_mode="HTML",
+                )
+                await set_app_setting_int(session, f"start_no_action_6h_{send_stage}_sent:{tg_id}", 1)
                 changed = True
             except Exception:
                 pass
@@ -1380,6 +1486,7 @@ async def _job_rotate_yandex_invites(bot: Bot) -> None:
     for tg_id, invite_link in items:
         try:
             await audit_send_message(
+                bot,
                 tg_id,
                 "🔁 Пора перейти в новую семейную подписку Yandex Plus.\n\n"
                 "Откройте 🟡 Yandex Plus и нажмите «Открыть приглашение», или используйте ссылку ниже:",
@@ -1675,6 +1782,7 @@ async def _job_user_subscription_notifications(bot: Bot) -> None:
                             "ℹ️ Завтра вам будет выдано новое приглашение в семейную подписку Yandex Plus.\n\n"
                             "Это связано со сменой аккаунта. Никаких действий сейчас не требуется.",
                             kind="yandex_invite_tomorrow",
+                            parse_mode="HTML",
                             reply_markup=InlineKeyboardMarkup(
                                 inline_keyboard=[
                                     [InlineKeyboardButton(text="🟡 Yandex Plus", callback_data="nav:yandex")],
