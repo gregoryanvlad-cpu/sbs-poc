@@ -1482,6 +1482,7 @@ async def on_nav(cb: CallbackQuery) -> None:
                 .order_by(Payment.id.desc())
                 .limit(1)
             ))
+            invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
 
         if not _is_sub_active(sub.end_at):
             try:
@@ -1538,7 +1539,6 @@ async def on_nav(cb: CallbackQuery) -> None:
                 + "Если ссылка уже не открывается — запроси новую у поддержки: @sbsmanager_bot."
             )
         else:
-            invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
             if invites_blocked:
                 info = (
                     "🟡 <b>Yandex Plus</b>\n\n"
