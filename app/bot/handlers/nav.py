@@ -1500,21 +1500,16 @@ async def on_nav(cb: CallbackQuery) -> None:
         buttons: list[list[InlineKeyboardButton]] = []
 
         cov = getattr(ym, "coverage_end_at", None) if ym else None
-        target_end = cov or (sub.end_at if sub and sub.end_at else None)
+        sub_end = sub.end_at if sub else None
+        target_end = cov or sub_end
         rotate_hint = ""
         try:
-            if not has_paid_purchase:
-                if target_end:
-                    rotate_hint = (
-                        f"⏳ <b>До окончания текущего приглашения:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
-                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(target_end)}</b>\n"
-                        "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
-                    )
-                else:
-                    rotate_hint = "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
-            elif target_end:
-                sub_end = sub.end_at if sub else None
-                if sub_end and _ensure_tz(sub_end) > _ensure_tz(target_end):
+            coverage_dt = _ensure_tz(cov) if cov else None
+            sub_end_dt = _ensure_tz(sub_end) if sub_end else None
+            has_scheduled_reissue = bool(coverage_dt and sub_end_dt and sub_end_dt > coverage_dt)
+
+            if target_end:
+                if has_scheduled_reissue:
                     rotate_hint = (
                         f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
                         f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(target_end)}</b>\n\n"
@@ -1525,8 +1520,11 @@ async def on_nav(cb: CallbackQuery) -> None:
                     rotate_hint = (
                         f"⏳ <b>До окончания текущего приглашения:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
                         f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(target_end)}</b>\n"
-                        "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
                     )
+                    if not has_paid_purchase:
+                        rotate_hint += "ℹ️ Во время пробного периода новое приглашение появится только после перехода на платную подписку.\n\n"
+                    else:
+                        rotate_hint += "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
             elif sub and _is_sub_active(sub.end_at):
                 rotate_hint = (
                     f"🕒 <b>Подписка активна до:</b> <b>{fmt_dt(sub.end_at)}</b>\n"
@@ -1534,7 +1532,6 @@ async def on_nav(cb: CallbackQuery) -> None:
                 )
         except Exception:
             pass
-
         # Если ссылка уже есть — показываем кнопку открыть.
         if ym and ym.invite_link:
             buttons.insert(0, [InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
