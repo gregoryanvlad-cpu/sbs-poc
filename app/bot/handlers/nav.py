@@ -1500,28 +1500,38 @@ async def on_nav(cb: CallbackQuery) -> None:
         buttons: list[list[InlineKeyboardButton]] = []
 
         cov = getattr(ym, "coverage_end_at", None) if ym else None
+        target_end = cov or (sub.end_at if sub and sub.end_at else None)
         rotate_hint = ""
         try:
-            if cov:
-                if not has_paid_purchase:
+            if not has_paid_purchase:
+                if target_end:
                     rotate_hint = (
-                        "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n"
-                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(cov)}</b>\n\n"
+                        f"⏳ <b>До окончания текущего приглашения:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
+                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(target_end)}</b>\n"
+                        "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
                     )
-                elif sub and sub.end_at and _ensure_tz(sub.end_at) > _ensure_tz(cov):
+                else:
+                    rotate_hint = "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
+            elif target_end:
+                sub_end = sub.end_at if sub else None
+                if sub_end and _ensure_tz(sub_end) > _ensure_tz(target_end):
                     rotate_hint = (
-                        f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(cov)}</b>\n"
-                        f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(cov)}</b>\n\n"
+                        f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
+                        f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(target_end)}</b>\n\n"
                     )
                     if ym and ym.invite_link:
                         buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
                 else:
                     rotate_hint = (
-                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(cov)}</b>\n"
+                        f"⏳ <b>До окончания текущего приглашения:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
+                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(target_end)}</b>\n"
                         "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
                     )
-            elif not has_paid_purchase and sub and _is_sub_active(sub.end_at):
-                rotate_hint = "ℹ️ <b>Во время пробного периода автоперевыдача ссылки недоступна.</b>\n\n"
+            elif sub and _is_sub_active(sub.end_at):
+                rotate_hint = (
+                    f"🕒 <b>Подписка активна до:</b> <b>{fmt_dt(sub.end_at)}</b>\n"
+                    "ℹ️ Таймер перевыдачи появится после выдачи приглашения.\n\n"
+                )
         except Exception:
             pass
 
