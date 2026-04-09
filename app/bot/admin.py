@@ -522,6 +522,146 @@ def _safe_div(n: float, d: float) -> float:
         return 0.0
     return float(n) / float(d)
 
+def _month_start_utc(dt: datetime) -> datetime:
+    dtu = _ensure_tz_utc(dt) or _utcnow()
+    return dtu.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_month_start_utc(dt: datetime) -> datetime:
+    return _month_start_utc(dt) + relativedelta(months=1)
+
+
+def _month_label_ru(dt: datetime) -> str:
+    months = [
+        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+    ]
+    dtu = _ensure_tz_utc(dt) or _utcnow()
+    return f"{months[dtu.month - 1]} {dtu.year}"
+
+
+def _iter_month_starts(start_dt: datetime, end_dt: datetime) -> list[datetime]:
+    cur = _month_start_utc(start_dt)
+    end_month = _month_start_utc(end_dt)
+    out: list[datetime] = []
+    while cur <= end_month:
+        out.append(cur)
+        cur = cur + relativedelta(months=1)
+    return out
+
+
+def _build_main_payment_intervals(payments: list[Payment], *, now: datetime) -> tuple[dict[int, list[tuple[datetime, datetime]]], dict[int, datetime], dict[int, datetime], dict[int, int]]:
+    intervals: dict[int, list[tuple[datetime, datetime]]] = {}
+    first_paid_at: dict[int, datetime] = {}
+    last_paid_at: dict[int, datetime] = {}
+    payment_counts: dict[int, int] = {}
+    current_end_by_user: dict[int, datetime | None] = {}
+
+    for pay in payments:
+        if not _is_main_success_payment(pay):
+            continue
+        tg_id = int(pay.tg_id)
+        paid_at = _ensure_tz_utc(getattr(pay, 'paid_at', None)) or now
+        start_at = current_end_by_user.get(tg_id)
+        if not start_at or start_at <= paid_at:
+            start_at = paid_at
+        end_at = start_at + timedelta(days=_main_payment_duration_days(pay))
+        intervals.setdefault(tg_id, []).append((start_at, end_at))
+        current_end_by_user[tg_id] = end_at
+        first_paid_at.setdefault(tg_id, paid_at)
+        last_paid_at[tg_id] = paid_at
+        payment_counts[tg_id] = payment_counts.get(tg_id, 0) + 1
+
+    return intervals, first_paid_at, last_paid_at, payment_counts
+
+
+def _active_users_at_snapshot(intervals: dict[int, list[tuple[datetime, datetime]]], snapshot: datetime) -> set[int]:
+    snap = _ensure_tz_utc(snapshot) or _utcnow()
+    active: set[int] = set()
+    for uid, spans in intervals.items():
+        for start_at, end_at in spans:
+            if start_at <= snap < end_at:
+                active.add(int(uid))
+                break
+    return active
+
+
+def _build_paid_growth_series(payments: list[Payment], *, now: datetime) -> dict[str, object]:
+    intervals, first_paid_at, last_paid_at, payment_counts = _build_main_payment_intervals(payments, now=now)
+    if not first_paid_at:
+        return {
+            'weekly': [],
+            'monthly': [],
+            'churned': [],
+            'active_now': set(),
+            'paid_intervals': intervals,
+            'first_paid_at': first_paid_at,
+            'last_paid_at': last_paid_at,
+            'payment_counts': payment_counts,
+        }
+
+    first_dt = min(first_paid_at.values())
+    active_now = _active_users_at_snapshot(intervals, now)
+
+    # Weekly new payer growth (first successful paid purchase in each 7-day bucket)
+    weekly: list[dict[str, object]] = []
+    bucket_start = first_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    prev_count = 0
+    while bucket_start <= now:
+        bucket_end = min(bucket_start + timedelta(days=7), now)
+        bucket_users = {uid for uid, dt in first_paid_at.items() if bucket_start <= dt < bucket_end}
+        count = len(bucket_users)
+        weekly.append({
+            'start': bucket_start,
+            'end': bucket_end,
+            'count': count,
+            'delta': count - prev_count,
+        })
+        prev_count = count
+        bucket_start = bucket_start + timedelta(days=7)
+
+    # Monthly active paid base (snapshot at month end, current month = now)
+    monthly: list[dict[str, object]] = []
+    prev_count = 0
+    for month_start in _iter_month_starts(first_dt, now):
+        next_month = _next_month_start_utc(month_start)
+        snapshot = min(next_month, now)
+        active_set = _active_users_at_snapshot(intervals, snapshot - timedelta(microseconds=1) if snapshot > month_start else snapshot)
+        count = len(active_set)
+        monthly.append({
+            'month_start': month_start,
+            'label': _month_label_ru(month_start),
+            'count': count,
+            'delta': count - prev_count,
+        })
+        prev_count = count
+
+    churned: list[dict[str, object]] = []
+    for uid, spans in intervals.items():
+        if int(uid) in active_now or not spans:
+            continue
+        end_at = max(end for _, end in spans)
+        churned.append({
+            'tg_id': int(uid),
+            'expired_at': end_at,
+            'first_paid_at': first_paid_at.get(int(uid)),
+            'last_paid_at': last_paid_at.get(int(uid)),
+            'payments_count': payment_counts.get(int(uid), 0),
+        })
+    churned.sort(key=lambda x: _ensure_tz_utc(x.get('expired_at')) or datetime(1970,1,1,tzinfo=timezone.utc), reverse=True)
+
+    return {
+        'weekly': weekly,
+        'monthly': monthly,
+        'churned': churned,
+        'active_now': active_now,
+        'paid_intervals': intervals,
+        'first_paid_at': first_paid_at,
+        'last_paid_at': last_paid_at,
+        'payment_counts': payment_counts,
+    }
+
+
 
 def _forecast_sales_block(*, sales_last_30: int, revenue_last_30: int, sales_last_7: int, revenue_last_7: int,
                           active_trial_using_now: int, hist_trial_conv: float, now: datetime) -> dict[str, object]:
@@ -895,6 +1035,7 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
         family_groups = list((await session.execute(select(FamilyVpnGroup))).scalars().all())
         family_profiles = list((await session.execute(select(FamilyVpnProfile))).scalars().all())
         msg_rows = list((await session.execute(select(MessageAudit))).scalars().all())
+        yandex_memberships = list((await session.execute(select(YandexMembership))).scalars().all())
 
     trial_starts: dict[int, datetime] = {}
     first_main_paid: dict[int, datetime] = {}
@@ -973,6 +1114,8 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
         had_prior_main_payment = True
     flush_user_state()
 
+    growth_series = _build_paid_growth_series(payments, now=now)
+
     active_trial_users = {uid for uid in trial_user_ids if int(trial_end_ts_by_user.get(uid, 0) or 0) > int(now.timestamp()) and uid not in paid_users_all}
     peer_by_user: dict[int, list] = {}
     for peer in peers:
@@ -998,6 +1141,10 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
     recent7_keys = {str(i.get('public_key') or ''): i for i in recent7d}
 
     active_trial_using_now = len({uid for uid in active_trial_users for p in peer_by_user.get(uid, []) if str(p.client_public_key or '') in recent24_keys})
+
+    invite_click_users = {int(m.tg_id) for m in msg_rows if str(getattr(m, 'kind', '') or '') == 'yandex_invite_open_clicked'}
+    yandex_membership_users = {int(getattr(m, 'tg_id', 0)) for m in yandex_memberships if int(getattr(m, 'tg_id', 0) or 0) > 0 and str(getattr(m, 'invite_link', '') or '').strip()}
+    trial_activation_or_yandex_users = {uid for uid in trial_user_ids if peer_by_user.get(uid) or uid in invite_click_users or uid in yandex_membership_users}
 
     activation_deltas = []
     ttfh_deltas = []
@@ -1130,6 +1277,9 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
         'active_trials_idle_now': max(0, len(active_trial_users) - int(active_trial_using_now)),
         'trial_to_paid': len(trial_to_paid_users),
         'hist_trial_conversion_percent': hist_trial_conv * 100.0,
+        'start_to_trial_percent': (_safe_div(trial_periods, total_users) * 100.0) if total_users else 0.0,
+        'trial_to_activation_or_yandex_count': len(trial_activation_or_yandex_users),
+        'trial_to_activation_or_yandex_percent': (_safe_div(len(trial_activation_or_yandex_users), trial_periods) * 100.0) if trial_periods else 0.0,
         'payments_199': pay_199,
         'upsells_99': upsells_99,
         'lte_99': lte_99,
@@ -1181,6 +1331,10 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
         'referral_paid': len(kinds_sent.get('referral_paid', set())),
         'referral_earning_created': len(kinds_sent.get('referral_earning_created', set())),
         'referral_hold_released': len(kinds_sent.get('referral_hold_released', set())),
+        'paid_growth_weekly': growth_series['weekly'],
+        'paid_growth_monthly': growth_series['monthly'],
+        'churned_users': growth_series['churned'],
+        'yandex_invite_open_clicks': len(invite_click_users),
     }
 
 
@@ -3983,6 +4137,10 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
         "5️⃣ <b>💳 Как быстро люди доходят до оплаты</b>",
         f"• Среднее время от пробного до первой оплаты: <b>{float(stats['avg_hours_to_paid']):.1f} ч</b>",
         "",
+        "5️⃣1️⃣ <b>🎯 Ключевые конверсии</b>",
+        f"• Start → Пробный период: <b>{float(stats['start_to_trial_percent']):.1f}%</b>",
+        f"• Пробный → Handshake или Yandex-приглашение: <b>{float(stats['trial_to_activation_or_yandex_percent']):.1f}%</b>",
+        "",
         "6️⃣ <b>🔁 Продления подписки</b>",
         f"• Получили напоминание за 3 дня: <b>{int(stats['renew_warn_3d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_3d'])}</b>",
         f"• Получили напоминание за 1 день: <b>{int(stats['renew_warn_1d_sent'])}</b> → оплатили: <b>{int(stats['renew_after_1d'])}</b>",
@@ -4031,6 +4189,121 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
         f"• 📨 D1: <b>{int(stats['trial_d1_sent'])}</b>/<b>{int(stats['trial_d1_seen'])}</b> | D2: <b>{int(stats['trial_d2_sent'])}</b>/<b>{int(stats['trial_d2_seen'])}</b>",
         f"• 📅 Продажи за 30 дней: <b>{int(stats['sales_last_30'])}</b> / <b>{int(stats['revenue_last_30'])} ₽</b> | за 7 дней: <b>{int(stats['sales_last_7'])}</b> / <b>{int(stats['revenue_last_7'])} ₽</b>",
     ]
+    parts = _split_html_lines(lines, limit=3400)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+
+
+@router.callback_query(lambda c: c.data == "admin:stats:conversions")
+async def admin_conversions_report(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Собираю конверсии…")
+    except Exception:
+        pass
+
+    try:
+        stats = await _collect_full_bot_stats_v2()
+    except Exception:
+        log.exception("admin_conversions_report_failed")
+        await cb.message.answer("❌ Не удалось собрать конверсии.", reply_markup=_kb_admin_back())
+        return
+
+    lines = [
+        "🎯 <b>Конверсии и рост</b>",
+        "",
+        "<b>Основные конверсии</b>",
+        f"• Start → Пробный период: <b>{float(stats['start_to_trial_percent']):.1f}%</b> (<b>{int(stats['trial_periods'])}</b> из <b>{int(stats['total_users'])}</b>)",
+        f"• Пробный → Handshake или Yandex-приглашение: <b>{float(stats['trial_to_activation_or_yandex_percent']):.1f}%</b> (<b>{int(stats['trial_to_activation_or_yandex_count'])}</b> из <b>{int(stats['trial_periods'])}</b>)",
+        f"• Пробный → Первая оплата: <b>{float(stats['hist_trial_conversion_percent']):.1f}%</b> (<b>{int(stats['trial_to_paid'])}</b> из <b>{int(stats['trial_periods'])}</b>)",
+        "",
+        "<b>Прирост новых платящих по 7-дневным периодам</b>",
+    ]
+
+    weekly = list(stats.get('paid_growth_weekly') or [])
+    if weekly:
+        show_weekly = weekly[-12:]
+        for item in show_weekly:
+            start_txt = (_ensure_tz_utc(item['start']) or _utcnow()).strftime('%d.%m.%Y')
+            end_txt = (_ensure_tz_utc(item['end']) or _utcnow()).strftime('%d.%m.%Y')
+            delta = int(item.get('delta', 0) or 0)
+            sign = '+' if delta > 0 else ''
+            lines.append(f"• {start_txt} — {end_txt}: <b>{int(item.get('count', 0) or 0)}</b> новых платящих | Разбор: <b>{sign}{delta}</b>")
+    else:
+        lines.append("• Пока нет данных")
+
+    lines += ["", "<b>Платящая база по месяцам</b>"]
+    monthly = list(stats.get('paid_growth_monthly') or [])
+    if monthly:
+        for item in monthly:
+            lines.append(f"{html.escape(str(item.get('label') or '—'))}, кол-во платящих: <b>{int(item.get('count', 0) or 0)}</b>")
+            delta = int(item.get('delta', 0) or 0)
+            sign = '+' if delta > 0 else ''
+            lines.append(f"Разбор: <b>{sign}{delta} платящих</b>")
+    else:
+        lines.append("Пока нет оплаченных подписок.")
+
+    parts = _split_html_lines(lines, limit=3400)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+
+
+@router.callback_query(lambda c: c.data == "admin:stats:churn")
+async def admin_churn_report(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Собираю отток…")
+    except Exception:
+        pass
+
+    now = _utcnow()
+    try:
+        stats = await _collect_full_bot_stats_v2()
+    except Exception:
+        log.exception("admin_churn_report_failed")
+        await cb.message.answer("❌ Не удалось собрать отток.", reply_markup=_kb_admin_back())
+        return
+
+    churned = list(stats.get('churned_users') or [])
+    if not churned:
+        await cb.message.edit_text(
+            "📉 <b>Отток оплат</b>\n\nСейчас нет пользователей, у которых оплаченная подписка закончилась без следующего продления.",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+        return
+
+    async with session_scope() as session:
+        ids = [int(item['tg_id']) for item in churned[:200]]
+        users = list((await session.execute(select(User).where(User.tg_id.in_(ids)))).scalars().all()) if ids else []
+        user_by_id = {int(u.tg_id): u for u in users}
+
+    lines = [
+        "📉 <b>Пользователи в оттоке</b>",
+        "",
+        f"Всего в оттоке сейчас: <b>{len(churned)}</b>",
+        "Показываю свежие случаи сверху.",
+        "",
+    ]
+    for item in churned[:50]:
+        uid = int(item['tg_id'])
+        user = user_by_id.get(uid)
+        name_parts = [str(getattr(user, 'first_name', '') or '').strip(), str(getattr(user, 'last_name', '') or '').strip()]
+        name = ' '.join([p for p in name_parts if p]).strip() or '—'
+        username = str(getattr(user, 'tg_username', '') or '').strip()
+        username_txt = f"@{html.escape(username)}" if username else '—'
+        expired_at = _ensure_tz_utc(item.get('expired_at'))
+        days_in_churn = max(0, int((now - expired_at).total_seconds() // 86400)) if expired_at else 0
+        lines += [
+            f"• <code>{uid}</code> | <b>{html.escape(name)}</b> | {username_txt}",
+            f"  Последняя оплата: <b>{_fmt_dt_short(item.get('last_paid_at'))}</b>",
+            f"  Подписка закончилась: <b>{_fmt_dt_short(expired_at)}</b>",
+            f"  В оттоке: <b>{days_in_churn}</b> дн. | Всего оплат: <b>{int(item.get('payments_count', 0) or 0)}</b>",
+            "",
+        ]
+
     parts = _split_html_lines(lines, limit=3400)
     await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
 
