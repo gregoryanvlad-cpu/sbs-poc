@@ -106,3 +106,24 @@ async def audit_send_message(
         pass
 
     return ok
+
+
+async def audit_log_event(tg_id: int, *, kind: str, text_preview: str = "") -> None:
+    """Persist an internal analytics event to message_audit without sending a message."""
+
+    preview = (text_preview or kind or "event").strip()[:700]
+    try:
+        async with session_scope() as session:
+            session.add(
+                MessageAudit(
+                    tg_id=int(tg_id),
+                    kind=str(kind)[:64],
+                    chat_id=None,
+                    message_id=None,
+                    text_preview=preview or str(kind)[:64],
+                    sent_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+    except Exception:
+        pass
