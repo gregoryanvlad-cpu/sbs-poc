@@ -57,7 +57,7 @@ from app.repo import extend_subscription, get_subscription, get_price_rub, is_tr
 from app.services.vpn.service import vpn_service
 from app.services.referrals.service import referral_service
 from app.services.lte_vpn.service import lte_vpn_service
-from app.services.message_audit import audit_send_message
+from app.services.message_audit import audit_send_message, audit_log_event
 
 router = Router()
 
@@ -1542,7 +1542,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             pass
         # Если ссылка уже есть — показываем кнопку открыть.
         if ym and ym.invite_link:
-            buttons.insert(0, [InlineKeyboardButton(text="🔗 Открыть приглашение", url=ym.invite_link)])
+            buttons.insert(0, [InlineKeyboardButton(text="🔗 Открыть приглашение", callback_data="yandex:open_invite")])
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
                 "✅ Приглашение уже выдано и доступно по кнопке ниже.\n\n"
@@ -3374,6 +3374,7 @@ async def on_vpn_reset(cb: CallbackQuery) -> None:
 @router.callback_query(lambda c: c.data == "trial:start")
 async def on_trial_start(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
+    await audit_log_event(tg_id, kind="trial_start_clicked", text_preview="trial:start")
     async with session_scope() as session:
         if not await is_trial_available(session, tg_id):
             sub = await get_subscription(session, tg_id)
@@ -3414,6 +3415,35 @@ async def on_trial_start(cb: CallbackQuery) -> None:
         await cb.message.edit_text(text, reply_markup=kb_main(show_trial=False), parse_mode="HTML")
     except Exception:
         await cb.message.answer(text, reply_markup=kb_main(show_trial=False), parse_mode="HTML")
+    await _safe_cb_answer(cb)
+
+
+@router.callback_query(lambda c: c.data == "yandex:open_invite")
+async def on_yandex_open_invite(cb: CallbackQuery) -> None:
+    async with session_scope() as session:
+        ym = await _get_yandex_membership(session, cb.from_user.id)
+        invite_link = str(getattr(ym, "invite_link", "") or "").strip()
+
+    if not invite_link:
+        await cb.answer("Приглашение пока недоступно. Попробуйте чуть позже.", show_alert=True)
+        return
+
+    await audit_log_event(cb.from_user.id, kind="yandex_invite_open_clicked", text_preview="yandex invite open")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Открыть приглашение", url=invite_link)],
+            [InlineKeyboardButton(text="⬅️ Назад в Yandex Plus", callback_data="nav:yandex")],
+        ]
+    )
+    text = (
+        "🟡 <b>Yandex Plus</b>\n\n"
+        "Нажмите кнопку ниже, чтобы открыть приглашение в семью Yandex Plus."
+    )
+    try:
+        await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
     await _safe_cb_answer(cb)
 
 
