@@ -586,14 +586,27 @@ def _active_users_at_snapshot(intervals: dict[int, list[tuple[datetime, datetime
     return active
 
 
-def _build_paid_growth_series(payments: list[Payment], *, now: datetime) -> dict[str, object]:
+def _build_paid_growth_series(
+    payments: list[Payment],
+    *,
+    now: datetime,
+    subscriptions: list[Subscription] | None = None,
+) -> dict[str, object]:
     intervals, first_paid_at, last_paid_at, payment_counts = _build_main_payment_intervals(payments, now=now)
+
+    active_now = _active_users_at_snapshot(intervals, now)
+    subscription_by_tg: dict[int, Subscription] = {int(s.tg_id): s for s in (subscriptions or [])}
+    for tg_id, sub in subscription_by_tg.items():
+        end_at = _ensure_tz_utc(getattr(sub, 'end_at', None))
+        if bool(getattr(sub, 'is_active', False)) and end_at and end_at > now:
+            active_now.add(int(tg_id))
+
     if not first_paid_at:
         return {
             'weekly': [],
             'monthly': [],
             'churned': [],
-            'active_now': set(),
+            'active_now': active_now,
             'paid_intervals': intervals,
             'first_paid_at': first_paid_at,
             'last_paid_at': last_paid_at,
@@ -601,7 +614,6 @@ def _build_paid_growth_series(payments: list[Payment], *, now: datetime) -> dict
         }
 
     first_dt = min(first_paid_at.values())
-    active_now = _active_users_at_snapshot(intervals, now)
 
     # Weekly new payer growth (first successful paid purchase in each 7-day bucket)
     weekly: list[dict[str, object]] = []
@@ -638,15 +650,19 @@ def _build_paid_growth_series(payments: list[Payment], *, now: datetime) -> dict
 
     churned: list[dict[str, object]] = []
     for uid, spans in intervals.items():
-        if int(uid) in active_now or not spans:
+        sub = subscription_by_tg.get(int(uid))
+        sub_end = _ensure_tz_utc(getattr(sub, 'end_at', None)) if sub is not None else None
+        sub_active_now = bool(sub is not None and getattr(sub, 'is_active', False) and sub_end and sub_end > now)
+        if int(uid) in active_now or sub_active_now or not spans:
             continue
-        end_at = max(end for _, end in spans)
+        end_at = sub_end or max(end for _, end in spans)
         churned.append({
             'tg_id': int(uid),
             'expired_at': end_at,
             'first_paid_at': first_paid_at.get(int(uid)),
             'last_paid_at': last_paid_at.get(int(uid)),
             'payments_count': payment_counts.get(int(uid), 0),
+            'subscription_end_at': sub_end,
         })
     churned.sort(key=lambda x: _ensure_tz_utc(x.get('expired_at')) or datetime(1970,1,1,tzinfo=timezone.utc), reverse=True)
 
@@ -1028,6 +1044,7 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
         user_created = {int(u.tg_id): _ensure_tz_utc(getattr(u, 'created_at', None)) or now for u in users}
 
         payments = list((await session.execute(select(Payment).where(Payment.status == "success").order_by(Payment.tg_id.asc(), Payment.paid_at.asc(), Payment.id.asc()))).scalars().all())
+        subscriptions = list((await session.execute(select(Subscription))).scalars().all())
         peers = list((await session.execute(select(VpnPeer))).scalars().all())
         active_peers = [p for p in peers if bool(getattr(p, 'is_active', False))]
         referrals = list((await session.execute(select(Referral))).scalars().all())
@@ -1114,7 +1131,7 @@ async def _collect_full_bot_stats_v2() -> dict[str, object]:
         had_prior_main_payment = True
     flush_user_state()
 
-    growth_series = _build_paid_growth_series(payments, now=now)
+    growth_series = _build_paid_growth_series(payments, now=now, subscriptions=subscriptions)
 
     active_trial_users = {uid for uid in trial_user_ids if int(trial_end_ts_by_user.get(uid, 0) or 0) > int(now.timestamp()) and uid not in paid_users_all}
     peer_by_user: dict[int, list] = {}
@@ -2726,10 +2743,7 @@ async def admin_user_inspect_input(message: Message, state: FSMContext) -> None:
     try:
         async with session_scope() as session:
             card_text = await _render_user_card(session, message.bot, tg_id)
-        try:
-            await progress.edit_text(card_text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
-        except Exception:
-            await message.answer(card_text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+        await _show_user_card_message(progress, tg_id, card_text, edit_first=True)
     except Exception:
         log.exception("admin_user_inspect_input_failed tg_id=%s raw=%s", tg_id, raw)
         try:
@@ -2756,9 +2770,25 @@ async def admin_user_card_refresh(cb: CallbackQuery) -> None:
         tg_id = int((cb.data or "").split(":")[-1])
     except Exception:
         return
-    async with session_scope() as session:
-        text = await _render_user_card(session, cb.bot, tg_id)
-    await cb.message.edit_text(text, reply_markup=_kb_user_card(tg_id), parse_mode="HTML")
+    try:
+        async with session_scope() as session:
+            text = await _render_user_card(session, cb.bot, tg_id)
+        await _show_user_card_message(cb.message, tg_id, text, edit_first=True)
+    except Exception:
+        log.exception("admin_user_card_refresh_failed tg_id=%s", tg_id)
+        await cb.message.answer(
+            "❌ Не удалось загрузить карточку пользователя. Попробуйте ещё раз через минуту.",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+
+
+async def _show_user_card_message(message: Message, tg_id: int, card_text: str, *, edit_first: bool) -> None:
+    parts = _split_html_lines((card_text or '—').splitlines(), limit=3400)
+    if not parts:
+        parts = ['—']
+    await _send_html_chunks(message, parts, reply_markup=_kb_user_card(tg_id), edit_first=edit_first)
+
 
 
 async def _gift_revoke_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboardMarkup]:
