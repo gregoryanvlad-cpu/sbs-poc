@@ -121,6 +121,30 @@ def _fmt_countdown_to(dt: datetime | None) -> str:
         return "—"
 
 
+def _fmt_time_left_short(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        now = datetime.now(timezone.utc)
+        target = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        total = int((target - now).total_seconds())
+        if total <= 0:
+            return "истекло"
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days} дн.")
+        if hours:
+            parts.append(f"{hours} ч.")
+        if not days and not hours:
+            parts.append(f"{minutes} мин.")
+        return " ".join(parts) if parts else "меньше минуты"
+    except Exception:
+        return "—"
+
+
 def _normalize_utc(dt: datetime | None) -> datetime | None:
     if not dt:
         return None
@@ -1334,6 +1358,7 @@ async def on_nav(cb: CallbackQuery) -> None:
             f"🆔 ID: <code>{cb.from_user.id}</code>\n\n"
             f"💳 Подписка: {'активна ✅' if _is_sub_active(sub.end_at) else 'не активна ❌'}\n"
             f"📅 Активна до: {fmt_dt(sub.end_at)}\n"
+            f"⏳ Осталось: <b>{_fmt_time_left_short(sub.end_at)}</b>\n"
             "🟡 <b>Yandex Plus</b>\n"
             f"{y_text}\n\n"
             "🧾 <b>Последние оплаты</b>\n"
@@ -3806,7 +3831,7 @@ def _family_slot_state_text(profile, now: datetime | None = None) -> str:
     now = now or utcnow()
     exp = _profile_expiry(profile)
     if exp and exp > now:
-        return f"до {fmt_dt(exp)}"
+        return f"до {fmt_dt(exp)} (осталось {_fmt_time_left_short(exp)})"
     if exp:
         return f"истекло {fmt_dt(exp)}"
     return "не оплачено"
@@ -3949,10 +3974,16 @@ async def on_vpn_family(cb: CallbackQuery) -> None:
                 f"Свободно: <b>{len(free_profiles)}</b>",
             ]
             if nearest and nearest_exp:
-                body_lines.append(f"Ближайшее истекает: <b>место #{int(nearest.slot_no)}</b> — {fmt_dt(nearest_exp)}")
+                body_lines.append(
+                    f"Ближайшее истекает: <b>место #{int(nearest.slot_no)}</b> — {fmt_dt(nearest_exp)} (осталось {_fmt_time_left_short(nearest_exp)})"
+                )
             if sub.end_at:
                 body_lines.append(f"Основная подписка: <b>до {fmt_dt(sub.end_at)}</b>")
+                body_lines.append(f"Осталось по основной подписке: <b>{_fmt_time_left_short(sub.end_at)}</b>")
             body_lines.append(f"Автосчёт семьи: <b>{'включён' if bool(getattr(grp, 'billing_opt_in', False)) else 'выключен'}</b>")
+            body_lines.append(
+                "ℹ️ Подарочные/ручные дни продлевают <b>основную подписку</b>. Семейные места живут отдельно и продлеваются отдельно."
+            )
             body = "\n".join(body_lines) + "\n\n"
 
         note = ""
