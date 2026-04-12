@@ -1212,6 +1212,23 @@ def _is_sub_active(sub_end_at: datetime | None) -> bool:
     return sub_end_at > utcnow()
 
 
+def _is_yandex_membership_current(ym: YandexMembership | None) -> bool:
+    if not ym:
+        return False
+    if getattr(ym, "removed_at", None) is not None:
+        return False
+    invite_link = str(getattr(ym, "invite_link", "") or "").strip()
+    if not invite_link:
+        return False
+    cov = getattr(ym, "coverage_end_at", None)
+    if cov is None:
+        return True
+    try:
+        return _normalize_utc(cov) > utcnow()
+    except Exception:
+        return False
+
+
 async def _get_yandex_membership(session, tg_id: int) -> YandexMembership | None:
     q = (
         select(YandexMembership)
@@ -1516,6 +1533,8 @@ async def on_nav(cb: CallbackQuery) -> None:
                 .limit(1)
             ))
             invites_blocked = bool(await get_app_setting_int(session, "yandex_invites_blocked", default=0) or 0)
+            from app.services.yandex.service import yandex_service
+            can_issue_now = await yandex_service.has_available_invite_slot(session)
 
         if not _is_sub_active(sub.end_at):
             try:
@@ -1531,52 +1550,63 @@ async def on_nav(cb: CallbackQuery) -> None:
             return
 
         buttons: list[list[InlineKeyboardButton]] = []
-
+        has_live_invite = _is_yandex_membership_current(ym)
         cov = getattr(ym, "coverage_end_at", None) if ym else None
         sub_end = sub.end_at if sub else None
-        target_end = cov or sub_end
         rotate_hint = ""
-        try:
-            coverage_dt = _normalize_utc(cov)
-            sub_end_dt = _normalize_utc(sub_end)
-            has_scheduled_reissue = bool(coverage_dt and sub_end_dt and sub_end_dt > coverage_dt)
+        has_scheduled_reissue = False
 
-            if target_end:
+        try:
+            coverage_dt = _normalize_utc(cov) if cov else None
+            sub_end_dt = _normalize_utc(sub_end) if sub_end else None
+            has_scheduled_reissue = bool(has_live_invite and coverage_dt and sub_end_dt and sub_end_dt > coverage_dt)
+
+            if has_live_invite and coverage_dt:
                 if has_scheduled_reissue:
                     rotate_hint = (
-                        f"⏳ <b>До автоматической перевыдачи:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
-                        f"🕒 <b>Плановая перевыдача:</b> <b>{fmt_dt(target_end)}</b>\n\n"
+                        f"⏳ <b>До выдачи следующего приглашения:</b> <b>{_fmt_countdown_to(coverage_dt)}</b>\n"
+                        f"🕒 <b>Следующее приглашение станет доступно:</b> <b>{fmt_dt(coverage_dt)}</b>\n"
+                        f"📅 <b>Текущее место в семье закреплено до:</b> <b>{fmt_dt(coverage_dt)}</b>\n"
+                        f"💳 <b>Основная подписка активна до:</b> <b>{fmt_dt(sub_end_dt)}</b>\n\n"
+                        "ℹ️ Этот блок показывается только когда подписка уже продлена, "
+                        "но текущее место в семье ещё действует по прошлому периоду."
                     )
-                    if ym and ym.invite_link:
+                    if can_issue_now:
                         buttons.append([InlineKeyboardButton(text="♻️ Получить новое приглашение уже сейчас", callback_data="yandex:issue_now")])
+                    else:
+                        rotate_hint += "\n⚠️ Свободных новых приглашений сейчас нет. Плановая перевыдача останется по дате выше."
                 else:
                     rotate_hint = (
-                        f"⏳ <b>До окончания текущего приглашения:</b> <b>{_fmt_countdown_to(target_end)}</b>\n"
-                        f"🕒 <b>Текущее приглашение действует до:</b> <b>{fmt_dt(target_end)}</b>\n"
+                        f"📅 <b>Подписка активна до:</b> <b>{fmt_dt(sub_end_dt or coverage_dt)}</b>\n"
+                        f"👨‍👩‍👧‍👦 <b>Текущее место в семье закреплено до:</b> <b>{fmt_dt(coverage_dt)}</b>\n"
                     )
                     if not has_paid_purchase:
                         rotate_hint += "ℹ️ Во время пробного периода новое приглашение появится только после перехода на платную подписку.\n\n"
                     else:
-                        rotate_hint += "ℹ️ Новая ссылка появится после следующего продления подписки.\n\n"
+                        rotate_hint += "ℹ️ При следующем продлении подписки новое приглашение будет выдано автоматически, если потребуется смена семьи.\n\n"
             elif sub and _is_sub_active(sub.end_at):
                 rotate_hint = (
                     f"🕒 <b>Подписка активна до:</b> <b>{fmt_dt(sub.end_at)}</b>\n"
-                    "ℹ️ Таймер перевыдачи появится после выдачи приглашения.\n\n"
+                    "ℹ️ После выдачи приглашения здесь появится статус по семье и следующей перевыдаче.\n\n"
                 )
         except Exception:
             pass
-        # Если ссылка уже есть — показываем кнопку открыть.
-        if ym and ym.invite_link:
+
+        if has_live_invite:
             buttons.insert(0, [InlineKeyboardButton(text="🔗 Открыть приглашение", callback_data="yandex:open_invite")])
+            issued_line = ""
+            if getattr(ym, "invite_issued_at", None):
+                issued_line = f"🧾 <b>Последняя ссылка выдана:</b> <b>{fmt_dt(getattr(ym, 'invite_issued_at', None))}</b>\n"
             info = (
                 "🟡 <b>Yandex Plus</b>\n\n"
-                "✅ Приглашение уже выдано и доступно по кнопке ниже.\n\n"
+                "✅ У вас есть выданное приглашение.\n\n"
                 f"Семья: <code>{getattr(ym, 'account_label', '—') or '—'}</code>\n"
-                f"Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n\n"
+                f"Слот: <b>{getattr(ym, 'slot_index', '—') or '—'}</b>\n"
+                + issued_line
                 + rotate_hint
-                + "⚠️ <b>Важно: откройте приглашение сразу ⚠️</b>\n"
-                + "Ссылка-приглашение действует ограниченное время и позже может устареть.\n\n"
-                + "Если ссылка уже не открывается — запроси новую у поддержки: @sbsmanager_bot."
+                + "⚠️ <b>Важно:</b> ссылка на вступление живёт ограниченное время.\n"
+                + "Дата выше относится к месту в семье или к следующей перевыдаче, а не к сроку жизни самой ссылки.\n\n"
+                + "Если ссылка уже не открывается, можно запросить новую кнопку ниже или написать в поддержку: @sbsmanager_bot."
             )
         else:
             if invites_blocked:
@@ -1650,6 +1680,7 @@ async def on_yandex_issue_now(cb: CallbackQuery) -> None:
     tg_id = cb.from_user.id
     async with session_scope() as session:
         sub = await get_subscription(session, tg_id)
+        ym = await _get_yandex_membership(session, tg_id)
         if not _is_sub_active(sub.end_at):
             await cb.answer('Подписка не активна', show_alert=True)
             return
@@ -1658,6 +1689,19 @@ async def on_yandex_issue_now(cb: CallbackQuery) -> None:
             link = await yandex_service.force_issue_new_invite(session, tg_id=tg_id)
             await session.commit()
         except Exception:
+            cov = getattr(ym, 'coverage_end_at', None) if ym else None
+            sub_end = getattr(sub, 'end_at', None) if sub else None
+            try:
+                coverage_dt = _normalize_utc(cov) if cov else None
+                sub_end_dt = _normalize_utc(sub_end) if sub_end else None
+                if coverage_dt and sub_end_dt and sub_end_dt > coverage_dt:
+                    await cb.answer(
+                        f'Сейчас нет свободного нового приглашения. Плановая перевыдача остаётся на {fmt_dt(coverage_dt)}.',
+                        show_alert=True,
+                    )
+                    return
+            except Exception:
+                pass
             await cb.answer('Не удалось выпустить новое приглашение. Попробуйте позже.', show_alert=True)
             return
     await cb.message.answer(
@@ -3448,9 +3492,10 @@ async def on_yandex_open_invite(cb: CallbackQuery) -> None:
     async with session_scope() as session:
         ym = await _get_yandex_membership(session, cb.from_user.id)
         invite_link = str(getattr(ym, "invite_link", "") or "").strip()
+        is_current = _is_yandex_membership_current(ym)
 
-    if not invite_link:
-        await cb.answer("Приглашение пока недоступно. Попробуйте чуть позже.", show_alert=True)
+    if not invite_link or not is_current:
+        await cb.answer("Старая ссылка уже недоступна. Запросите новое приглашение в разделе Yandex Plus.", show_alert=True)
         return
 
     await audit_log_event(cb.from_user.id, kind="yandex_invite_open_clicked", text_preview="yandex invite open")
