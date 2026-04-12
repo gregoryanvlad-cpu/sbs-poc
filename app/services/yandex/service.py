@@ -100,6 +100,15 @@ class YandexService:
     Everything else (Playwright, TTL, family scans) is no longer used.
     """
 
+    async def has_available_invite_slot(self, session) -> bool:
+        """Return True when at least one eligible free invite slot exists right now."""
+        now = utcnow()
+        try:
+            await _pick_slot_for_issue(session, now=now)
+            return True
+        except Exception:
+            return False
+
     async def ensure_membership_for_user(
         self,
         *,
