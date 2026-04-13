@@ -6,7 +6,7 @@ from pathlib import Path
 from app.core.config import settings
 from app.bot.keyboards import kb_main
 from app.db.session import session_scope
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func
 from app.db.models import User, Payment, Subscription, Referral, ReferralEarning
 from app.repo import ensure_user, is_trial_available
 from app.services.referrals.service import referral_service
@@ -14,6 +14,18 @@ from app.services.message_audit import audit_send_message
 from app.services.web_auth import approve_site_telegram_login, extract_web_login_selector, is_web_login_payload
 
 router = Router()
+
+
+def _format_verification_ttl(ttl_seconds: int | None) -> str:
+    if not ttl_seconds or ttl_seconds <= 0:
+        return "ограниченное время"
+    minutes = ttl_seconds // 60
+    seconds = ttl_seconds % 60
+    if minutes and seconds:
+        return f"{minutes} мин. {seconds} сек."
+    if minutes:
+        return f"{minutes} мин."
+    return f"{seconds} сек."
 
 
 @router.message(CommandStart())
@@ -49,8 +61,6 @@ async def cmd_start(message: Message) -> None:
         if is_web_auth:
             web_selector = extract_web_login_selector(payload)
 
-        # Привязка по рефералке допустима только на самом первом входе.
-        # Если пользователь уже существовал в БД, не назначаем реферера повторно.
         if payload and payload.startswith("ref_"):
             code = payload.split("ref_", 1)[1].strip()
             if existing_user is None:
@@ -61,23 +71,16 @@ async def cmd_start(message: Message) -> None:
                         ref_code=code,
                     )
             else:
-                # Самовосстановление после старого бага: если зрелому пользователю
-                # ошибочно проставили pending-реферала, убираем только pending-метадату,
-                # не трогая уже оформленные referral-записи.
                 payments_cnt = int(await session.scalar(select(func.count()).select_from(Payment).where(Payment.tg_id == int(tg_id))) or 0)
                 has_sub = bool(await session.get(Subscription, int(tg_id)))
                 is_mature_user = bool(payments_cnt > 0 or has_sub)
                 if is_mature_user:
-                    # Для уже существующего взрослого пользователя повторный заход по чужой рефке
-                    # не должен ни назначать нового реферера, ни оставлять ошибочно созданную
-                    # реферальную связь без заработков.
                     existing_user.referred_by_tg_id = None
                     if hasattr(existing_user, 'referred_at'):
                         existing_user.referred_at = None
                     ref_row = await session.scalar(select(Referral).where(Referral.referred_tg_id == int(tg_id)).limit(1))
                     if ref_row is not None:
                         referral_earnings_cnt = int(await session.scalar(select(func.count()).select_from(ReferralEarning).where(ReferralEarning.referred_tg_id == int(tg_id))) or 0)
-                        # Удаляем только явно ошибочную связь: без first_payment_id и без заработков.
                         if getattr(ref_row, 'first_payment_id', None) is None and referral_earnings_cnt == 0:
                             await session.delete(ref_row)
 
@@ -93,23 +96,51 @@ async def cmd_start(message: Message) -> None:
             )
             return
 
-        ok, result_message = await approve_site_telegram_login(selector=web_selector, tg_id=tg_id)
+        ok, result = await approve_site_telegram_login(selector=web_selector, tg_id=tg_id)
         if ok:
+            site_url = result.site_url or settings.web_app_base_url or "https://sbsconnect.up.railway.app"
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🌐 Вернуться на сайт", url=(settings.web_app_base_url or "https://sbsconnect.up.railway.app"))]]
+                inline_keyboard=[[InlineKeyboardButton(text="🌐 Вернуться на сайт", url=site_url)]]
             )
+
+            if result.verification_code:
+                ttl_text = _format_verification_ttl(result.verification_ttl_seconds)
+                text = (
+                    "✅ <b>Вход на сайте подтверждён</b>\n\n"
+                    f"Код для завершения входа: <code>{result.verification_code}</code>\n"
+                    f"Код действует: <b>{ttl_text}</b>.\n\n"
+                    "Вернись в браузер, введи этот код на сайте и заверши вход.\n"
+                    "<i>Никому не передавай этот код.</i>"
+                )
+            else:
+                text = (
+                    "✅ <b>Вход на сайте подтверждён</b>\n\n"
+                    "Вернись в браузер: сайт завершит авторизацию автоматически. "
+                    "Если страница уже была открыта, просто подожди пару секунд или обнови её."
+                )
+
             await message.answer(
-                "✅ Вход на сайте подтверждён.\n\n"
-                "Вернись в браузер: сайт завершит авторизацию автоматически. "
-                "Если страница уже была открыта, просто подожди пару секунд или обнови её.",
+                text,
                 reply_markup=kb,
+                parse_mode="HTML",
             )
         else:
             await message.answer(
-                f"⚠️ {result_message}",
+                f"⚠️ {result.message}",
                 reply_markup=ReplyKeyboardRemove(),
             )
         return
+
+    text = (
+        "<b>Добро пожаловать</b> 👋\n"
+        "<i>Этот бот — ваш центр управления сервисами:</i>\n\n"
+        "• Безопасный VPN\n"
+        "• Обход глушилок региона\n"
+        "• Обход замедления Telegram\n"
+        "• Yandex Plus\n\n"
+        "<b>Всего 199 ₽ в месяц</b>\n\n"
+        "<i>По вопросам сотрудничества:</i> @sbsmanager_bot"
+    )
 
     if new_pending_referrer_tg_id and is_new_registration:
         ref_kb = InlineKeyboardMarkup(
@@ -126,18 +157,6 @@ async def cmd_start(message: Message) -> None:
             )
         except Exception:
             pass
-
-    # Greeting (обычный текст, без рамки/код-блока)
-    text = (
-        "<b>Добро пожаловать</b> 👋\n"
-        "<i>Этот бот — ваш центр управления сервисами:</i>\n\n"
-        "• Безопасный VPN\n"
-        "• Обход глушилок региона\n"
-        "• Обход замедления Telegram\n"
-        "• Yandex Plus\n\n"
-        "<b>Всего 199 ₽ в месяц</b>\n\n"
-        "<i>По вопросам сотрудничества:</i> @sbsmanager_bot"
-    )
 
     welcome_image = Path(__file__).resolve().parents[2] / "content" / "welcome-start.jpg"
 
