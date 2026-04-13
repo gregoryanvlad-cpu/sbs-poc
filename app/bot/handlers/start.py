@@ -3,6 +3,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardRemove, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from pathlib import Path
 
+from app.core.config import settings
 from app.bot.keyboards import kb_main
 from app.db.session import session_scope
 from sqlalchemy import select, func, delete
@@ -10,6 +11,7 @@ from app.db.models import User, Payment, Subscription, Referral, ReferralEarning
 from app.repo import ensure_user, is_trial_available
 from app.services.referrals.service import referral_service
 from app.services.message_audit import audit_send_message
+from app.services.web_auth import approve_site_telegram_login, extract_web_login_selector, is_web_login_payload
 
 router = Router()
 
@@ -29,6 +31,9 @@ async def cmd_start(message: Message) -> None:
     show_trial = False
     new_pending_referrer_tg_id: int | None = None
     is_new_registration = False
+    is_web_auth = is_web_login_payload(payload)
+    web_selector: str | None = None
+
     async with session_scope() as session:
         u = message.from_user
         existing_user = await session.get(User, int(tg_id))
@@ -40,6 +45,9 @@ async def cmd_start(message: Message) -> None:
             first_name=u.first_name,
             last_name=u.last_name,
         )
+
+        if is_web_auth:
+            web_selector = extract_web_login_selector(payload)
 
         # Привязка по рефералке допустима только на самом первом входе.
         # Если пользователь уже существовал в БД, не назначаем реферера повторно.
@@ -76,6 +84,32 @@ async def cmd_start(message: Message) -> None:
         await referral_service.ensure_ref_code(session, tg_id)
         show_trial = await is_trial_available(session, tg_id)
         await session.commit()
+
+    if is_web_auth:
+        if not web_selector:
+            await message.answer(
+                "⚠️ Ссылка для входа на сайт повреждена. Вернись на сайт и запроси новую ссылку через Telegram.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        ok, result_message = await approve_site_telegram_login(selector=web_selector, tg_id=tg_id)
+        if ok:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🌐 Вернуться на сайт", url=(settings.web_app_base_url or "https://sbsconnect.up.railway.app"))]]
+            )
+            await message.answer(
+                "✅ Вход на сайте подтверждён.\n\n"
+                "Вернись в браузер: сайт завершит авторизацию автоматически. "
+                "Если страница уже была открыта, просто подожди пару секунд или обнови её.",
+                reply_markup=kb,
+            )
+        else:
+            await message.answer(
+                f"⚠️ {result_message}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        return
 
     if new_pending_referrer_tg_id and is_new_registration:
         ref_kb = InlineKeyboardMarkup(
