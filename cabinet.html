@@ -1,0 +1,953 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SBS CONNECT — Личный кабинет</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="cabinet-body cabinet-v2-body">
+    <div class="grid-bg"></div>
+
+    <header class="cabinet-topbar">
+      <div class="container cabinet-topbar-inner">
+        <a class="brand" href="/" aria-label="На главную">
+          <img src="/assets/logo-white-person.webp" alt="SBS CONNECT" onerror="this.src='/assets/logo-white-person.png'" />
+          <span>SBS <span>CONNECT</span></span>
+        </a>
+
+        <div class="cabinet-topbar-actions">
+          <a class="cabinet-topbar-link cabinet-topbar-link-home" href="/">НА ГЛАВНУЮ</a>
+          <button class="cabinet-topbar-link" id="logoutBtn" type="button">ВЫЙТИ</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container cabinet-v2-layout">
+      <section class="cabinet-shell">
+        <div class="cabinet-profile-card cyber-card">
+          <div class="cabinet-profile-left">
+            <div class="cabinet-avatar-wrap">
+              <div class="cabinet-avatar-glow"></div>
+              <div id="profileAvatar" class="cabinet-avatar cabinet-avatar-emoji" aria-hidden="true">🙂</div>
+              <button class="cabinet-avatar-upload" id="avatarUploadBtn" type="button" aria-label="Загрузить аватар">📷</button>
+              <input type="file" id="avatarUploadInput" class="cabinet-avatar-input" accept="image/png,image/jpeg,image/webp" hidden />
+              <span class="cabinet-avatar-status"></span>
+            </div>
+
+            <div class="cabinet-profile-meta">
+              <div class="cabinet-profile-row">
+                <h1 id="profileName">Загрузка…</h1>
+                <span class="cabinet-account-badge" id="accountBadge">ACCOUNT</span>
+              </div>
+              <div class="cabinet-profile-subrow">
+                <span id="profileHandle">@sbs_user</span>
+                <span id="profileId">ID: —</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="cabinet-status-chip" id="subscriptionStatusChip">АКТИВНА</div>
+        </div>
+
+        <div class="cabinet-tabs-shell">
+          <div class="cabinet-tabs" id="cabinetTabs">
+            <button class="cabinet-tab is-active" data-tab="overview" type="button">ОБЗОР</button>
+            <button class="cabinet-tab" data-tab="payments" type="button">ПЛАТЕЖИ</button>
+            <button class="cabinet-tab" data-tab="referrals" type="button">РЕФЕРАЛЫ</button>
+            <button class="cabinet-tab" data-tab="family" type="button">СЕМ. ГРУППА</button>
+            <button class="cabinet-tab" data-tab="yandex" type="button">ЯНД. СЕМЬЯ</button>
+          </div>
+        </div>
+
+        <section class="cabinet-panel-area">
+          <div class="cabinet-pane is-active" data-pane="overview">
+            <article class="cabinet-section-card cyber-card">
+              <div class="cabinet-section-head">
+                <div>
+                  <div class="section-code">// ПОДПИСКА</div>
+                  <h2 class="cabinet-section-title" id="subscriptionTitle">SBS CONNECT</h2>
+                </div>
+                <div class="cabinet-status-chip small" id="subscriptionStatusMini">АКТИВНА</div>
+              </div>
+
+              <div class="cabinet-metric-grid" id="subscriptionMetrics"></div>
+
+              <div class="cabinet-progress-wrap">
+                <div class="cabinet-progress-meta">
+                  <span>Прогресс периода</span>
+                  <span id="subscriptionProgressText">0 / 0 дней</span>
+                </div>
+                <div class="cabinet-progress-track">
+                  <div class="cabinet-progress-bar" id="subscriptionProgressBar"></div>
+                </div>
+              </div>
+
+              <div class="cabinet-cta-row">
+                <button class="cabinet-cta cabinet-cta-purple" id="renewBtn" type="button">ПРОДЛИТЬ → 199 ₽</button>
+              </div>
+            </article>
+
+            <article class="cabinet-section-card cyber-card">
+              <div class="section-code">// VPN КОНФИГ</div>
+              <h2 class="cabinet-section-title">Получить конфигурацию</h2>
+
+              <div class="cabinet-notice is-success" id="configNotice">
+                <span class="cabinet-notice-icon">✓</span>
+                <span class="cabinet-notice-text" id="configNoticeText">Подписка активна — конфиг доступен для скачивания</span>
+              </div>
+
+              <div class="cabinet-config-helper-grid">
+                <article class="cabinet-config-instructions-card">
+                  <div class="cabinet-config-helper-head">
+                    <span class="cabinet-config-helper-label">ИНСТРУКЦИЯ</span>
+                    <select id="deviceGuideSelect" class="cabinet-device-select">
+                      <option value="ios">iPhone / iPad</option>
+                      <option value="android">Android</option>
+                      <option value="windows">Windows</option>
+                      <option value="macos">macOS</option>
+                      <option value="linux">Linux</option>
+                    </select>
+                  </div>
+                  <div class="cabinet-guide-box" id="deviceGuideText">Выберите устройство, чтобы увидеть инструкцию по импорту .conf.</div>
+                </article>
+              </div>
+
+              <div class="cabinet-config-actions">
+                <button class="cabinet-cta cabinet-cta-cyan" id="downloadConfigBtn" type="button">СКАЧАТЬ .CONF</button>
+                <button class="cabinet-cta cabinet-cta-secondary" id="resetConfigBtn" type="button">СБРОСИТЬ КОНФИГ</button>
+              </div>
+            </article>
+
+            <article class="cabinet-section-card cyber-card">
+              <div class="section-code">// VPN FAMILY</div>
+              <h2 class="cabinet-section-title">Семейная группа VPN</h2>
+              <div class="cabinet-family-overview-grid">
+                <div class="cabinet-family-overview-card">
+                  <div class="cabinet-family-overview-label">СТАТУС</div>
+                  <div class="cabinet-family-overview-value" id="familyOverviewStatus">—</div>
+                </div>
+                <div class="cabinet-family-overview-card">
+                  <div class="cabinet-family-overview-label">СВОБОДНО</div>
+                  <div class="cabinet-family-overview-value" id="familyOverviewFree">—</div>
+                </div>
+                <div class="cabinet-family-overview-card">
+                  <div class="cabinet-family-overview-label">АКТИВНО ДО</div>
+                  <div class="cabinet-family-overview-value" id="familyOverviewEnd">—</div>
+                </div>
+              </div>
+              <div class="cabinet-family-inline-meta" id="familyOverviewMeta"></div>
+              <div class="cabinet-cta-row cabinet-family-overview-actions">
+                <button class="cabinet-cta cabinet-cta-cyan" id="buyFamilySeatBtn" type="button">КУПИТЬ МЕСТО</button>
+                <button class="cabinet-cta cabinet-cta-secondary" id="openFamilyTabBtn" type="button">ОТКРЫТЬ РАЗДЕЛ</button>
+              </div>
+            </article>
+
+
+            <article class="cabinet-section-card cyber-card">
+              <div class="section-code">// ЯНДЕКС ПЛЮС</div>
+              <h2 class="cabinet-section-title">Яндекс Семья</h2>
+              <div class="cabinet-family-overview-grid">
+                <div class="cabinet-family-overview-card">
+                  <div class="cabinet-family-overview-label">СТАТУС</div>
+                  <div class="cabinet-family-overview-value" id="yandexOverviewStatus">—</div>
+                </div>
+                <div class="cabinet-family-overview-card">
+                  <div class="cabinet-family-overview-label">СВОБОДНО</div>
+                  <div class="cabinet-family-overview-value" id="yandexOverviewFree">—</div>
+                </div>
+                <div class="cabinet-family-overview-card">
+                  <div class="cabinet-family-overview-label">АКТИВНО ДО</div>
+                  <div class="cabinet-family-overview-value" id="yandexOverviewEnd">—</div>
+                </div>
+              </div>
+              <div class="cabinet-family-inline-meta" id="yandexOverviewMeta"></div>
+              <div class="cabinet-cta-row cabinet-family-overview-actions">
+                <button class="cabinet-cta cabinet-cta-cyan" id="copyYandexInviteBtn" type="button">СКОПИРОВАТЬ ССЫЛКУ</button>
+                <button class="cabinet-cta cabinet-cta-secondary" id="openYandexTabBtn" type="button">ОТКРЫТЬ РАЗДЕЛ</button>
+              </div>
+            </article>
+
+            <div class="cabinet-quick-grid" id="quickActionsGrid"></div>
+          </div>
+
+          <div class="cabinet-pane" data-pane="payments">
+            <article class="cabinet-section-card cyber-card">
+              <div class="section-code">// ИСТОРИЯ</div>
+              <h2 class="cabinet-section-title">Платежи</h2>
+              <div class="cabinet-payments-list" id="paymentsList"></div>
+            </article>
+          </div>
+
+          <div class="cabinet-pane" data-pane="referrals">
+            <div class="cabinet-stat-grid" id="referralStats"></div>
+
+            <article class="cabinet-section-card cyber-card">
+              <div class="section-code">// РЕФЕРАЛЬНЫЕ ССЫЛКИ</div>
+              <h2 class="cabinet-section-title">Пригласи друга</h2>
+              <div class="cabinet-link-caption">Ссылка на сайт</div>
+              <div class="cabinet-link-box">
+                <div class="cabinet-link-value" id="referralLinkValue">—</div>
+                <button class="cabinet-cta cabinet-cta-cyan small" id="copyReferralBtn" type="button">КОПИРОВАТЬ</button>
+              </div>
+              <div class="cabinet-link-caption">Ссылка на Telegram-бота</div>
+              <div class="cabinet-link-box">
+                <div class="cabinet-link-value" id="botReferralLinkValue">—</div>
+                <button class="cabinet-cta cabinet-cta-secondary small" id="copyBotReferralBtn" type="button">КОПИРОВАТЬ</button>
+              </div>
+              <p class="cabinet-help-text" id="referralHelpText"></p>
+            </article>
+          </div>
+
+          <div class="cabinet-pane" data-pane="family">
+            <article class="cabinet-section-card cyber-card">
+              <div class="cabinet-section-head">
+                <div>
+                  <div class="section-code">// VPN FAMILY</div>
+                  <h2 class="cabinet-section-title">Семейная группа VPN</h2>
+                </div>
+                <div class="cabinet-status-chip small" id="familyStatusChip">НЕ АКТИВНА</div>
+              </div>
+
+              <div class="cabinet-progress-wrap family">
+                <div class="cabinet-progress-meta">
+                  <span>МЕСТА В ГРУППЕ</span>
+                  <span id="familyUsageText">0 / 0 активны</span>
+                </div>
+                <div class="cabinet-slots" id="familySlots"></div>
+              </div>
+
+              <div class="cabinet-family-meta" id="familyMeta"></div>
+              <p class="cabinet-help-text" id="familyHelpText"></p>
+
+              <div class="cabinet-cta-row cabinet-family-actions-row">
+                <button class="cabinet-cta cabinet-cta-cyan" id="familyBuySeatMainBtn" type="button">➕ КУПИТЬ МЕСТО</button>
+                <button class="cabinet-cta cabinet-cta-secondary" id="familyRenewOneBtn" type="button">🔄 ПРОДЛИТЬ 1 БЛИЖАЙШЕЕ</button>
+                <button class="cabinet-cta cabinet-cta-secondary" id="familyRenewAllBtn" type="button">🔄 ПРОДЛИТЬ ВСЕ</button>
+              </div>
+            </article>
+
+            <article class="cabinet-section-card cyber-card family-seats-card">
+              <div class="section-code">// МОИ МЕСТА</div>
+              <h2 class="cabinet-section-title">Управление местами</h2>
+              <div class="cabinet-family-list" id="familySlotsList"></div>
+            </article>
+          </div>
+
+          <div class="cabinet-pane" data-pane="yandex">
+            <article class="cabinet-section-card cyber-card">
+              <div class="cabinet-section-head">
+                <div>
+                  <div class="section-code">// ЯНДЕКС ПЛЮС</div>
+                  <h2 class="cabinet-section-title">Яндекс Семья</h2>
+                </div>
+                <div class="cabinet-status-chip small" id="yandexStatusChip">НЕ АКТИВНА</div>
+              </div>
+
+              <div class="cabinet-progress-wrap family">
+                <div class="cabinet-progress-meta">
+                  <span>МЕСТА В ГРУППЕ</span>
+                  <span id="yandexUsageText">0 / 0 занято</span>
+                </div>
+                <div class="cabinet-slots" id="yandexSlots"></div>
+              </div>
+
+              <div class="cabinet-family-meta" id="yandexMeta"></div>
+
+              <div class="cabinet-link-box">
+                <div class="cabinet-link-value" id="yandexInviteValue">—</div>
+                <button class="cabinet-cta cabinet-cta-cyan small" id="copyYandexBtn" type="button">КОПИРОВАТЬ</button>
+              </div>
+
+              <p class="cabinet-help-text" id="yandexHelpText"></p>
+
+              <article class="cabinet-config-instructions-card" style="margin-top:20px;">
+                <div class="cabinet-config-helper-head">
+                  <span class="cabinet-config-helper-label">ЧТО ДАЁТ ЯНДЕКС ПЛЮС</span>
+                </div>
+                <div class="cabinet-guide-box">
+                  <ul class="cabinet-yandex-benefits">
+                    <li>Яндекс Музыка без рекламы</li>
+                    <li>Кинопоиск — фильмы и сериалы</li>
+                    <li>Яндекс Такси — кешбэк баллами</li>
+                    <li>Яндекс Маркет — бонусы</li>
+                    <li>До 6 аккаунтов в одной группе</li>
+                  </ul>
+                </div>
+              </article>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      const state = { activeTab: 'overview', model: null };
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+      }
+
+      function formatDate(value) {
+        if (!value) return '—';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return '—';
+        return date.toISOString().slice(0, 10);
+      }
+
+      function formatDateTime(value) {
+        if (!value) return '—';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return '—';
+        return `${date.toISOString().slice(0, 10)} ${date.toISOString().slice(11, 16)}`;
+      }
+
+      function formatMoney(value) {
+        const amount = Number(value || 0);
+        return `${amount.toLocaleString('ru-RU')} ₽`;
+      }
+
+      async function copyText(value, trigger) {
+        if (!value) return;
+        await navigator.clipboard.writeText(value);
+        if (trigger) {
+          const prev = trigger.textContent;
+          trigger.textContent = 'СКОПИРОВАНО';
+          setTimeout(() => { trigger.textContent = prev; }, 1500);
+        }
+      }
+
+      function mapPaymentStatus(status) {
+        const value = String(status || '').toLowerCase();
+        if (['paid', 'success', 'completed', 'ok'].includes(value)) return 'ОПЛАЧЕНО';
+        if (['pending', 'processing'].includes(value)) return 'В ОБРАБОТКЕ';
+        if (['failed', 'cancelled', 'canceled'].includes(value)) return 'ОТКЛОНЕНО';
+        return value ? value.toUpperCase() : 'ОПЛАЧЕНО';
+      }
+
+      function diffDaysLeft(value) {
+        if (!value) return null;
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return null;
+        return Math.ceil((date.getTime() - Date.now()) / 86400000);
+      }
+
+      
+const DEVICE_GUIDES = {
+  ios: {
+    steps: [
+      '1) Установите WireGuard из App Store.',
+      '2) В кабинете нажмите «Скачать .conf» и сохраните файл в «Файлы».',
+      '3) В WireGuard нажмите «+» → Import from file or archive.',
+      '4) Выберите скачанный .conf и разрешите добавление VPN.',
+      '5) Если не подключается — попробуйте «Сбросить конфиг» и скачайте новый файл.'
+    ],
+    links: [
+      { title: '⬇️ Скачать WireGuard для iPhone / iPad', url: 'https://apps.apple.com/app/wireguard/id1441195209' }
+    ]
+  },
+  android: {
+    steps: [
+      '1) Нажмите кнопку ниже и установите WireGuard из Google Play.',
+      '2) В кабинете нажмите «Скачать .conf» и сохраните файл.',
+      '3) Откройте WireGuard → «+» → Import from file or archive.',
+      '4) Выберите скачанный .conf и подтвердите создание VPN-подключения.',
+      '5) Если не подключается — проверьте интернет и попробуйте «Сбросить конфиг».'
+    ],
+    links: [
+      { title: '⬇️ Скачать WireGuard (Google Play)', url: 'https://play.google.com/store/apps/details?id=com.wireguard.android' }
+    ]
+  },
+  windows: {
+    steps: [
+      '1) Нажмите кнопку ниже и установите WireGuard для Windows.',
+      '2) В кабинете нажмите «Скачать .conf» и сохраните файл.',
+      '3) Откройте WireGuard → Import tunnel(s) from file.',
+      '4) Выберите скачанный .conf и нажмите Activate.',
+      '5) Если не подключается — проверьте обычный интернет и попробуйте «Сбросить конфиг».'
+    ],
+    links: [
+      { title: '⬇️ Скачать WireGuard для Windows', url: 'https://www.wireguard.com/install/' }
+    ]
+  },
+  macos: {
+    steps: [
+      '1) Нажмите кнопку ниже и установите WireGuard для macOS.',
+      '2) В кабинете нажмите «Скачать .conf».',
+      '3) В приложении WireGuard выберите Import tunnel(s) from file.',
+      '4) Укажите скачанный .conf и нажмите Activate.',
+      '5) Если не подключается — проверьте интернет без VPN и затем нажмите «Сбросить конфиг».'
+    ],
+    links: [
+      { title: '⬇️ Скачать WireGuard для macOS', url: 'https://apps.apple.com/app/wireguard/id1451685025' }
+    ]
+  },
+  linux: {
+    steps: [
+      '1) Нажмите кнопку ниже и откройте официальную инструкцию WireGuard.',
+      '2) Для Ubuntu/Debian обычно достаточно выполнить: sudo apt update && sudo apt install wireguard -y.',
+      '3) Скачайте .conf из кабинета.',
+      '4) Сохраните его как /etc/wireguard/wg0.conf или импортируйте в NetworkManager.',
+      '5) Запустите: sudo wg-quick up wg0.'
+    ],
+    links: [
+      { title: '⬇️ Официальная инструкция WireGuard', url: 'https://www.wireguard.com/install/' }
+    ]
+  }
+};
+
+      function normalizeDashboard(data) {
+        const account = data?.account || {};
+        const subscription = data?.subscription || {};
+        const payments = Array.isArray(data?.payments) ? data.payments : [];
+        const referrals = Array.isArray(data?.referrals) ? data.referrals : [];
+        const referralEarnings = Array.isArray(data?.referral_earnings) ? data.referral_earnings : [];
+        const referralSummary = data?.referral_summary || {};
+        const family = data?.family || {};
+        const group = family.group || {};
+        const profiles = Array.isArray(family.profiles) ? family.profiles : [];
+        const yandex = data?.yandex || {};
+        const yandexGroup = yandex.group || {};
+        const actions = Array.isArray(data?.actions) ? data.actions : [];
+
+        const daysElapsed = Number(subscription.progress_elapsed_days ?? (subscription.start_at ? Math.max(0, Math.ceil((Date.now() - new Date(subscription.start_at).getTime()) / 86400000)) : 0));
+        const daysTotal = Number(subscription.progress_total_days ?? (subscription.start_at && subscription.end_at ? Math.max(1, Math.ceil((new Date(subscription.end_at).getTime() - new Date(subscription.start_at).getTime()) / 86400000)) : 0));
+        const daysLeft = Number(subscription.progress_remaining_days ?? (subscription.end_at ? Math.max(0, Math.ceil((new Date(subscription.end_at).getTime() - Date.now()) / 86400000)) : 0));
+
+        const referralBonus = Number(referralSummary.total_earned_rub ?? referralEarnings.reduce((sum, item) => sum + Number(item.earned_rub || 0), 0));
+        const actionByKey = (key) => actions.find((item) => item && item.key === key) || null;
+        const renewUrl = actionByKey('pay')?.href || '/api/payments/checkout';
+        const configUrl = subscription.config_url || actionByKey('config_download')?.href || '/api/vpn/download-config';
+        const configKey = subscription.config_key || '';
+        const referralLink = account.referral_link || actionByKey('ref')?.value || '';
+        const botReferralLink = account.bot_referral_link || '';
+        const yandexInviteLink = yandexGroup.invite_link || actionByKey('yandex')?.value || actionByKey('yandex')?.href || '';
+        const yandexSlots = Number(yandexGroup.seats_total || 0) || 5;
+        const yandexUsed = Math.min(Number(yandexGroup.seats_used || 0), Math.max(0, yandexSlots));
+
+        const familyProfiles = profiles.map((item) => {
+          const expiresAt = item.expires_at || null;
+          const days = diffDaysLeft(expiresAt);
+          const paid = Boolean(item.is_paid);
+          return {
+            slotNo: Number(item.slot_no || 0),
+            label: item.label || `Место ${item.slot_no}`,
+            paid,
+            shareable: Boolean(item.is_shareable),
+            hasConfig: Boolean(item.has_config),
+            peerId: item.vpn_peer_id || null,
+            serverCode: item.server_code || null,
+            expiresAt,
+            isPaused: Boolean(item.is_paused),
+            vpnIsActive: Boolean(item.vpn_is_active),
+            stateText: paid
+              ? `до ${formatDateTime(expiresAt)}${days !== null ? ` (осталось ${Math.max(0, days)} дн.)` : ''}`
+              : (expiresAt ? `истекло ${formatDateTime(expiresAt)}` : 'не оплачено')
+          };
+        });
+
+        return {
+          name: account.display_name || [account.first_name, account.last_name].filter(Boolean).join(' ') || account.email || 'Пользователь SBS CONNECT',
+          badge: account.user_type === 'telegram' ? 'Telegram' : 'Email',
+          handle: account.tg_username ? `@${account.tg_username}` : (account.email_masked || account.email || 'web-account'),
+          idLine: account.tg_id ? `ID: ${account.tg_id}` : (account.email ? `Email: ${account.email_masked || account.email}` : 'ID: —'),
+          active: Boolean(subscription.is_active),
+          startedAt: formatDate(subscription.start_at),
+          expiresAt: formatDate(subscription.end_at),
+          daysLeft,
+          daysElapsed: Math.max(0, Math.min(daysElapsed, daysTotal || daysElapsed || 0)),
+          daysTotal: daysTotal || Math.max(daysElapsed, daysLeft, 30),
+          statusText: subscription.is_active ? 'АКТИВНА' : 'НЕ АКТИВНА',
+          payments: payments.map((item) => ({
+            date: formatDate(item.paid_at || item.created_at),
+            amount: formatMoney(item.amount || 0),
+            status: mapPaymentStatus(item.status),
+            id: item.id ? `#${item.id}` : '—'
+          })),
+          referrals: {
+            count: Number(referralSummary.active_count ?? referrals.length),
+            bonus: formatMoney(referralBonus || 0),
+            percent: Number(referralSummary.current_percent || 0),
+            hasOverride: Boolean(referralSummary.has_override),
+            nextPercent: referralSummary.next_percent ?? null,
+            nextTarget: referralSummary.next_target_active ?? null,
+            link: referralLink,
+            botLink: botReferralLink,
+            enabled: Boolean(referralLink || botReferralLink)
+          },
+          family: {
+            active: Boolean(group.is_current),
+            status: group.is_current ? 'АКТИВНА' : 'НЕ АКТИВНА',
+            seatsTotal: Number(group.seats_total || 0),
+            activeCount: Number(group.active_profiles || 0),
+            freeCount: Number(group.free_profiles || 0),
+            activeUntil: group.active_until || null,
+            nearestSlotNo: group.nearest_slot_no || null,
+            nearestExpiresAt: group.nearest_expires_at || null,
+            billingOptIn: Boolean(group.billing_opt_in),
+            seatPrice: Number(family.seat_price_rub || 0),
+            profiles: familyProfiles
+          },
+          yandex: {
+            active: Boolean(yandexGroup.is_current),
+            status: yandexGroup.is_current ? 'АКТИВНА' : 'НЕ АКТИВНА',
+            slots: yandexSlots,
+            used: Math.max(0, yandexUsed),
+            free: Math.max(0, yandexSlots - yandexUsed),
+            enabled: Boolean(yandexInviteLink),
+            inviteLink: yandexInviteLink,
+            accountLabel: yandexGroup.account_label || '',
+            slotIndex: yandexGroup.slot_index || null,
+            yandexLogin: yandexGroup.yandex_login || '',
+            coverageEndAt: yandexGroup.coverage_end_at || null,
+            inviteExpiresAt: yandexGroup.invite_expires_at || null,
+            plusEndAt: yandexGroup.plus_end_at || null
+          },
+          avatarUrl: account.avatar_url || '',
+          actions: {
+            renew: renewUrl,
+            configKey,
+            configUrl,
+            canDownloadConfig: Boolean(subscription.is_active && configUrl),
+            canResetConfig: Boolean(subscription.is_active),
+            resetUrl: subscription.config_reset_url || '/api/vpn/reset-config'
+          }
+        };
+      }
+
+      function renderSubscriptionMetrics(model) {
+        const metrics = [
+          { label: 'НАЧАЛО', value: model.startedAt },
+          { label: 'ИСТЕКАЕТ', value: model.expiresAt, glow: true },
+          { label: 'ПРОШЛО', value: `${model.daysElapsed} дн.` }
+        ];
+        document.getElementById('subscriptionMetrics').innerHTML = metrics.map((item) => `
+          <div class="cabinet-metric-card ${item.glow ? 'is-glow' : ''}">
+            <div class="cabinet-metric-label">${item.label}</div>
+            <div class="cabinet-metric-value">${escapeHtml(item.value)}</div>
+          </div>
+        `).join('');
+        document.getElementById('subscriptionProgressText').textContent = `${model.daysElapsed} / ${model.daysTotal} дней прошло`;
+        const progress = model.daysTotal > 0 ? Math.max(0, Math.min(100, Math.round((model.daysElapsed / Math.max(1, model.daysTotal)) * 100))) : 0;
+        document.getElementById('subscriptionProgressBar').style.width = `${progress}%`;
+      }
+
+      function renderDeviceGuide(device) {
+        const target = document.getElementById('deviceGuideText');
+        if (!target) return;
+        const guide = DEVICE_GUIDES[device] || DEVICE_GUIDES.ios;
+        const stepsHtml = guide.steps.map((step) => `<span>${escapeHtml(step)}</span>`).join('');
+        const linksHtml = guide.links?.length ? `<div class="cabinet-guide-links">${guide.links.map((item) => `<a class="cabinet-guide-link" href="${item.url}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.title)}</a>`).join('')}</div>` : '';
+        target.innerHTML = `${stepsHtml}${linksHtml}`;
+      }
+
+      async function handleCheckout(product = 'subscription', extras = {}) {
+        try {
+          const response = await fetch('/api/payments/checkout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ source: 'cabinet', product, ...extras })
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok || !data.payment_url) throw new Error(data.error || 'PAYMENT_CHECKOUT_FAILED');
+          window.location.href = data.payment_url;
+        } catch (error) {
+          const map = {
+            PAYMENTS_DISABLED: 'Платежи временно недоступны на сайте. Проверьте переменные Platega в Railway.',
+            PAYMENT_ACCOUNT_NOT_READY: 'Оплата пока недоступна для этого аккаунта.',
+            PAYMENT_PROVIDER_ERROR: 'Платежная система сейчас недоступна. Попробуй позже.',
+            SUBSCRIPTION_REQUIRED: 'Сначала продлите основную подписку.',
+            FAMILY_SLOT_REQUIRED: 'Выберите место для продления.'
+          };
+          alert(map[error.message] || 'Не удалось открыть оплату. Попробуй ещё раз позже.');
+        }
+      }
+
+      async function handleResetConfig(model) {
+        if (!model.active || !model.actions.canResetConfig) {
+          handleCheckout('subscription');
+          return;
+        }
+        if (!window.confirm('Старый конфиг перестанет работать. Сбросить и запросить новый?')) return;
+        try {
+          const response = await fetch(model.actions.resetUrl || '/api/vpn/reset-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ source: 'cabinet' })
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || 'VPN_RESET_FAILED');
+          alert('Конфиг сброшен. Скачайте новый .conf.');
+        } catch (error) {
+          const map = {
+            VPN_RESET_NOT_CONFIGURED: 'Сброс конфига пока не настроен на серверной части.',
+            SUBSCRIPTION_REQUIRED: 'Сначала оплатите или продлите подписку.',
+            VPN_RESET_FAILED: 'Не удалось сбросить конфиг. Попробуйте позже.'
+          };
+          alert(map[error.message] || 'Не удалось сбросить конфиг.');
+        }
+      }
+
+      function handleDownloadConfig(model) {
+        if (!model.active || !model.actions.canDownloadConfig) {
+          handleCheckout('subscription');
+          return;
+        }
+        window.location.href = model.actions.configUrl || '/api/vpn/download-config';
+      }
+
+      async function handleFamilySlotDownload(slotNo) {
+        window.location.href = `/api/family/slot/${slotNo}/download`;
+      }
+
+      async function handleFamilySlotReset(slotNo) {
+        if (!window.confirm(`Сбросить семейный профиль #${slotNo}? Старый конфиг перестанет работать.`)) return;
+        try {
+          const response = await fetch(`/api/family/slot/${slotNo}/reset`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ source: 'cabinet' })
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || 'FAMILY_RESET_FAILED');
+          alert('Профиль сброшен. Если новый конфиг уже подготовлен, скачайте его повторно.');
+        } catch (error) {
+          const map = {
+            FAMILY_RESET_NOT_CONFIGURED: 'Сброс семейного профиля пока не подключён на серверной части.',
+            FAMILY_RESET_FAILED: 'Не удалось сбросить профиль.',
+            FAMILY_SLOT_NOT_ACTIVE: 'Сначала продлите это место.',
+            SUBSCRIPTION_REQUIRED: 'Сначала продлите основную подписку.'
+          };
+          alert(map[error.message] || 'Не удалось сбросить профиль.');
+        }
+      }
+
+      function renderQuickActions(model) {
+        const actions = [
+          { icon: '⇩', label: model.active ? 'Мой конфиг' : 'Конфиг', sub: model.active ? 'Скачать .conf' : 'Откроется после оплаты', action: () => model.active ? handleDownloadConfig(model) : handleCheckout('subscription'), enabled: true },
+          { icon: '₽', label: model.active ? 'Продлить' : 'Оплатить', sub: '199 ₽/мес', action: () => handleCheckout('subscription'), enabled: true },
+          { icon: '👥', label: 'Рефералы', sub: `${model.referrals.count} чел.`, action: () => activateTab('referrals'), enabled: true },
+          { icon: '👨‍👩‍👧‍👦', label: 'VPN Family', sub: model.family.active ? `${model.family.activeCount}/${model.family.seatsTotal} активны` : 'Не активна', action: () => activateTab('family'), enabled: true },
+          { icon: '☆', label: 'Яндекс Семья', sub: model.yandex.active ? 'Активна' : 'Не активна', action: () => activateTab('yandex'), enabled: true }
+        ];
+        const grid = document.getElementById('quickActionsGrid');
+        grid.innerHTML = actions.map((item, index) => `
+          <button class="cabinet-quick-card ${item.enabled ? '' : 'is-disabled'}" data-quick-index="${index}" type="button">
+            <span class="cabinet-quick-icon">${item.icon}</span>
+            <strong>${item.label}</strong>
+            <span>${item.sub}</span>
+          </button>
+        `).join('');
+        grid.querySelectorAll('[data-quick-index]').forEach((node) => node.addEventListener('click', () => actions[Number(node.dataset.quickIndex)]?.action?.()));
+      }
+
+      function renderFamilyOverview(model) {
+        document.getElementById('familyOverviewStatus').textContent = model.family.active ? 'АКТИВНА' : 'НЕ АКТИВНА';
+        document.getElementById('familyOverviewFree').textContent = `${model.family.freeCount} из ${model.family.seatsTotal}`;
+        document.getElementById('familyOverviewEnd').textContent = model.family.activeUntil ? formatDate(model.family.activeUntil) : '—';
+        document.getElementById('familyOverviewMeta').innerHTML = [
+          `<span class="cabinet-family-pill">Цена: ${escapeHtml(formatMoney(model.family.seatPrice || 0))} / место</span>`,
+          model.family.nearestSlotNo ? `<span class="cabinet-family-pill">Ближайшее истекает: место #${escapeHtml(String(model.family.nearestSlotNo))}</span>` : '',
+          `<span class="cabinet-family-pill">Автосчёт: ${model.family.billingOptIn ? 'включён' : 'выключен'}</span>`
+        ].filter(Boolean).join('');
+        document.getElementById('buyFamilySeatBtn').onclick = () => handleCheckout('family_buy', { seats: 1 });
+        document.getElementById('openFamilyTabBtn').onclick = () => activateTab('family');
+      }
+
+      function renderYandexOverview(model) {
+        document.getElementById('yandexOverviewStatus').textContent = model.yandex.active ? 'АКТИВНА' : 'НЕ АКТИВНА';
+        document.getElementById('yandexOverviewFree').textContent = `${model.yandex.free} из ${model.yandex.slots}`;
+        document.getElementById('yandexOverviewEnd').textContent = model.yandex.coverageEndAt ? formatDate(model.yandex.coverageEndAt) : '—';
+        document.getElementById('yandexOverviewMeta').innerHTML = [
+          model.yandex.accountLabel ? `<span class="cabinet-family-pill">Семья: ${escapeHtml(model.yandex.accountLabel)}</span>` : '',
+          model.yandex.slotIndex ? `<span class="cabinet-family-pill">Место: ${escapeHtml(String(model.yandex.slotIndex))}</span>` : '',
+          model.yandex.inviteLink ? `<span class="cabinet-family-pill">Ссылка подготовлена</span>` : `<span class="cabinet-family-pill">Ссылка пока не выдана</span>`
+        ].filter(Boolean).join('');
+        document.getElementById('copyYandexInviteBtn').disabled = !model.yandex.inviteLink;
+        document.getElementById('copyYandexInviteBtn').onclick = (event) => { if (model.yandex.inviteLink) copyText(model.yandex.inviteLink, event.currentTarget); };
+        document.getElementById('openYandexTabBtn').onclick = () => activateTab('yandex');
+      }
+
+      function renderPayments(model) {
+        const target = document.getElementById('paymentsList');
+        if (!model.payments.length) {
+          target.innerHTML = '<div class="cabinet-empty">Платежей пока нет.</div>';
+          return;
+        }
+        target.innerHTML = model.payments.map((item) => `
+          <div class="cabinet-payment-row">
+            <div class="cabinet-payment-check">✓</div>
+            <div class="cabinet-payment-main">
+              <div class="cabinet-payment-date">${escapeHtml(item.date)}</div>
+              <div class="cabinet-payment-id">${escapeHtml(item.id)}</div>
+            </div>
+            <div class="cabinet-payment-amount">${escapeHtml(item.amount)}</div>
+            <div class="cabinet-payment-status">${escapeHtml(item.status)}</div>
+          </div>
+        `).join('');
+      }
+
+      function renderReferrals(model) {
+        document.getElementById('referralStats').innerHTML = [
+          { label: 'ПРИГЛАШЕНО', value: model.referrals.count, unit: 'чел.', tone: 'cyan' },
+          { label: 'ЗАРАБОТАНО', value: model.referrals.bonus, unit: '', tone: 'green' },
+          { label: 'ОТЧИСЛЕНИЯ', value: `${model.referrals.percent}%`, unit: 'с реферала', tone: 'purple' }
+        ].map((item) => `
+          <article class="cabinet-stat-card cyber-card">
+            <div class="cabinet-stat-label">${item.label}</div>
+            <div class="cabinet-stat-value ${item.tone}">${escapeHtml(String(item.value))}</div>
+            <div class="cabinet-stat-unit">${escapeHtml(item.unit)}</div>
+          </article>
+        `).join('');
+
+        document.getElementById('referralLinkValue').textContent = model.referrals.link || 'Реферальная ссылка появится после активации.';
+        const referralHelp = document.getElementById('referralHelpText');
+        if (model.referrals.hasOverride) {
+          referralHelp.textContent = `Текущий процент отчисления с реферала: ${model.referrals.percent}%. Значение назначено администратором.`;
+        } else if (model.referrals.nextPercent && model.referrals.nextTarget) {
+          referralHelp.textContent = `Текущий процент отчисления с реферала: ${model.referrals.percent}%. Следующий уровень — ${model.referrals.nextPercent}% при ${model.referrals.nextTarget} активных рефералах.`;
+        } else {
+          referralHelp.textContent = `Текущий процент отчисления с реферала: ${model.referrals.percent}%.`;
+        }
+        const refBtn = document.getElementById('copyReferralBtn');
+        refBtn.disabled = !model.referrals.enabled;
+        refBtn.onclick = async (event) => {
+          if (!model.referrals.enabled) return;
+          await navigator.clipboard.writeText(model.referrals.link);
+          event.currentTarget.textContent = 'СКОПИРОВАНО';
+          setTimeout(() => { event.currentTarget.textContent = 'КОПИРОВАТЬ'; }, 1500);
+        };
+      }
+
+      function renderFamily(model) {
+        const familyChip = document.getElementById('familyStatusChip');
+        familyChip.textContent = model.family.active ? 'АКТИВНА' : 'НЕ АКТИВНА';
+        familyChip.classList.toggle('inactive', !model.family.active);
+        document.getElementById('familyUsageText').textContent = `${model.family.activeCount} / ${model.family.seatsTotal} активны · свободно ${model.family.freeCount}`;
+        document.getElementById('familyMeta').innerHTML = [
+          `<span class="cabinet-family-pill">Цена: ${escapeHtml(formatMoney(model.family.seatPrice || 0))} / место</span>`,
+          model.family.activeUntil ? `<span class="cabinet-family-pill">Активно до: ${escapeHtml(formatDate(model.family.activeUntil))}</span>` : '',
+          model.family.nearestSlotNo ? `<span class="cabinet-family-pill">Ближайшее истекает: место #${escapeHtml(String(model.family.nearestSlotNo))}</span>` : '',
+          `<span class="cabinet-family-pill">Автосчёт: ${model.family.billingOptIn ? 'включён' : 'выключен'}</span>`
+        ].filter(Boolean).join('');
+
+        const help = document.getElementById('familyHelpText');
+        help.innerHTML = 'Семейная группа VPN — это отдельные оплачиваемые места для родственников, друзей и дополнительных устройств. Каждое место живёт отдельно от основной подписки и продлевается отдельно.';
+
+        const slots = document.getElementById('familySlots');
+        slots.innerHTML = Array.from({ length: Math.max(1, model.family.seatsTotal || 1) }).map((_, index) => {
+          const slot = model.family.profiles.find((item) => item.slotNo === index + 1);
+          return `<span class="cabinet-slot ${slot?.paid ? 'is-filled' : ''}"></span>`;
+        }).join('');
+
+        document.getElementById('familyBuySeatMainBtn').onclick = () => handleCheckout('family_buy', { seats: 1 });
+        document.getElementById('familyRenewOneBtn').onclick = () => handleCheckout('family_renew_one');
+        document.getElementById('familyRenewAllBtn').onclick = () => handleCheckout('family_renew_all');
+
+        const list = document.getElementById('familySlotsList');
+        if (!model.family.profiles.length) {
+          list.innerHTML = '<div class="cabinet-empty">У вас пока нет купленных семейных мест.</div>';
+          return;
+        }
+        list.innerHTML = model.family.profiles.map((slot) => `
+          <article class="cabinet-family-slot-card">
+            <div class="cabinet-family-slot-head">
+              <div>
+                <strong>Место #${escapeHtml(String(slot.slotNo))}</strong>
+                <div class="cabinet-family-slot-meta">${escapeHtml(slot.stateText)}</div>
+              </div>
+              <span class="cabinet-family-slot-badge ${slot.paid ? 'is-active' : 'is-inactive'}">${slot.paid ? 'АКТИВНО' : 'НЕ АКТИВНО'}</span>
+            </div>
+            <div class="cabinet-family-slot-submeta">
+              <span>${slot.hasConfig ? 'Конфиг создан' : 'Конфиг ещё не выдан'}</span>
+              <span>${slot.serverCode ? `Сервер: ${escapeHtml(slot.serverCode)}` : 'Сервер будет назначен при выдаче'}</span>
+            </div>
+            <div class="cabinet-family-slot-actions">
+              <button class="cabinet-cta cabinet-cta-cyan small" type="button" data-family-download="${slot.slotNo}" ${slot.paid && slot.hasConfig ? '' : 'disabled'}>📤 ПОЛУЧИТЬ КОНФИГ</button>
+              <button class="cabinet-cta cabinet-cta-secondary small" type="button" data-family-reset="${slot.slotNo}" ${slot.paid ? '' : 'disabled'}>♻️ СБРОСИТЬ</button>
+              <button class="cabinet-cta cabinet-cta-secondary small" type="button" data-family-renew="${slot.slotNo}">🔄 ПРОДЛИТЬ</button>
+            </div>
+          </article>
+        `).join('');
+
+        list.querySelectorAll('[data-family-download]').forEach((button) => {
+          button.addEventListener('click', () => handleFamilySlotDownload(button.dataset.familyDownload));
+        });
+        list.querySelectorAll('[data-family-reset]').forEach((button) => {
+          button.addEventListener('click', () => handleFamilySlotReset(button.dataset.familyReset));
+        });
+        list.querySelectorAll('[data-family-renew]').forEach((button) => {
+          button.addEventListener('click', () => handleCheckout('family_renew_slot', { slot_no: Number(button.dataset.familyRenew) }));
+        });
+      }
+
+      function renderYandex(model) {
+        const chip = document.getElementById('yandexStatusChip');
+        chip.textContent = model.yandex.active ? 'АКТИВНА' : 'НЕ АКТИВНА';
+        chip.classList.toggle('inactive', !model.yandex.active);
+        document.getElementById('yandexUsageText').textContent = `${model.yandex.used} / ${model.yandex.slots} занято`;
+        document.getElementById('yandexInviteValue').textContent = model.yandex.inviteLink || 'Ссылка появится здесь после выдачи или продления семейной группы.';
+        document.getElementById('yandexMeta').innerHTML = [
+          model.yandex.accountLabel ? `<span class="cabinet-family-pill">Семья: ${escapeHtml(model.yandex.accountLabel)}</span>` : '',
+          model.yandex.slotIndex ? `<span class="cabinet-family-pill">Место: ${escapeHtml(String(model.yandex.slotIndex))}</span>` : '',
+          model.yandex.yandexLogin ? `<span class="cabinet-family-pill">Логин: ${escapeHtml(model.yandex.yandexLogin)}</span>` : '',
+          model.yandex.coverageEndAt ? `<span class="cabinet-family-pill">Активно до: ${escapeHtml(formatDate(model.yandex.coverageEndAt))}</span>` : ''
+        ].filter(Boolean).join('');
+        const help = document.getElementById('yandexHelpText');
+        if (model.yandex.inviteExpiresAt) {
+          help.textContent = `Ссылка-приглашение выдана из БД. Истекает: ${formatDate(model.yandex.inviteExpiresAt)}.`;
+        } else if (model.yandex.active) {
+          help.textContent = model.yandex.inviteLink ? 'Данные по Яндекс Семье подтягиваются напрямую из БД.' : 'Подписка Яндекс активна. Ссылка-приглашение сейчас не выдана, но статус и место в группе подтянуты из БД.';
+        } else {
+          help.textContent = 'Приглашение появится здесь после выдачи или продления семейной группы.';
+        }
+        document.getElementById('copyYandexBtn').disabled = !model.yandex.inviteLink;
+        document.getElementById('copyYandexBtn').onclick = (event) => { if (model.yandex.inviteLink) copyText(model.yandex.inviteLink, event.currentTarget); };
+        const slots = document.getElementById('yandexSlots');
+        slots.innerHTML = Array.from({ length: Math.max(1, model.yandex.slots) }).map((_, index) => `<span class="cabinet-slot ${index < model.yandex.used ? 'is-filled' : ''}"></span>`).join('');
+      }
+
+      function avatarEmojiSeed(model) {
+        const seeds = ['🙂','😎','🤖','🛰️','✨','🚀','😺','🛸','🌈','😄'];
+        const base = String(model.idLine || model.name || 'sbs');
+        let hash = 0;
+        for (let i = 0; i < base.length; i++) hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
+        return seeds[Math.abs(hash) % seeds.length];
+      }
+
+      function renderAvatar(model) {
+        const node = document.getElementById('profileAvatar');
+        if (!node) return;
+        if (model.avatarUrl) {
+          node.outerHTML = `<img id="profileAvatar" class="cabinet-avatar" src="${escapeHtml(model.avatarUrl)}" alt="Аватар" onerror="this.outerHTML='&lt;div id="profileAvatar" class="cabinet-avatar cabinet-avatar-emoji">${avatarEmojiSeed(model)}&lt;/div>'" />`;
+        } else {
+          node.outerHTML = `<div id="profileAvatar" class="cabinet-avatar cabinet-avatar-emoji">${avatarEmojiSeed(model)}</div>`;
+        }
+      }
+
+      function renderHeader(model) {
+        renderAvatar(model);
+        document.getElementById('profileName').textContent = model.name;
+        document.getElementById('accountBadge').textContent = model.badge;
+        document.getElementById('profileHandle').textContent = model.handle;
+        document.getElementById('profileId').textContent = model.idLine;
+        document.getElementById('subscriptionStatusChip').textContent = model.statusText;
+        document.getElementById('subscriptionStatusChip').classList.toggle('inactive', !model.active);
+        document.getElementById('subscriptionStatusMini').textContent = model.statusText;
+        document.getElementById('subscriptionStatusMini').classList.toggle('inactive', !model.active);
+        document.getElementById('subscriptionTitle').textContent = model.active ? 'SBS CONNECT' : 'Подключить подписку';
+
+        const notice = document.getElementById('configNotice');
+        const noticeText = document.getElementById('configNoticeText');
+        if (model.active) {
+          notice.className = 'cabinet-notice is-success';
+          noticeText.textContent = model.actions.canDownloadConfig ? 'Подписка активна — конфиг доступен для скачивания' : 'Подписка активна — управление конфигом доступно через кабинет';
+        } else {
+          notice.className = 'cabinet-notice is-warn';
+          noticeText.textContent = 'Подписка не активна — оформи доступ, чтобы получить конфиг и семейные VPN-места';
+        }
+      }
+
+      function bindOverviewActions(model) {
+        const renewBtn = document.getElementById('renewBtn');
+        const downloadBtn = document.getElementById('downloadConfigBtn');
+        const resetBtn = document.getElementById('resetConfigBtn');
+        const guideSelect = document.getElementById('deviceGuideSelect');
+
+        renewBtn.textContent = model.active ? 'ПРОДЛИТЬ → 199 ₽' : 'ОПЛАТИТЬ → 199 ₽';
+        renewBtn.onclick = () => handleCheckout('subscription');
+
+        downloadBtn.disabled = false;
+        downloadBtn.textContent = model.actions.canDownloadConfig ? 'СКАЧАТЬ .CONF' : 'ОПЛАТИТЬ → 199 ₽';
+        downloadBtn.onclick = () => model.actions.canDownloadConfig ? handleDownloadConfig(model) : handleCheckout('subscription');
+
+        resetBtn.disabled = !model.actions.canResetConfig;
+        resetBtn.classList.toggle('is-disabled', !model.actions.canResetConfig);
+        resetBtn.onclick = () => handleResetConfig(model);
+
+        renderDeviceGuide(guideSelect.value || 'ios');
+        guideSelect.onchange = () => renderDeviceGuide(guideSelect.value || 'ios');
+      }
+
+
+      function bindAvatarUpload(model) {
+        const trigger = document.getElementById('avatarUploadBtn');
+        const input = document.getElementById('avatarUploadInput');
+        if (!trigger || !input) return;
+        trigger.onclick = () => input.click();
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          if (file.size > 5 * 1024 * 1024) {
+            alert('Файл слишком большой. До 5 МБ.');
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = async () => {
+            try {
+              const response = await fetch('/api/profile/avatar', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ data_url: reader.result })
+              });
+              const data = await response.json().catch(() => ({}));
+              if (!response.ok) throw new Error(data.error || 'AVATAR_UPLOAD_FAILED');
+              model.avatarUrl = data.avatar_url || '';
+              renderAvatar(model);
+            } catch (error) {
+              alert(error.message === 'INVALID_IMAGE' ? 'Загрузите PNG, JPG или WEBP.' : 'Не удалось сохранить аватар.');
+            } finally {
+              input.value = '';
+            }
+          };
+          reader.readAsDataURL(file);
+        };
+      }
+
+      function activateTab(tabId) {
+        state.activeTab = tabId;
+        document.querySelectorAll('.cabinet-tab').forEach((node) => node.classList.toggle('is-active', node.dataset.tab === tabId));
+        document.querySelectorAll('.cabinet-pane').forEach((node) => node.classList.toggle('is-active', node.dataset.pane === tabId));
+      }
+
+      async function loadCabinet() {
+        const response = await fetch('/api/me', { credentials: 'include' });
+        if (!response.ok) throw new Error('AUTH_REQUIRED');
+        const data = await response.json();
+        const model = normalizeDashboard(data);
+        state.model = model;
+        renderHeader(model);
+        bindAvatarUpload(model);
+        renderSubscriptionMetrics(model);
+        renderQuickActions(model);
+        renderFamilyOverview(model);
+        renderYandexOverview(model);
+        renderPayments(model);
+        renderReferrals(model);
+        renderFamily(model);
+        renderYandex(model);
+        bindOverviewActions(model);
+      }
+
+      document.getElementById('logoutBtn').addEventListener('click', async () => {
+        await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+        localStorage.removeItem('sbs_telegram_login_token');
+        window.location.href = '/';
+      });
+      document.querySelectorAll('.cabinet-tab').forEach((button) => button.addEventListener('click', () => activateTab(button.dataset.tab)));
+      loadCabinet().catch(() => { window.location.href = '/'; });
+    </script>
+  </body>
+</html>
