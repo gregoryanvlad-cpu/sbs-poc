@@ -678,6 +678,321 @@ def _build_paid_growth_series(
     }
 
 
+_PAYMENT_WARN_KIND_TO_DAYS = {
+    "sub_warn_7d": 7,
+    "sub_warn_3d": 3,
+    "sub_warn_1d": 1,
+}
+_PAYMENT_WARN_KINDS = tuple(_PAYMENT_WARN_KIND_TO_DAYS.keys())
+
+
+def _days_until_due_admin(end_at: datetime, now: datetime) -> int:
+    dt = _ensure_tz_utc(end_at) or now
+    cur = _ensure_tz_utc(now) or _utcnow()
+    delta = dt - cur
+    if delta.total_seconds() <= 0:
+        return 0
+    return int((delta.total_seconds() + 86399) // 86400)
+
+
+def _warning_cycle_stats(msg_rows: list[MessageAudit], *, end_at: datetime | None) -> dict[str, object]:
+    if end_at is None:
+        return {"count": 0, "labels": [], "seen": False}
+
+    end_dt = _ensure_tz_utc(end_at)
+    if end_dt is None:
+        return {"count": 0, "labels": [], "seen": False}
+
+    window_start = end_dt - timedelta(days=8, hours=6)
+    window_end = end_dt + timedelta(hours=6)
+    by_kind: dict[str, MessageAudit] = {}
+    for row in msg_rows:
+        kind = str(getattr(row, "kind", "") or "")
+        if kind not in _PAYMENT_WARN_KIND_TO_DAYS:
+            continue
+        if getattr(row, "message_id", None) is None:
+            continue
+        sent_at = _ensure_tz_utc(getattr(row, "sent_at", None))
+        if sent_at is None or sent_at < window_start or sent_at > window_end:
+            continue
+        prev = by_kind.get(kind)
+        prev_sent = _ensure_tz_utc(getattr(prev, "sent_at", None)) if prev is not None else None
+        if prev is None or prev_sent is None or prev_sent > sent_at:
+            by_kind[kind] = row
+
+    ordered = [kind for kind in ("sub_warn_7d", "sub_warn_3d", "sub_warn_1d") if kind in by_kind]
+    return {
+        "count": len(ordered),
+        "labels": [f"{_PAYMENT_WARN_KIND_TO_DAYS[k]}д" for k in ordered],
+        "seen": any(getattr(by_kind[k], "seen_at", None) is not None for k in ordered),
+    }
+
+
+def _count_renewals_after_warning(payments: list[Payment], msg_rows: list[MessageAudit]) -> int:
+    main_payments = [p for p in payments if _is_main_success_payment(p)]
+    if len(main_payments) <= 1:
+        return 0
+
+    warn_sents: list[datetime] = []
+    for row in msg_rows:
+        kind = str(getattr(row, "kind", "") or "")
+        if kind not in _PAYMENT_WARN_KIND_TO_DAYS:
+            continue
+        if getattr(row, "message_id", None) is None:
+            continue
+        sent_at = _ensure_tz_utc(getattr(row, "sent_at", None))
+        if sent_at is not None:
+            warn_sents.append(sent_at)
+    warn_sents.sort()
+    if not warn_sents:
+        return 0
+
+    renewals = 0
+    for pay in main_payments[1:]:
+        paid_at = _ensure_tz_utc(getattr(pay, "paid_at", None))
+        if paid_at is None:
+            continue
+        if any(0 <= (paid_at - sent_at).total_seconds() <= 10 * 86400 for sent_at in warn_sents):
+            renewals += 1
+    return renewals
+
+
+def _probability_label_ru(percent: int) -> str:
+    if percent >= 70:
+        return "высокая"
+    if percent >= 45:
+        return "средняя"
+    return "низкая"
+
+
+def _predict_payment_probability_percent(
+    *,
+    payments_count: int,
+    reminders_sent: int,
+    current_warning_seen: bool,
+    renewals_after_warning: int,
+    last_interaction_at: datetime | None,
+    days_left: int | None = None,
+    days_overdue: int | None = None,
+) -> int:
+    score = 0.34
+
+    if payments_count >= 2:
+        score += 0.12
+    if payments_count >= 3:
+        score += 0.08
+    if payments_count >= 5:
+        score += 0.05
+
+    if renewals_after_warning > 0:
+        score += 0.18
+        score += min(0.12, max(0, renewals_after_warning - 1) * 0.06)
+
+    if last_interaction_at is not None:
+        last_dt = _ensure_tz_utc(last_interaction_at) or _utcnow()
+        days_idle = max(0.0, ((_utcnow() - last_dt).total_seconds() / 86400.0))
+        if days_idle <= 3:
+            score += 0.14
+        elif days_idle <= 7:
+            score += 0.10
+        elif days_idle <= 14:
+            score += 0.05
+        elif days_idle > 60:
+            score -= 0.18
+        elif days_idle > 30:
+            score -= 0.10
+    else:
+        score -= 0.05
+
+    if current_warning_seen:
+        score += 0.07
+
+    if days_overdue is not None and days_overdue > 0:
+        if days_overdue <= 2:
+            score -= 0.12
+        elif days_overdue <= 7:
+            score -= 0.20
+        elif days_overdue <= 14:
+            score -= 0.28
+        else:
+            score -= 0.38
+    elif days_left is not None:
+        if days_left >= 4:
+            score += 0.04
+        elif days_left <= 1:
+            score -= 0.04
+
+    if reminders_sent == 0 and (days_left or 0) >= 4:
+        score += 0.05
+    elif reminders_sent == 1:
+        score += 0.02
+    elif reminders_sent >= 3 and ((days_left is not None and days_left <= 1) or (days_overdue is not None and days_overdue > 0)):
+        score -= 0.06
+
+    if payments_count <= 1 and days_overdue is not None and days_overdue > 3:
+        score -= 0.06
+
+    return int(round(_clip(score, 0.03, 0.97) * 100.0))
+
+
+def _fmt_payment_watch_name(user: User | None) -> tuple[str, str]:
+    if user is None:
+        return "—", "—"
+    name_parts = [str(getattr(user, "first_name", "") or "").strip(), str(getattr(user, "last_name", "") or "").strip()]
+    name = " ".join([p for p in name_parts if p]).strip() or "—"
+    username = str(getattr(user, "tg_username", "") or "").strip()
+    username_txt = f"@{html.escape(username)}" if username else "—"
+    return html.escape(name), username_txt
+
+
+def _fmt_days_bucket_ru(days_left: int | None = None, days_overdue: int | None = None) -> str:
+    if days_overdue is not None and days_overdue > 0:
+        return f"в оттоке {int(days_overdue)} дн."
+    if days_left is None:
+        return "—"
+    if days_left <= 0:
+        return "сегодня"
+    return f"через {int(days_left)} дн."
+
+
+async def _collect_payment_watch_rows() -> dict[str, list[dict[str, object]]]:
+    now = _utcnow()
+
+    async with session_scope() as session:
+        payments = list((await session.execute(
+            select(Payment).where(Payment.status == "success").order_by(Payment.tg_id.asc(), Payment.paid_at.asc(), Payment.id.asc())
+        )).scalars().all())
+        subscriptions = list((await session.execute(select(Subscription).where(Subscription.end_at.is_not(None)))).scalars().all())
+        warn_rows = list((await session.execute(
+            select(MessageAudit).where(MessageAudit.kind.in_(_PAYMENT_WARN_KINDS)).order_by(MessageAudit.tg_id.asc(), MessageAudit.sent_at.asc(), MessageAudit.id.asc())
+        )).scalars().all())
+        last_interaction_rows = (await session.execute(
+            select(AppSetting.key, AppSetting.int_value).where(AppSetting.key.like("ua:last_interaction_ts:%"))
+        )).all()
+
+    intervals, _, last_paid_at, payment_counts = _build_main_payment_intervals(payments, now=now)
+
+    payments_by_user: dict[int, list[Payment]] = {}
+    for pay in payments:
+        if not _is_main_success_payment(pay):
+            continue
+        payments_by_user.setdefault(int(pay.tg_id), []).append(pay)
+
+    msg_by_user: dict[int, list[MessageAudit]] = {}
+    for row in warn_rows:
+        msg_by_user.setdefault(int(row.tg_id), []).append(row)
+
+    last_interaction_by_user: dict[int, datetime] = {}
+    for key, int_value in last_interaction_rows:
+        skey = str(key or "")
+        try:
+            uid = int(skey.split(":", 1)[1])
+            ts = int(int_value or 0)
+        except Exception:
+            continue
+        if ts > 0:
+            last_interaction_by_user[uid] = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    sub_by_user = {int(s.tg_id): s for s in subscriptions}
+
+    due_rows: list[dict[str, object]] = []
+    churn_rows: list[dict[str, object]] = []
+    candidate_ids: set[int] = set()
+
+    for uid, user_payments in payments_by_user.items():
+        sub = sub_by_user.get(int(uid))
+        sub_end = _ensure_tz_utc(getattr(sub, "end_at", None)) if sub is not None else None
+        is_active_now = bool(sub is not None and getattr(sub, "is_active", False) and sub_end and sub_end > now)
+        fallback_end = max((end for _, end in intervals.get(int(uid), [])), default=None)
+        reference_end = sub_end or fallback_end
+        if reference_end is None:
+            continue
+
+        cycle_warn = _warning_cycle_stats(msg_by_user.get(int(uid), []), end_at=reference_end)
+        reminders_sent = int(cycle_warn.get("count", 0) or 0)
+        warn_labels = list(cycle_warn.get("labels") or [])
+        warn_seen = bool(cycle_warn.get("seen", False))
+        renewals_after_warning = _count_renewals_after_warning(user_payments, msg_by_user.get(int(uid), []))
+        last_interaction_at = last_interaction_by_user.get(int(uid))
+        last_paid = last_paid_at.get(int(uid))
+        payments_count = int(payment_counts.get(int(uid), 0) or 0)
+
+        if is_active_now and sub_end is not None:
+            days_left = _days_until_due_admin(sub_end, now)
+            if 0 <= days_left <= 7:
+                probability = _predict_payment_probability_percent(
+                    payments_count=payments_count,
+                    reminders_sent=reminders_sent,
+                    current_warning_seen=warn_seen,
+                    renewals_after_warning=renewals_after_warning,
+                    last_interaction_at=last_interaction_at,
+                    days_left=days_left,
+                )
+                due_rows.append({
+                    "tg_id": int(uid),
+                    "end_at": sub_end,
+                    "days_left": days_left,
+                    "last_paid_at": last_paid,
+                    "payments_count": payments_count,
+                    "reminders_sent": reminders_sent,
+                    "warn_labels": warn_labels,
+                    "warn_seen": warn_seen,
+                    "renewals_after_warning": renewals_after_warning,
+                    "last_interaction_at": last_interaction_at,
+                    "probability_percent": probability,
+                    "probability_label": _probability_label_ru(probability),
+                })
+                candidate_ids.add(int(uid))
+            continue
+
+        if reference_end > now or reminders_sent <= 0:
+            continue
+
+        days_overdue = max(1, int((now - reference_end).total_seconds() // 86400))
+        probability = _predict_payment_probability_percent(
+            payments_count=payments_count,
+            reminders_sent=reminders_sent,
+            current_warning_seen=warn_seen,
+            renewals_after_warning=renewals_after_warning,
+            last_interaction_at=last_interaction_at,
+            days_overdue=days_overdue,
+        )
+        churn_rows.append({
+            "tg_id": int(uid),
+            "expired_at": reference_end,
+            "days_overdue": days_overdue,
+            "last_paid_at": last_paid,
+            "payments_count": payments_count,
+            "reminders_sent": reminders_sent,
+            "warn_labels": warn_labels,
+            "warn_seen": warn_seen,
+            "renewals_after_warning": renewals_after_warning,
+            "last_interaction_at": last_interaction_at,
+            "probability_percent": probability,
+            "probability_label": _probability_label_ru(probability),
+        })
+        candidate_ids.add(int(uid))
+
+    users_by_id: dict[int, User] = {}
+    if candidate_ids:
+        async with session_scope() as session:
+            users = list((await session.execute(select(User).where(User.tg_id.in_(sorted(candidate_ids))))).scalars().all())
+        users_by_id = {int(u.tg_id): u for u in users}
+
+    for row in due_rows:
+        row["user"] = users_by_id.get(int(row["tg_id"]))
+    for row in churn_rows:
+        row["user"] = users_by_id.get(int(row["tg_id"]))
+
+    due_rows.sort(key=lambda item: ((_ensure_tz_utc(item.get("end_at")) or now), -int(item.get("probability_percent", 0) or 0)))
+    churn_rows.sort(key=lambda item: (_ensure_tz_utc(item.get("expired_at")) or datetime(1970, 1, 1, tzinfo=timezone.utc)), reverse=True)
+
+    return {
+        "due_soon": due_rows,
+        "churn": churn_rows,
+    }
+
+
 
 def _forecast_sales_block(*, sales_last_30: int, revenue_last_30: int, sales_last_7: int, revenue_last_7: int,
                           active_trial_using_now: int, hist_trial_conv: float, now: datetime) -> dict[str, object]:
@@ -4278,6 +4593,58 @@ async def admin_conversions_report(cb: CallbackQuery) -> None:
     await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
 
 
+@router.callback_query(lambda c: c.data == "admin:stats:due_soon")
+async def admin_due_soon_report(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Собираю оплаты на горизонте…")
+    except Exception:
+        pass
+
+    try:
+        payload = await _collect_payment_watch_rows()
+    except Exception:
+        log.exception("admin_due_soon_report_failed")
+        await cb.message.answer("❌ Не удалось собрать список ближайших оплат.", reply_markup=_kb_admin_back())
+        return
+
+    due_rows = list(payload.get("due_soon") or [])
+    if not due_rows:
+        await cb.message.edit_text(
+            "⏰ <b>Скоро оплата</b>\n\nСейчас нет активных платных подписок, у которых оплата должна подойти в ближайшие 7 дней.",
+            reply_markup=_kb_admin_back(),
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [
+        "⏰ <b>Скоро оплата</b>",
+        "",
+        f"Всего пользователей в ближайших оплатах: <b>{len(due_rows)}</b>",
+        "Вероятность — эвристический прогноз по истории оплат, реакции на прошлые напоминания и недавней активности.",
+        "",
+    ]
+
+    for item in due_rows[:60]:
+        uid = int(item["tg_id"])
+        user = item.get("user")
+        name, username_txt = _fmt_payment_watch_name(user if isinstance(user, User) or user is None else None)
+        warn_labels = ", ".join([html.escape(str(x)) for x in (item.get("warn_labels") or [])]) or "—"
+        lines += [
+            f"• <code>{uid}</code> | <b>{name}</b> | {username_txt}",
+            f"  Оплатить до: <b>{_fmt_dt_short(item.get('end_at'))}</b> ({_fmt_days_bucket_ru(days_left=int(item.get('days_left', 0) or 0))})",
+            f"  Уведомлений отправлено: <b>{int(item.get('reminders_sent', 0) or 0)}</b> ({warn_labels}) | Последняя активность: <b>{_fmt_dt_short(item.get('last_interaction_at'))}</b>",
+            f"  Последняя оплата: <b>{_fmt_dt_short(item.get('last_paid_at'))}</b> | Всего оплат: <b>{int(item.get('payments_count', 0) or 0)}</b>",
+            f"  Продлевал после напоминаний раньше: <b>{int(item.get('renewals_after_warning', 0) or 0)}</b> раз | Прогноз оплаты: <b>{int(item.get('probability_percent', 0) or 0)}%</b> ({html.escape(str(item.get('probability_label') or '—'))})",
+            "",
+        ]
+
+    parts = _split_html_lines(lines, limit=3400)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+
+
 @router.callback_query(lambda c: c.data == "admin:stats:churn")
 async def admin_churn_report(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
@@ -4288,49 +4655,41 @@ async def admin_churn_report(cb: CallbackQuery) -> None:
     except Exception:
         pass
 
-    now = _utcnow()
     try:
-        stats = await _collect_full_bot_stats_v2()
+        payload = await _collect_payment_watch_rows()
     except Exception:
         log.exception("admin_churn_report_failed")
         await cb.message.answer("❌ Не удалось собрать отток.", reply_markup=_kb_admin_back())
         return
 
-    churned = list(stats.get('churned_users') or [])
+    churned = list(payload.get("churn") or [])
     if not churned:
         await cb.message.edit_text(
-            "📉 <b>Отток оплат</b>\n\nСейчас нет пользователей, у которых оплаченная подписка закончилась без следующего продления.",
+            "📉 <b>Отток оплат</b>\n\nСейчас нет пользователей из блока «Скоро оплата», которые не продлили подписку после напоминаний.",
             reply_markup=_kb_admin_back(),
             parse_mode="HTML",
         )
         return
 
-    async with session_scope() as session:
-        ids = [int(item['tg_id']) for item in churned[:200]]
-        users = list((await session.execute(select(User).where(User.tg_id.in_(ids)))).scalars().all()) if ids else []
-        user_by_id = {int(u.tg_id): u for u in users}
-
     lines = [
-        "📉 <b>Пользователи в оттоке</b>",
+        "📉 <b>Отток оплат</b>",
         "",
         f"Всего в оттоке сейчас: <b>{len(churned)}</b>",
-        "Показываю свежие случаи сверху.",
+        "Показываю пользователей, которые были в сценарии ближайшей оплаты, но не продлили подписку.",
+        "Вероятность — эвристический прогноз, насколько вероятно, что пользователь всё же вернётся и оплатит после оттока.",
         "",
     ]
-    for item in churned[:50]:
-        uid = int(item['tg_id'])
-        user = user_by_id.get(uid)
-        name_parts = [str(getattr(user, 'first_name', '') or '').strip(), str(getattr(user, 'last_name', '') or '').strip()]
-        name = ' '.join([p for p in name_parts if p]).strip() or '—'
-        username = str(getattr(user, 'tg_username', '') or '').strip()
-        username_txt = f"@{html.escape(username)}" if username else '—'
-        expired_at = _ensure_tz_utc(item.get('expired_at'))
-        days_in_churn = max(0, int((now - expired_at).total_seconds() // 86400)) if expired_at else 0
+    for item in churned[:60]:
+        uid = int(item["tg_id"])
+        user = item.get("user")
+        name, username_txt = _fmt_payment_watch_name(user if isinstance(user, User) or user is None else None)
+        warn_labels = ", ".join([html.escape(str(x)) for x in (item.get("warn_labels") or [])]) or "—"
         lines += [
-            f"• <code>{uid}</code> | <b>{html.escape(name)}</b> | {username_txt}",
-            f"  Последняя оплата: <b>{_fmt_dt_short(item.get('last_paid_at'))}</b>",
-            f"  Подписка закончилась: <b>{_fmt_dt_short(expired_at)}</b>",
-            f"  В оттоке: <b>{days_in_churn}</b> дн. | Всего оплат: <b>{int(item.get('payments_count', 0) or 0)}</b>",
+            f"• <code>{uid}</code> | <b>{name}</b> | {username_txt}",
+            f"  Подписка закончилась: <b>{_fmt_dt_short(item.get('expired_at'))}</b> ({_fmt_days_bucket_ru(days_overdue=int(item.get('days_overdue', 0) or 0))})",
+            f"  Уведомлений перед оттоком: <b>{int(item.get('reminders_sent', 0) or 0)}</b> ({warn_labels}) | Последняя активность: <b>{_fmt_dt_short(item.get('last_interaction_at'))}</b>",
+            f"  Последняя оплата: <b>{_fmt_dt_short(item.get('last_paid_at'))}</b> | Всего оплат: <b>{int(item.get('payments_count', 0) or 0)}</b>",
+            f"  Продлевал после напоминаний раньше: <b>{int(item.get('renewals_after_warning', 0) or 0)}</b> раз | Вероятность оплаты: <b>{int(item.get('probability_percent', 0) or 0)}%</b> ({html.escape(str(item.get('probability_label') or '—'))})",
             "",
         ]
 
