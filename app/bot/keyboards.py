@@ -109,6 +109,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="📊 Статус VPN", callback_data="admin:vpn:status")
     b.button(text="📈 Полная статистика", callback_data="admin:stats:full")
     b.button(text="🎯 Конверсии и рост", callback_data="admin:stats:conversions")
+    b.button(text="⏰ Скоро оплата", callback_data="admin:stats:due_soon")
     b.button(text="📉 Отток оплат", callback_data="admin:stats:churn")
     b.button(text="🕒 WG grace (24ч)", callback_data="admin:vpn:grace")
     b.button(text="➕ Админу доп. устройства", callback_data="admin:vpn:extra")
@@ -161,7 +162,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🧨 Сбросить пользователя (TEST)", callback_data="admin:reset:user")
 
     b.button(text="🏠 Главное меню", callback_data="nav:home")
-    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
+    b.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
     return b.as_markup()
 
 
