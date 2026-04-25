@@ -7460,7 +7460,7 @@ def _foreign_admin_req_text(req: ForeignPaymentRequest) -> str:
 
 @router.callback_query(lambda c: c.data == "admin:foreign:menu")
 async def admin_foreign_menu(cb: CallbackQuery) -> None:
-    if not await is_admin(cb):
+    if not await is_admin(cb.from_user.id):
         return
     await cb.answer()
     async with session_scope() as session:
@@ -7483,7 +7483,7 @@ async def admin_foreign_menu(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("admin:foreign:list:"))
 async def admin_foreign_list(cb: CallbackQuery) -> None:
-    if not await is_admin(cb):
+    if not await is_admin(cb.from_user.id):
         return
     await cb.answer()
     status = cb.data.rsplit(':',1)[1]
@@ -7510,7 +7510,7 @@ async def admin_foreign_list(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("admin:foreign:view:"))
 async def admin_foreign_view(cb: CallbackQuery) -> None:
-    if not await is_admin(cb):
+    if not await is_admin(cb.from_user.id):
         return
     await cb.answer()
     try:
@@ -7530,7 +7530,7 @@ async def admin_foreign_view(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("admin:foreign:set:"))
 async def admin_foreign_set_status(cb: CallbackQuery) -> None:
-    if not await is_admin(cb):
+    if not await is_admin(cb.from_user.id):
         return
     await cb.answer()
     parts = cb.data.split(':')
