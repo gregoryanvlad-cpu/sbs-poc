@@ -2013,6 +2013,7 @@ async def on_foreign_request_details(message, state: FSMContext) -> None:
         )
         session.add(req)
         await session.flush()
+        await session.commit()
         req_id = int(req.id)
     admin_text = "💸 <b>Новая заявка по зарубежным платежам</b>\n\n" + admin_text.split("\n\n",1)[1] + f"\n\nID заявки: <b>#{req_id}</b>"
     await _notify_foreign_request(message.bot, admin_text)
@@ -5689,14 +5690,14 @@ async def on_foreign_my_requests(cb: CallbackQuery) -> None:
         try:
             await cb.message.edit_text(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML")
         except Exception:
-            pass
+            await cb.message.answer(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML")
         return
     items = [(int(r.id), f"#{r.id} · {_foreign_status_label(r.status)}") for r in rows]
     txt = "📂 <b>Мои заявки</b>\n\nВыберите заявку из списка ниже."
     try:
         await cb.message.edit_text(txt, reply_markup=kb_foreign_my_requests(items), parse_mode="HTML")
     except Exception:
-        pass
+        await cb.message.answer(txt, reply_markup=kb_foreign_my_requests(items), parse_mode="HTML")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("foreign:my:"))
@@ -5717,4 +5718,4 @@ async def on_foreign_my_request_view(cb: CallbackQuery) -> None:
     try:
         await cb.message.edit_text(_foreign_request_card(req), reply_markup=kb_foreign_my_requests([(int(req.id), f"#{req.id} · {_foreign_status_label(req.status)}")]), parse_mode="HTML")
     except Exception:
-        pass
+        await cb.message.answer(_foreign_request_card(req), reply_markup=kb_foreign_my_requests([(int(req.id), f"#{req.id} · {_foreign_status_label(req.status)}")]), parse_mode="HTML")
