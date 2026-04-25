@@ -2054,7 +2054,7 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
                 kind = "sub_warn_1d"
 
             try:
-                await audit_send_message(
+                sent_ok = await audit_send_message(
                     bot,
                     tg_id,
                     text_msg,
@@ -2066,16 +2066,17 @@ async def _job_subscription_end_at_notifications(bot: Bot) -> None:
                         ]
                     ),
                 )
-                await set_app_setting_int(session, sent_key, 1)
-                changed = True
-            except Exception:
-                # audit_send_message already logs SEND_FAILED. Still mark the
-                # attempt so we don't spam every loop.
-                try:
+                # Mark the reminder as sent ONLY after a successful delivery.
+                # Previously we also marked failed attempts, which meant a
+                # temporary Telegram/API error could permanently suppress the
+                # current reminder cycle for an otherwise reachable user.
+                if sent_ok:
                     await set_app_setting_int(session, sent_key, 1)
                     changed = True
-                except Exception:
-                    pass
+            except Exception:
+                # audit_send_message already persists the failure to
+                # message_audit; do not burn the reminder flag here.
+                pass
 
         if changed:
             await session.commit()
