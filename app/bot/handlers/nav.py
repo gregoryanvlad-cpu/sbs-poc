@@ -111,7 +111,6 @@ async def _get_user_active_promo(session, tg_id: int) -> tuple[str, int] | None:
     return None
 
 
-FOREIGN_SUPPORT_CONTACT = "@zirokano"
 FOREIGN_SERVICES: dict[str, dict[str, object]] = {
     "paypal_in": {"title": "Приём платежей на PayPal (Friends & Family)", "fee": 13},
     "platform_payout": {"title": "Вывод с Patreon, TikTok, VGen и других платформ", "fee": 13},
@@ -1846,12 +1845,19 @@ async def on_foreign_terms(cb: CallbackQuery) -> None:
 async def on_foreign_contact(cb: CallbackQuery) -> None:
     await _safe_cb_answer(cb)
     txt = (
-        "💬 <b>Связь по зарубежным платежам</b>\n\n"
-        f"По всем вопросам: {FOREIGN_SUPPORT_CONTACT}\n\n"
-        "Если вы уже оформили заявку через бота, укажите в сообщении свой Telegram и кратко опишите запрос."
+        "🛠 <b>Поддержка по зарубежным платежам</b>\n\n"
+        "По всем вопросам по зарубежным платежам обращайтесь в поддержку прямо через бота.\n\n"
+        "Если у вас уже есть заявка, укажите её номер и кратко опишите вопрос."
     )
     try:
-        await cb.message.edit_text(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML")
+        await cb.message.edit_text(
+            txt,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛠 Открыть поддержку", callback_data="nav:support")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav:foreign")],
+            ]),
+            parse_mode="HTML",
+        )
     except Exception:
         pass
 
