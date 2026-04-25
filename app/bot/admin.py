@@ -757,6 +757,110 @@ def _count_renewals_after_warning(payments: list[Payment], msg_rows: list[Messag
     return renewals
 
 
+
+
+def _payment_warning_payload(days_left: int) -> tuple[str, str] | None:
+    if days_left == 7:
+        return (
+            "sub_warn_7d",
+            "⏳ Через 7 дней закончится ваша подписка на VPN.\n\nПродлите подписку, чтобы продолжать пользоваться сервисом без перерыва.",
+        )
+    if days_left == 3:
+        return (
+            "sub_warn_3d",
+            "⚠️ Осталось 3 дня до окончания подписки на VPN.\n\nПродлите подписку заранее, чтобы не потерять доступ.",
+        )
+    if days_left == 1:
+        return (
+            "sub_warn_1d",
+            "🚨 Завтра закончится ваша подписка на VPN.\n\nПродлите подписку сейчас, чтобы доступ не отключился.",
+        )
+    return None
+
+
+def _payment_warn_window(end_at: datetime | None) -> tuple[datetime | None, datetime | None]:
+    end_dt = _ensure_tz_utc(end_at)
+    if end_dt is None:
+        return None, None
+    return end_dt - timedelta(days=8, hours=6), end_dt + timedelta(hours=6)
+
+
+async def _collect_payment_due_diagnostics() -> list[dict[str, object]]:
+    now = _utcnow()
+    async with session_scope() as session:
+        subscriptions = list((await session.execute(select(Subscription).where(Subscription.end_at.is_not(None), Subscription.is_active.is_(True)))).scalars().all())
+        payments = list((await session.execute(select(Payment).where(Payment.status == "success").order_by(Payment.tg_id.asc(), Payment.paid_at.asc(), Payment.id.asc()))).scalars().all())
+        warn_rows = list((await session.execute(select(MessageAudit).where(MessageAudit.kind.in_(_PAYMENT_WARN_KINDS)).order_by(MessageAudit.tg_id.asc(), MessageAudit.sent_at.asc(), MessageAudit.id.asc()))).scalars().all())
+        users = list((await session.execute(select(User).where(User.tg_id.in_([int(s.tg_id) for s in subscriptions])))).scalars().all())
+
+    users_by_id = {int(u.tg_id): u for u in users}
+    msg_by_user: dict[int, list[MessageAudit]] = {}
+    for row in warn_rows:
+        msg_by_user.setdefault(int(row.tg_id), []).append(row)
+
+    payment_counts: dict[int, int] = {}
+    last_paid_at: dict[int, datetime | None] = {}
+    for pay in payments:
+        if not _is_main_success_payment(pay):
+            continue
+        uid = int(pay.tg_id)
+        payment_counts[uid] = int(payment_counts.get(uid, 0)) + 1
+        paid_at = _ensure_tz_utc(getattr(pay, 'paid_at', None))
+        prev = last_paid_at.get(uid)
+        if paid_at is not None and (prev is None or paid_at > prev):
+            last_paid_at[uid] = paid_at
+
+    rows: list[dict[str, object]] = []
+    for sub in subscriptions:
+        uid = int(sub.tg_id)
+        end_at = _ensure_tz_utc(getattr(sub, 'end_at', None))
+        if end_at is None or end_at <= now:
+            continue
+        days_left = _days_until_due_admin(end_at, now)
+        payload = _payment_warning_payload(days_left)
+        if payload is None:
+            continue
+        kind, _ = payload
+        window_start, window_end = _payment_warn_window(end_at)
+        sent_row = None
+        failed_row = None
+        for row in msg_by_user.get(uid, []):
+            rk = str(getattr(row, 'kind', '') or '')
+            if rk != kind:
+                continue
+            sent_at = _ensure_tz_utc(getattr(row, 'sent_at', None))
+            if sent_at is None or (window_start and sent_at < window_start) or (window_end and sent_at > window_end):
+                continue
+            if getattr(row, 'message_id', None) is not None:
+                if sent_row is None or (_ensure_tz_utc(getattr(sent_row, 'sent_at', None)) or now) < sent_at:
+                    sent_row = row
+            else:
+                if failed_row is None or (_ensure_tz_utc(getattr(failed_row, 'sent_at', None)) or now) < sent_at:
+                    failed_row = row
+        status = 'sent' if sent_row is not None else ('failed' if failed_row is not None else 'pending')
+        rows.append({
+            'tg_id': uid,
+            'user': users_by_id.get(uid),
+            'end_at': end_at,
+            'days_left': days_left,
+            'kind': kind,
+            'last_paid_at': last_paid_at.get(uid),
+            'payments_count': int(payment_counts.get(uid, 0) or 0),
+            'status': status,
+            'sent_at': _ensure_tz_utc(getattr(sent_row, 'sent_at', None)) if sent_row is not None else None,
+            'failed_at': _ensure_tz_utc(getattr(failed_row, 'sent_at', None)) if failed_row is not None else None,
+            'seen_at': _ensure_tz_utc(getattr(sent_row, 'seen_at', None)) if sent_row is not None else None,
+        })
+    rows.sort(key=lambda x: (int(x.get('days_left', 99) or 99), _ensure_tz_utc(x.get('end_at')) or now, int(x.get('tg_id', 0) or 0)))
+    return rows
+
+
+def _kb_admin_due_soon_tools() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🔎 Диагностика напоминаний', callback_data='admin:stats:due_diag')],
+        [InlineKeyboardButton(text='📨 Дослать последнее напоминание', callback_data='admin:stats:due_resend')],
+        [InlineKeyboardButton(text='⬅️ Назад', callback_data='admin:stats')],
+    ])
 def _probability_label_ru(percent: int) -> str:
     if percent >= 70:
         return "высокая"
@@ -3093,7 +3197,7 @@ async def admin_user_card_refresh(cb: CallbackQuery) -> None:
         log.exception("admin_user_card_refresh_failed tg_id=%s", tg_id)
         await cb.message.answer(
             "❌ Не удалось загрузить карточку пользователя. Попробуйте ещё раз через минуту.",
-            reply_markup=_kb_admin_back(),
+            reply_markup=_kb_admin_due_soon_tools(),
             parse_mode="HTML",
         )
 
@@ -4535,7 +4639,7 @@ async def admin_full_stats(cb: CallbackQuery) -> None:
         f"• 📅 Продажи за 30 дней: <b>{int(stats['sales_last_30'])}</b> / <b>{int(stats['revenue_last_30'])} ₽</b> | за 7 дней: <b>{int(stats['sales_last_7'])}</b> / <b>{int(stats['revenue_last_7'])} ₽</b>",
     ]
     parts = _split_html_lines(lines, limit=3400)
-    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_due_soon_tools(), edit_first=True)
 
 
 @router.callback_query(lambda c: c.data == "admin:stats:conversions")
@@ -4645,6 +4749,94 @@ async def admin_due_soon_report(cb: CallbackQuery) -> None:
     await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
 
 
+
+
+@router.callback_query(lambda c: c.data == "admin:stats:due_diag")
+async def admin_due_soon_diag(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Собираю диагностику…")
+    except Exception:
+        pass
+    try:
+        rows = await _collect_payment_due_diagnostics()
+    except Exception:
+        log.exception("admin_due_soon_diag_failed")
+        await cb.message.answer("❌ Не удалось собрать диагностику напоминаний.", reply_markup=_kb_admin_due_soon_tools())
+        return
+    if not rows:
+        await cb.message.edit_text("🔎 <b>Диагностика напоминаний</b>\n\nСегодня нет активных подписок в окнах -7 / -3 / -1 дней.", reply_markup=_kb_admin_due_soon_tools(), parse_mode="HTML")
+        return
+    lines=["🔎 <b>Диагностика напоминаний</b>","",f"Всего пользователей в окне напоминаний сейчас: <b>{len(rows)}</b>","Статусы: ✅ отправлено / ⚠️ была неудачная попытка / ⏳ ещё не отправлялось.",""]
+    for item in rows[:80]:
+        uid=int(item['tg_id'])
+        name, username_txt = _fmt_payment_watch_name(item.get('user') if isinstance(item.get('user'), User) or item.get('user') is None else None)
+        status=str(item.get('status') or 'pending')
+        status_txt='✅ отправлено' if status=='sent' else ('⚠️ не доставлено' if status=='failed' else '⏳ ожидает отправки')
+        stamp = _fmt_dt_short(item.get('sent_at') or item.get('failed_at'))
+        lines += [
+            f"• <code>{uid}</code> | <b>{name}</b> | {username_txt}",
+            f"  Напоминание: <b>{html.escape(str(item.get('kind') or '—'))}</b> | Оплатить до: <b>{_fmt_dt_short(item.get('end_at'))}</b>",
+            f"  Статус: <b>{status_txt}</b> | Последняя попытка: <b>{stamp}</b> | Прочитано: <b>{'да' if item.get('seen_at') else 'нет'}</b>",
+            f"  Последняя оплата: <b>{_fmt_dt_short(item.get('last_paid_at'))}</b> | Всего оплат: <b>{int(item.get('payments_count',0) or 0)}</b>",
+            "",
+        ]
+    parts=_split_html_lines(lines, limit=3400)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_due_soon_tools(), edit_first=True)
+
+
+@router.callback_query(lambda c: c.data == "admin:stats:due_resend")
+async def admin_due_soon_resend(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Досылаю последнее напоминание…")
+    except Exception:
+        pass
+    try:
+        rows = await _collect_payment_due_diagnostics()
+    except Exception:
+        log.exception("admin_due_soon_resend_failed")
+        await cb.message.answer("❌ Не удалось собрать список для досылки.", reply_markup=_kb_admin_due_soon_tools())
+        return
+    targets=[r for r in rows if str(r.get('status') or '') != 'sent']
+    if not targets:
+        await cb.message.answer("✅ Сейчас нет пользователей, которым нужно дослать последнее напоминание.", reply_markup=_kb_admin_due_soon_tools())
+        return
+    sent_count=0
+    fail_count=0
+    async with session_scope() as session:
+        for item in targets:
+            payload=_payment_warning_payload(int(item.get('days_left',0) or 0))
+            if payload is None:
+                continue
+            kind, text_msg = payload
+            tg_id=int(item['tg_id'])
+            end_at=_ensure_tz_utc(item.get('end_at'))
+            if end_at is None:
+                continue
+            end_key=end_at.astimezone(AMSTERDAM_TZ).strftime('%Y-%m-%d')
+            sent_key=f"sub_end_warn_{int(item.get('days_left',0) or 0)}d_sent:{tg_id}:{end_key}"
+            try:
+                ok = await audit_send_message(
+                    cb.bot, tg_id, text_msg, kind=kind,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплата', callback_data='nav:pay')],[InlineKeyboardButton(text='🏠 Главное меню', callback_data='nav:home')]])
+                )
+                if ok:
+                    await set_app_setting_int(session, sent_key, 1)
+                    sent_count += 1
+                else:
+                    fail_count += 1
+            except Exception:
+                fail_count += 1
+        await session.commit()
+    await cb.message.answer(
+        f"📨 <b>Досылка завершена</b>\n\nУспешно отправлено: <b>{sent_count}</b>\nНе удалось отправить: <b>{fail_count}</b>",
+        reply_markup=_kb_admin_due_soon_tools(), parse_mode='HTML'
+    )
 @router.callback_query(lambda c: c.data == "admin:stats:churn")
 async def admin_churn_report(cb: CallbackQuery) -> None:
     if not is_owner(cb.from_user.id):
