@@ -4746,7 +4746,7 @@ async def admin_due_soon_report(cb: CallbackQuery) -> None:
         ]
 
     parts = _split_html_lines(lines, limit=3400)
-    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_due_soon_tools(), edit_first=True)
 
 
 
@@ -4886,7 +4886,7 @@ async def admin_churn_report(cb: CallbackQuery) -> None:
         ]
 
     parts = _split_html_lines(lines, limit=3400)
-    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_due_soon_tools(), edit_first=True)
 
 
 @router.callback_query(lambda c: c.data == "admin:vpn:servers")
