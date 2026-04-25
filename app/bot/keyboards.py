@@ -143,6 +143,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="🔁 Управление рефералами", callback_data="admin:referrals:menu")
     b.button(text="💲 Цена подписки", callback_data="admin:price")
     b.button(text="🎟 Промокоды", callback_data="admin:promos")
+    b.button(text="💸 Заявки по платежам", callback_data="admin:foreign:menu")
     b.button(text="📶 Цена VPN LTE", callback_data="admin:lte_price")
     b.button(text="💳 Проверить оплаты", callback_data="admin:payments:reconcile")
     b.button(text="📶 Починить LTE", callback_data="admin:lte:repair")
@@ -224,6 +225,7 @@ def kb_foreign_payments() -> InlineKeyboardMarkup:
     b.button(text="💬 Оставить заявку", callback_data="foreign:req")
     b.button(text="🧮 Рассчитать стоимость", callback_data="foreign:calc")
     b.button(text="🧩 Иная услуга", callback_data="foreign:req:other")
+    b.button(text="📂 Мои заявки", callback_data="foreign:my")
     b.button(text="📜 Условия", callback_data="foreign:terms")
     b.button(text="💬 Связь", callback_data="foreign:contact")
     b.button(text="⬅️ Назад", callback_data="nav:home")
@@ -262,4 +264,53 @@ def kb_foreign_request_result() -> InlineKeyboardMarkup:
     b.button(text="💬 Связь", callback_data="foreign:contact")
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
+    return b.as_markup()
+
+
+
+def kb_foreign_my_requests(items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for req_id, label in items[:12]:
+        b.button(text=label[:64], callback_data=f"foreign:my:{req_id}")
+    b.button(text="⬅️ Назад", callback_data="nav:foreign")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_foreign_admin_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🆕 Новые", callback_data="admin:foreign:list:new")
+    b.button(text="🔵 В работе", callback_data="admin:foreign:list:in_progress")
+    b.button(text="⏳ Ждут оплаты", callback_data="admin:foreign:list:waiting_payment")
+    b.button(text="🟢 Выполнены", callback_data="admin:foreign:list:done")
+    b.button(text="🔴 Отклонены", callback_data="admin:foreign:list:rejected")
+    b.button(text="📋 Все заявки", callback_data="admin:foreign:list:all")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    b.adjust(2,2,2,1)
+    return b.as_markup()
+
+
+def kb_foreign_admin_requests(items: list[tuple[int, str]], status: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for req_id, label in items[:15]:
+        b.button(text=label[:64], callback_data=f"admin:foreign:view:{req_id}")
+    b.button(text="⬅️ Назад", callback_data="admin:foreign:menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_foreign_admin_request_view(req_id: int, status: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    if status != 'in_progress':
+        b.button(text='🔵 В работу', callback_data=f'admin:foreign:set:{req_id}:in_progress')
+    if status != 'waiting_payment':
+        b.button(text='⏳ Ждёт оплаты', callback_data=f'admin:foreign:set:{req_id}:waiting_payment')
+    if status != 'done':
+        b.button(text='🟢 Выполнено', callback_data=f'admin:foreign:set:{req_id}:done')
+    if status != 'rejected':
+        b.button(text='🔴 Отклонить', callback_data=f'admin:foreign:set:{req_id}:rejected')
+    if status != 'new':
+        b.button(text='🆕 Сбросить в новую', callback_data=f'admin:foreign:set:{req_id}:new')
+    b.button(text='⬅️ Назад', callback_data='admin:foreign:menu')
+    b.adjust(2,2,1,1)
     return b.as_markup()
