@@ -13,6 +13,7 @@ def kb_main(*, show_trial: bool = False) -> InlineKeyboardMarkup:
     if show_trial:
         b.button(text="🎁 Пробный период 5 дней", callback_data="trial:start")
     b.button(text="💳 Оплата", callback_data="nav:pay")
+    b.button(text="💸 Зарубежные платежи", callback_data="nav:foreign")
     b.button(text="❓ FAQ", callback_data="nav:faq")
     b.button(text="🛠 Поддержка", callback_data="nav:support")
     b.adjust(1)
@@ -213,6 +214,52 @@ def kb_lte_vpn(*, has_access: bool, activation_rub: int) -> InlineKeyboardMarkup
 
 def kb_lte_main_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.button(text="🏠 Главное меню", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_foreign_payments() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💬 Оставить заявку", callback_data="foreign:req")
+    b.button(text="🧮 Рассчитать стоимость", callback_data="foreign:calc")
+    b.button(text="🧩 Иная услуга", callback_data="foreign:req:other")
+    b.button(text="📜 Условия", callback_data="foreign:terms")
+    b.button(text="💬 Связь", callback_data="foreign:contact")
+    b.button(text="⬅️ Назад", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_foreign_service_picker(*, prefix: str, include_unknown: bool = False) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💸 Приём на PayPal", callback_data=f"{prefix}:paypal_in")
+    b.button(text="📤 Вывод с платформ", callback_data=f"{prefix}:platform_payout")
+    b.button(text="🔁 Перевод с PayPal", callback_data=f"{prefix}:paypal_out")
+    b.button(text="🧾 Invoice / G&S", callback_data=f"{prefix}:invoice")
+    b.button(text="🛒 Подписки и сервисы", callback_data=f"{prefix}:services")
+    b.button(text="📦 Покупка товаров", callback_data=f"{prefix}:goods")
+    b.button(text="🧩 Иная услуга", callback_data=f"{prefix}:other")
+    if include_unknown:
+        b.button(text="❓ Не знаю, что выбрать", callback_data=f"{prefix}:unknown")
+    b.button(text="⬅️ Назад", callback_data="nav:foreign")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_foreign_calc_result(service_key: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💬 Оставить заявку", callback_data=f"foreign:req:{service_key}")
+    b.button(text="🔁 Пересчитать", callback_data="foreign:calc")
+    b.button(text="⬅️ Назад", callback_data="nav:foreign")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def kb_foreign_request_result() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💸 Зарубежные платежи", callback_data="nav:foreign")
+    b.button(text="💬 Связь", callback_data="foreign:contact")
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
