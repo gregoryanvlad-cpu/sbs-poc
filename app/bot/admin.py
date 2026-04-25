@@ -7547,6 +7547,7 @@ async def admin_foreign_set_status(cb: CallbackQuery) -> None:
             return
         req.status = new_status
         await session.flush()
+        await session.commit()
         user_id = int(req.user_id)
         req_snapshot = {
             'id': req.id,
