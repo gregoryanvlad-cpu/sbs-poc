@@ -45,6 +45,10 @@ from app.bot.keyboards import (
     kb_kinoteka,
     kb_lte_vpn,
     kb_lte_main_menu,
+    kb_foreign_payments,
+    kb_foreign_service_picker,
+    kb_foreign_calc_result,
+    kb_foreign_request_result,
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
@@ -64,6 +68,15 @@ router = Router()
 
 class PromoCodeFSM(StatesGroup):
     waiting_code = State()
+
+
+class ForeignCalcFSM(StatesGroup):
+    waiting_amount = State()
+
+
+class ForeignRequestFSM(StatesGroup):
+    waiting_amount = State()
+    waiting_details = State()
 
 
 def _promo_norm(code: str) -> str:
@@ -94,6 +107,111 @@ async def _get_user_active_promo(session, tg_id: int) -> tuple[str, int] | None:
         if code and price > 0:
             return code, price
     return None
+
+
+FOREIGN_SUPPORT_CONTACT = "@zirokano"
+FOREIGN_SERVICES: dict[str, dict[str, object]] = {
+    "paypal_in": {"title": "Приём платежей на PayPal (Friends & Family)", "fee": 13},
+    "platform_payout": {"title": "Вывод с Patreon, TikTok, VGen и других платформ", "fee": 13},
+    "paypal_out": {"title": "Отправка платежей с PayPal на ваш адрес", "fee": 8},
+    "invoice": {"title": "Invoice / Goods & Services", "fee": 20},
+    "services": {"title": "Оплата сервисов, подписок и онлайн-товаров", "fee": 13},
+    "goods": {"title": "Покупка товаров из-за рубежа и доставка в СНГ", "fee": 13},
+    "other": {"title": "Иная услуга", "fee": None},
+    "unknown": {"title": "Не знаю, что выбрать", "fee": None},
+}
+
+
+def _foreign_service_title(service_key: str) -> str:
+    item = FOREIGN_SERVICES.get(service_key) or FOREIGN_SERVICES["other"]
+    return str(item.get("title") or "Иная услуга")
+
+
+def _foreign_service_fee(service_key: str) -> int | None:
+    item = FOREIGN_SERVICES.get(service_key) or FOREIGN_SERVICES["other"]
+    fee = item.get("fee")
+    return int(fee) if isinstance(fee, int) else None
+
+
+def _format_money_like(raw: str) -> str:
+    s = (raw or "").strip().replace(",", ".")
+    try:
+        val = float(s)
+        if val.is_integer():
+            return str(int(val))
+        return f"{val:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return raw.strip() or "—"
+
+
+def _calculate_total(amount_raw: str, fee_percent: int) -> tuple[str, str] | None:
+    s = (amount_raw or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(s)
+    except Exception:
+        return None
+    if amount <= 0:
+        return None
+    total = amount * (1 + fee_percent / 100.0)
+    return (_format_money_like(str(amount)), _format_money_like(f"{total:.2f}"))
+
+
+async def _notify_foreign_request(bot: Bot, text: str) -> None:
+    recipients = [int(settings.owner_tg_id), *[int(x) for x in settings.admin_tg_ids]]
+    seen: set[int] = set()
+    for tg_id in recipients:
+        if tg_id in seen:
+            continue
+        seen.add(tg_id)
+        try:
+            await bot.send_message(tg_id, text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            continue
+
+
+def _foreign_payments_text() -> str:
+    return """💸 <b>Зарубежные платежи</b>
+
+Доступные услуги:
+
+♦️ <b>Приём платежей с карты / PayPal на PayPal (Friends & Family)</b>
+Итоговая комиссия: <b>13%</b>
+
+♦️ <b>Вывод с Patreon, TikTok, VGen и других платформ</b>
+Итоговая комиссия: <b>13%</b>
+
+♦️ <b>Отправка платежей с PayPal на ваш адрес</b>
+Итоговая комиссия: <b>8%</b>
+
+♦️ <b>Выставление счетов (Invoice) через PayPal / приём Goods & Services</b>
+Итоговая комиссия: <b>20%</b>
+
+♦️ <b>Оплата сервисов / подписок / онлайн-товаров</b>
+ChatGPT, YouTube, PSN и другие
+Итоговая комиссия: <b>13%</b>
+
+♦️ <b>Покупка товаров из-за рубежа и доставка в страны СНГ</b>
+Итоговая комиссия: <b>13%</b>
+
+♦️ <b>Регистрация аккаунтов (Twitter, Instagram, YouTube и др.) с передачей доступа</b>
+Стоимость: <b>индивидуально</b>
+
+♻️ <b>Вывод доступен:</b>
+• на карты российских банков
+• на USDT-кошельки
+
+Если вашей услуги нет в списке — нажмите <b>«🧩 Иная услуга»</b>."""
+
+
+def _foreign_terms_text() -> str:
+    return """📜 <b>Условия</b>
+
+• итоговая стоимость рассчитывается заранее;
+• стандартные услуги идут по фиксированной комиссии;
+• нестандартные запросы рассчитываются индивидуально;
+• вывод возможен на карты РФ и USDT;
+• по отдельным заявкам могут потребоваться уточнения;
+• если услуги нет в списке — используйте кнопку <b>«🧩 Иная услуга»</b>."""
 
 
 def _fmt_countdown_to(dt: datetime | None) -> str:
@@ -1640,6 +1758,18 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
 
+    if where == "foreign":
+        txt = _foreign_payments_text()
+        try:
+            await cb.message.edit_text(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            try:
+                await cb.message.answer(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML", disable_web_page_preview=True)
+            except Exception:
+                pass
+        await _safe_cb_answer(cb)
+        return
+
     if where == "faq":
         text = (
             "❓ <b>FAQ</b>\n\n"
@@ -1673,6 +1803,188 @@ async def on_nav(cb: CallbackQuery) -> None:
         return
 
     await cb.answer("Неизвестный раздел")
+
+
+@router.callback_query(lambda c: c.data == "foreign:terms")
+async def on_foreign_terms(cb: CallbackQuery) -> None:
+    await _safe_cb_answer(cb)
+    try:
+        await cb.message.edit_text(_foreign_terms_text(), reply_markup=kb_foreign_payments(), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(lambda c: c.data == "foreign:contact")
+async def on_foreign_contact(cb: CallbackQuery) -> None:
+    await _safe_cb_answer(cb)
+    txt = (
+        "💬 <b>Связь по зарубежным платежам</b>\n\n"
+        f"По всем вопросам: {FOREIGN_SUPPORT_CONTACT}\n\n"
+        "Если вы уже оформили заявку через бота, укажите в сообщении свой Telegram и кратко опишите запрос."
+    )
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(lambda c: c.data == "foreign:calc")
+async def on_foreign_calc_menu(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _safe_cb_answer(cb)
+    txt = "🧮 <b>Калькулятор стоимости</b>\n\nВыберите нужную услугу кнопкой ниже."
+    try:
+        await cb.message.edit_text(
+            txt,
+            reply_markup=kb_foreign_service_picker(prefix="foreign:calcsel", include_unknown=True),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("foreign:calcsel:"))
+async def on_foreign_calc_select(cb: CallbackQuery, state: FSMContext) -> None:
+    await _safe_cb_answer(cb)
+    service_key = cb.data.split(":", 2)[2]
+    if service_key in {"other", "unknown"}:
+        await state.set_state(ForeignRequestFSM.waiting_details)
+        await state.update_data(service_key=service_key, amount_raw="не указан")
+        try:
+            await cb.message.edit_text(
+                "🧩 <b>Опишите ваш запрос</b>\n\n"
+                "Напишите, что именно нужно оплатить / вывести / купить, и мы рассчитаем стоимость вручную.",
+                reply_markup=kb_back_home(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+    await state.set_state(ForeignCalcFSM.waiting_amount)
+    await state.update_data(service_key=service_key)
+    try:
+        await cb.message.edit_text(
+            f"🧮 <b>{html_escape(_foreign_service_title(service_key))}</b>\n\n"
+            "Введите сумму для расчёта числом.\n"
+            "Например: <code>100</code> или <code>49.99</code>",
+            reply_markup=kb_back_home(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@router.message(ForeignCalcFSM.waiting_amount)
+async def on_foreign_calc_amount(message, state: FSMContext) -> None:
+    data = await state.get_data()
+    service_key = str(data.get("service_key") or "other")
+    fee = _foreign_service_fee(service_key)
+    if fee is None:
+        await state.clear()
+        await message.answer("Для этой услуги расчёт делается вручную. Оставьте заявку ниже.", reply_markup=kb_foreign_request_result())
+        return
+    calc = _calculate_total(message.text or "", fee)
+    if not calc:
+        await message.answer("Введите сумму числом. Например: 100 или 49.99")
+        return
+    amount_fmt, total_fmt = calc
+    await state.clear()
+    txt = (
+        "🧮 <b>Предварительный расчёт</b>\n\n"
+        f"Услуга: <b>{html_escape(_foreign_service_title(service_key))}</b>\n"
+        f"Сумма: <b>{html_escape(amount_fmt)}</b>\n"
+        f"Комиссия: <b>{fee}%</b>\n"
+        f"Итого: <b>{html_escape(total_fmt)}</b>"
+    )
+    await message.answer(txt, reply_markup=kb_foreign_calc_result(service_key), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data == "foreign:req")
+async def on_foreign_request_menu(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _safe_cb_answer(cb)
+    try:
+        await cb.message.edit_text(
+            "💬 <b>Оставить заявку</b>\n\nВыберите услугу кнопкой ниже.",
+            reply_markup=kb_foreign_service_picker(prefix="foreign:req", include_unknown=True),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("foreign:req:"))
+async def on_foreign_request_select(cb: CallbackQuery, state: FSMContext) -> None:
+    await _safe_cb_answer(cb)
+    service_key = cb.data.split(":", 2)[2]
+    await state.update_data(service_key=service_key)
+    await state.set_state(ForeignRequestFSM.waiting_amount)
+    prompt = (
+        f"💬 <b>{html_escape(_foreign_service_title(service_key))}</b>\n\n"
+        "Введите сумму или бюджет заявки.\n"
+        "Если пока не знаете — напишите <code>не знаю</code>."
+    )
+    if service_key in {"other", "unknown"}:
+        prompt = (
+            "🧩 <b>Иная услуга</b>\n\n"
+            "Введите примерную сумму или бюджет.\n"
+            "Если пока не знаете — напишите <code>не знаю</code>."
+        )
+    try:
+        await cb.message.edit_text(prompt, reply_markup=kb_back_home(), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.message(ForeignRequestFSM.waiting_amount)
+async def on_foreign_request_amount(message, state: FSMContext) -> None:
+    amount_raw = (message.text or "").strip()
+    if not amount_raw:
+        await message.answer("Введите сумму или напишите «не знаю».")
+        return
+    await state.update_data(amount_raw=amount_raw)
+    await state.set_state(ForeignRequestFSM.waiting_details)
+    await message.answer(
+        "✍️ <b>Опишите задачу</b>\n\n"
+        "Напишите, что именно нужно: сервис / платформа / товар / ссылка / дополнительные детали.",
+        reply_markup=kb_back_home(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(ForeignRequestFSM.waiting_details)
+async def on_foreign_request_details(message, state: FSMContext) -> None:
+    details = (message.text or "").strip()
+    if not details:
+        await message.answer("Опишите задачу текстом.")
+        return
+    data = await state.get_data()
+    service_key = str(data.get("service_key") or "other")
+    amount_raw = str(data.get("amount_raw") or "не указан")
+    fee = _foreign_service_fee(service_key)
+    calc = _calculate_total(amount_raw, fee) if fee is not None and amount_raw.lower() not in {"не знаю", "неизвестно"} else None
+    username = f"@{message.from_user.username}" if getattr(message.from_user, "username", None) else "—"
+    full_name = html_escape((message.from_user.full_name or "—")[:128])
+    admin_text = (
+        "💸 <b>Новая заявка по зарубежным платежам</b>\n\n"
+        f"Услуга: <b>{html_escape(_foreign_service_title(service_key))}</b>\n"
+        f"Пользователь: <b>{full_name}</b>\n"
+        f"Username: {html_escape(username)}\n"
+        f"TG ID: <code>{message.from_user.id}</code>\n"
+        f"Сумма / бюджет: <b>{html_escape(amount_raw)}</b>\n"
+        + (f"Итог по калькулятору: <b>{html_escape(calc[1])}</b> (комиссия {fee}%)\n" if calc else "")
+        + f"Описание:\n{html_escape(details)}"
+    )
+    await _notify_foreign_request(message.bot, admin_text)
+    await state.clear()
+    user_text = (
+        "✅ <b>Заявка отправлена</b>\n\n"
+        f"Услуга: <b>{html_escape(_foreign_service_title(service_key))}</b>\n"
+        f"Сумма / бюджет: <b>{html_escape(amount_raw)}</b>\n"
+        + (f"Предварительный итог: <b>{html_escape(calc[1])}</b>\n" if calc else "")
+        + f"По всем вопросам: {FOREIGN_SUPPORT_CONTACT}"
+    )
+    await message.answer(user_text, reply_markup=kb_foreign_request_result(), parse_mode="HTML")
 
 
 @router.callback_query(lambda c: c.data == "yandex:issue_now")
