@@ -227,7 +227,7 @@ def kb_foreign_payments() -> InlineKeyboardMarkup:
     b.button(text="🧩 Иная услуга", callback_data="foreign:req:other")
     b.button(text="📂 Мои заявки", callback_data="foreign:my")
     b.button(text="📜 Условия", callback_data="foreign:terms")
-    b.button(text="💬 Связь", callback_data="foreign:contact")
+    b.button(text="🛠 Поддержка", callback_data="foreign:contact")
     b.button(text="⬅️ Назад", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
@@ -261,7 +261,7 @@ def kb_foreign_calc_result(service_key: str) -> InlineKeyboardMarkup:
 def kb_foreign_request_result() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💸 Зарубежные платежи", callback_data="nav:foreign")
-    b.button(text="💬 Связь", callback_data="foreign:contact")
+    b.button(text="🛠 Поддержка", callback_data="foreign:contact")
     b.button(text="🏠 Главное меню", callback_data="nav:home")
     b.adjust(1)
     return b.as_markup()
