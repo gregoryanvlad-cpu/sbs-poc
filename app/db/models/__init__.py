@@ -11,6 +11,7 @@ from .message_audit import MessageAudit
 from .family_vpn_group import FamilyVpnGroup
 from .family_vpn_profile import FamilyVpnProfile
 from .lte_vpn_client import LteVpnClient
+from .foreign_payment_request import ForeignPaymentRequest
 try:
     from .app_setting import AppSetting  # optional
 except Exception:  # pragma: no cover
@@ -31,5 +32,6 @@ __all__ = [
     "FamilyVpnGroup",
     "FamilyVpnProfile",
     "LteVpnClient",
+    "ForeignPaymentRequest",
 ]
 
