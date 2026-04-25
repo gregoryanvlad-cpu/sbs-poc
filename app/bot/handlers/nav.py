@@ -175,33 +175,22 @@ def _foreign_payments_text() -> str:
 
 Доступные услуги:
 
-♦️ <b>Приём платежей с карты / PayPal на PayPal (Friends & Family)</b>
-Итоговая комиссия: <b>13%</b>
+• PayPal Friends &amp; Family
+• вывод с Patreon / TikTok / VGen
+• отправка средств с PayPal
+• invoice / Goods &amp; Services
+• оплата подписок, сервисов и онлайн-товаров
+• покупка товаров из-за рубежа
+• регистрация аккаунтов
+• иные запросы под вашу задачу
 
-♦️ <b>Вывод с Patreon, TikTok, VGen и других платформ</b>
-Итоговая комиссия: <b>13%</b>
-
-♦️ <b>Отправка платежей с PayPal на ваш адрес</b>
-Итоговая комиссия: <b>8%</b>
-
-♦️ <b>Выставление счетов (Invoice) через PayPal / приём Goods & Services</b>
-Итоговая комиссия: <b>20%</b>
-
-♦️ <b>Оплата сервисов / подписок / онлайн-товаров</b>
+<b>Примеры сервисов:</b>
 ChatGPT, YouTube, PSN и другие
-Итоговая комиссия: <b>13%</b>
 
-♦️ <b>Покупка товаров из-за рубежа и доставка в страны СНГ</b>
-Итоговая комиссия: <b>13%</b>
+<b>Комиссия:</b> от <b>8%</b> до <b>20%</b>
+<b>Вывод:</b> карты РФ / USDT
 
-♦️ <b>Регистрация аккаунтов (Twitter, Instagram, YouTube и др.) с передачей доступа</b>
-Стоимость: <b>индивидуально</b>
-
-♻️ <b>Вывод доступен:</b>
-• на карты российских банков
-• на USDT-кошельки
-
-Если вашей услуги нет в списке — нажмите <b>«🧩 Иная услуга»</b>."""
+Если нужной услуги нет в списке — нажмите <b>«🧩 Иная услуга»</b>."""
 
 
 def _foreign_terms_text() -> str:
@@ -2035,7 +2024,7 @@ async def on_foreign_request_details(message, state: FSMContext) -> None:
         f"Сумма / бюджет: <b>{html_escape(amount_raw)}</b>\n"
         + (f"Предварительный итог: <b>{html_escape(calc[1])}</b>\n" if calc else "")
         + f"Статус: <b>{_foreign_status_label('new')}</b>\n"
-        + f"По всем вопросам: {FOREIGN_SUPPORT_CONTACT}"
+        + "По всем вопросам используйте кнопку <b>🛠 Поддержка</b> ниже."
     )
     await message.answer(user_text, reply_markup=kb_foreign_request_result(), parse_mode="HTML")
 
