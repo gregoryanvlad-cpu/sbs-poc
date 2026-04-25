@@ -4694,7 +4694,7 @@ async def admin_conversions_report(cb: CallbackQuery) -> None:
         lines.append("Пока нет оплаченных подписок.")
 
     parts = _split_html_lines(lines, limit=3400)
-    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_back(), edit_first=True)
+    await _send_html_chunks(cb.message, parts, reply_markup=_kb_admin_due_soon_tools(), edit_first=True)
 
 
 @router.callback_query(lambda c: c.data == "admin:stats:due_soon")
