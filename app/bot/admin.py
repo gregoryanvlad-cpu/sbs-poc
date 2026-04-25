@@ -22,7 +22,7 @@ from sqlalchemy import func, select, literal, and_, or_, delete, text
 from dateutil.relativedelta import relativedelta
 
 from app.bot.auth import is_owner, is_admin
-from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu
+from app.bot.keyboards import kb_admin_menu, kb_admin_referrals_menu, kb_foreign_admin_menu, kb_foreign_admin_requests, kb_foreign_admin_request_view
 from app.core.config import settings
 from app.db.models import Referral, ReferralEarning, Subscription, User, Payment
 from app.db.models.vpn_peer import VpnPeer
@@ -35,6 +35,7 @@ from app.db.models.payout_request import PayoutRequest
 from app.db.models.yandex_account import YandexAccount
 from app.db.models.yandex_invite_slot import YandexInviteSlot
 from app.db.models.yandex_membership import YandexMembership
+from app.db.models.foreign_payment_request import ForeignPaymentRequest
 from app.db.session import session_scope
 from app.repo import get_price_rub, set_app_setting_int, get_subscription, extend_subscription, get_app_setting_int
 from app.services.referrals.service import referral_service
@@ -7426,3 +7427,147 @@ async def admin_ref_approve_pending(cb: CallbackQuery) -> None:
             )
         except Exception:
             continue
+
+
+FOREIGN_ADMIN_STATUS_LABELS = {
+    "new": "🟡 Новая",
+    "in_progress": "🔵 В работе",
+    "waiting_payment": "⏳ Ожидает оплаты",
+    "done": "🟢 Выполнена",
+    "rejected": "🔴 Отклонена",
+}
+
+
+def _foreign_admin_status_label(status: str) -> str:
+    return FOREIGN_ADMIN_STATUS_LABELS.get(str(status or "new"), "🟡 Новая")
+
+
+def _foreign_admin_req_text(req: ForeignPaymentRequest) -> str:
+    username = f"@{req.username}" if req.username else "—"
+    return (
+        f"💸 <b>Заявка #{req.id}</b>\n\n"
+        f"Статус: <b>{html.escape(_foreign_admin_status_label(req.status))}</b>\n"
+        f"Пользователь: <b>{html.escape(req.full_name or '—')}</b>\n"
+        f"Username: {html.escape(username)}\n"
+        f"TG ID: <code>{req.user_id}</code>\n"
+        f"Услуга: <b>{html.escape(str(req.service_key))}</b> — {html.escape(str(req.amount_raw or '—'))}\n"
+        + (f"Комиссия: <b>{int(req.fee_percent)}%</b>\n" if req.fee_percent is not None else "")
+        + (f"Предварительный итог: <b>{html.escape(req.total_raw)}</b>\n" if req.total_raw else "")
+        + f"Создана: <b>{req.created_at.strftime('%Y-%m-%d %H:%M')}</b>\n\n"
+        + f"Описание:\n{html.escape((req.details or '—')[:2500])}"
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin:foreign:menu")
+async def admin_foreign_menu(cb: CallbackQuery) -> None:
+    if not await is_admin(cb):
+        return
+    await cb.answer()
+    async with session_scope() as session:
+        counts = {}
+        for st in ["new", "in_progress", "waiting_payment", "done", "rejected"]:
+            counts[st] = int((await session.execute(select(func.count()).select_from(ForeignPaymentRequest).where(ForeignPaymentRequest.status == st))).scalar() or 0)
+    txt = (
+        "💸 <b>Заявки по зарубежным платежам</b>\n\n"
+        f"🟡 Новые: <b>{counts['new']}</b>\n"
+        f"🔵 В работе: <b>{counts['in_progress']}</b>\n"
+        f"⏳ Ждут оплаты: <b>{counts['waiting_payment']}</b>\n"
+        f"🟢 Выполнены: <b>{counts['done']}</b>\n"
+        f"🔴 Отклонены: <b>{counts['rejected']}</b>"
+    )
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb_foreign_admin_menu(), parse_mode='HTML')
+    except Exception:
+        await cb.message.answer(txt, reply_markup=kb_foreign_admin_menu(), parse_mode='HTML')
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin:foreign:list:"))
+async def admin_foreign_list(cb: CallbackQuery) -> None:
+    if not await is_admin(cb):
+        return
+    await cb.answer()
+    status = cb.data.rsplit(':',1)[1]
+    async with session_scope() as session:
+        stmt = select(ForeignPaymentRequest)
+        if status != 'all':
+            stmt = stmt.where(ForeignPaymentRequest.status == status)
+        rows = (await session.execute(stmt.order_by(ForeignPaymentRequest.id.desc()).limit(15))).scalars().all()
+    if not rows:
+        txt = '💸 <b>Заявки по зарубежным платежам</b>\n\nПо этому фильтру пока ничего нет.'
+        kb = kb_foreign_admin_menu()
+    else:
+        txt = '💸 <b>Заявки по зарубежным платежам</b>\n\nВыберите заявку из списка ниже.'
+        items = []
+        for r in rows:
+            username = f"@{r.username}" if r.username else f"ID {r.user_id}"
+            items.append((int(r.id), f"#{r.id} · {_foreign_admin_status_label(r.status)} · {username}"))
+        kb = kb_foreign_admin_requests(items, status)
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb, parse_mode='HTML')
+    except Exception:
+        await cb.message.answer(txt, reply_markup=kb, parse_mode='HTML')
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin:foreign:view:"))
+async def admin_foreign_view(cb: CallbackQuery) -> None:
+    if not await is_admin(cb):
+        return
+    await cb.answer()
+    try:
+        req_id = int(cb.data.rsplit(':',1)[1])
+    except Exception:
+        return
+    async with session_scope() as session:
+        req = await session.get(ForeignPaymentRequest, req_id)
+    if not req:
+        await cb.answer('Заявка не найдена', show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(_foreign_admin_req_text(req), reply_markup=kb_foreign_admin_request_view(req.id, req.status), parse_mode='HTML')
+    except Exception:
+        await cb.message.answer(_foreign_admin_req_text(req), reply_markup=kb_foreign_admin_request_view(req.id, req.status), parse_mode='HTML')
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("admin:foreign:set:"))
+async def admin_foreign_set_status(cb: CallbackQuery) -> None:
+    if not await is_admin(cb):
+        return
+    await cb.answer()
+    parts = cb.data.split(':')
+    if len(parts) < 5:
+        return
+    try:
+        req_id = int(parts[3])
+    except Exception:
+        return
+    new_status = parts[4]
+    async with session_scope() as session:
+        req = await session.get(ForeignPaymentRequest, req_id)
+        if not req:
+            return
+        req.status = new_status
+        await session.flush()
+        user_id = int(req.user_id)
+        req_snapshot = {
+            'id': req.id,
+            'status': req.status,
+            'service_key': req.service_key,
+        }
+    try:
+        await audit_send_message(
+            cb.bot,
+            user_id,
+            'foreign_request_status',
+            (
+                f"💸 <b>Обновление по заявке #{req_snapshot['id']}</b>\n\n"
+                f"Услуга: <b>{html.escape(req_snapshot['service_key'])}</b>\n"
+                f"Статус: <b>{html.escape(_foreign_admin_status_label(req_snapshot['status']))}</b>"
+            ),
+            parse_mode='HTML',
+        )
+    except Exception:
+        pass
+    async with session_scope() as session:
+        req = await session.get(ForeignPaymentRequest, req_id)
+    if req:
+        await cb.message.edit_text(_foreign_admin_req_text(req), reply_markup=kb_foreign_admin_request_view(req.id, req.status), parse_mode='HTML')
