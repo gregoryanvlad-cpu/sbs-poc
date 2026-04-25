@@ -49,10 +49,12 @@ from app.bot.keyboards import (
     kb_foreign_service_picker,
     kb_foreign_calc_result,
     kb_foreign_request_result,
+    kb_foreign_my_requests,
 )
 from app.bot.ui import days_left, fmt_dt, utcnow
 from app.core.config import settings
 from app.db.models import Payment, User, LteVpnClient, Referral, ReferralEarning
+from app.db.models.foreign_payment_request import ForeignPaymentRequest
 from app.db.models.app_setting import AppSetting
 from app.db.models.yandex_membership import YandexMembership
 from app.db.session import session_scope
@@ -213,6 +215,32 @@ def _foreign_terms_text() -> str:
 • по отдельным заявкам могут потребоваться уточнения;
 • если услуги нет в списке — используйте кнопку <b>«🧩 Иная услуга»</b>."""
 
+
+
+
+FOREIGN_STATUS_LABELS = {
+    "new": "🟡 Новая",
+    "in_progress": "🔵 В работе",
+    "waiting_payment": "⏳ Ожидает оплаты",
+    "done": "🟢 Выполнена",
+    "rejected": "🔴 Отклонена",
+}
+
+
+def _foreign_status_label(status: str) -> str:
+    return FOREIGN_STATUS_LABELS.get(str(status or "new"), "🟡 Новая")
+
+
+def _foreign_request_card(req: ForeignPaymentRequest) -> str:
+    return (
+        f"📋 <b>Заявка #{req.id}</b>\n\n"
+        f"Статус: <b>{html_escape(_foreign_status_label(req.status))}</b>\n"
+        f"Услуга: <b>{html_escape(_foreign_service_title(req.service_key))}</b>\n"
+        f"Сумма / бюджет: <b>{html_escape(req.amount_raw or '—')}</b>\n"
+        + (f"Предварительный итог: <b>{html_escape(req.total_raw)}</b>\n" if req.total_raw else "")
+        + f"Создана: <b>{fmt_dt(req.created_at)}</b>\n\n"
+        f"Описание:\n{html_escape((req.details or '—')[:1500])}"
+    )
 
 def _fmt_countdown_to(dt: datetime | None) -> str:
     if not dt:
@@ -1975,13 +2003,32 @@ async def on_foreign_request_details(message, state: FSMContext) -> None:
         + (f"Итог по калькулятору: <b>{html_escape(calc[1])}</b> (комиссия {fee}%)\n" if calc else "")
         + f"Описание:\n{html_escape(details)}"
     )
+    async with session_scope() as session:
+        req = ForeignPaymentRequest(
+            user_id=int(message.from_user.id),
+            username=getattr(message.from_user, "username", None),
+            full_name=(message.from_user.full_name or "")[:255] or None,
+            service_key=service_key,
+            amount_raw=amount_raw[:64],
+            fee_percent=fee,
+            total_raw=(calc[1] if calc else None),
+            details=details[:4000],
+            contact=username[:128] if username != "—" else None,
+            status="new",
+        )
+        session.add(req)
+        await session.flush()
+        req_id = int(req.id)
+    admin_text = "💸 <b>Новая заявка по зарубежным платежам</b>\n\n" + admin_text.split("\n\n",1)[1] + f"\n\nID заявки: <b>#{req_id}</b>"
     await _notify_foreign_request(message.bot, admin_text)
     await state.clear()
     user_text = (
         "✅ <b>Заявка отправлена</b>\n\n"
+        f"Номер заявки: <b>#{req_id}</b>\n"
         f"Услуга: <b>{html_escape(_foreign_service_title(service_key))}</b>\n"
         f"Сумма / бюджет: <b>{html_escape(amount_raw)}</b>\n"
         + (f"Предварительный итог: <b>{html_escape(calc[1])}</b>\n" if calc else "")
+        + f"Статус: <b>{_foreign_status_label('new')}</b>\n"
         + f"По всем вопросам: {FOREIGN_SUPPORT_CONTACT}"
     )
     await message.answer(user_text, reply_markup=kb_foreign_request_result(), parse_mode="HTML")
@@ -5630,3 +5677,49 @@ async def on_vpn_lte_reset(cb: CallbackQuery) -> None:
     )
     await _safe_cb_answer(cb)
 
+
+
+@router.callback_query(lambda c: c.data == "foreign:my")
+async def on_foreign_my_requests(cb: CallbackQuery) -> None:
+    await _safe_cb_answer(cb)
+    async with session_scope() as session:
+        rows = (await session.execute(
+            select(ForeignPaymentRequest)
+            .where(ForeignPaymentRequest.user_id == int(cb.from_user.id))
+            .order_by(ForeignPaymentRequest.id.desc())
+            .limit(12)
+        )).scalars().all()
+    if not rows:
+        txt = "📂 <b>Мои заявки</b>\n\nУ вас пока нет заявок по зарубежным платежам."
+        try:
+            await cb.message.edit_text(txt, reply_markup=kb_foreign_payments(), parse_mode="HTML")
+        except Exception:
+            pass
+        return
+    items = [(int(r.id), f"#{r.id} · {_foreign_status_label(r.status)}") for r in rows]
+    txt = "📂 <b>Мои заявки</b>\n\nВыберите заявку из списка ниже."
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb_foreign_my_requests(items), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("foreign:my:"))
+async def on_foreign_my_request_view(cb: CallbackQuery) -> None:
+    await _safe_cb_answer(cb)
+    try:
+        req_id = int(cb.data.rsplit(":",1)[1])
+    except Exception:
+        return
+    async with session_scope() as session:
+        req = await session.get(ForeignPaymentRequest, req_id)
+    if not req or int(req.user_id) != int(cb.from_user.id):
+        try:
+            await cb.answer("Заявка не найдена", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        await cb.message.edit_text(_foreign_request_card(req), reply_markup=kb_foreign_my_requests([(int(req.id), f"#{req.id} · {_foreign_status_label(req.status)}")]), parse_mode="HTML")
+    except Exception:
+        pass
