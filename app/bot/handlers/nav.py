@@ -2613,6 +2613,23 @@ async def _start_platega_payment(
     pay_months = months_override if months_override is not None else settings.period_months
     pay_days = 30 if months_override is not None else settings.period_days
 
+    # HOTFIX: website checkout works, but direct Platega API calls from the Railway
+    # Telegram-bot service can be blocked by DDoS-Guard due to the bot service outbound IP.
+    # In web mode we do NOT call Platega from the bot. We send the user to the website
+    # checkout immediately, so payments keep working while Platega allowlists the bot IP.
+    bot_payment_mode = str(getattr(settings, "bot_payment_mode", "web") or "web").strip().lower()
+    if bot_payment_mode in {"web", "site", "website", "checkout", "web_first", "web-only", "web_only"}:
+        await _send_web_payment_fallback(
+            cb,
+            tg_id=tg_id,
+            amount_rub=int(price_rub),
+            months=int(pay_months),
+            purpose=("lte" if promo_code == "lte" else "subscription"),
+            promo_code=promo_code,
+            back_callback="nav:home",
+        )
+        return
+
     # We pack some useful info into payload for easier troubleshooting.
     payload = f"tg_id={tg_id};period={pay_months}m"
     if promo_code:
