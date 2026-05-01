@@ -57,7 +57,7 @@ class PlategaClient:
     async def create_transaction(
         self,
         *,
-        payment_method: int,
+        payment_method: int | None,
         amount: int,
         currency: str = "RUB",
         description: str,
@@ -65,9 +65,15 @@ class PlategaClient:
         failed_url: str,
         payload: str,
     ) -> PlategaCreateResult:
-        url = f"{self._base_url}/transaction/process"
+        """Create a Platega payment link.
+
+        The legacy endpoint with a fixed payment method returns ``redirect``.
+        The current generic endpoint lets the payer choose a method and returns ``url``.
+        If the configured payment method is disabled for the merchant, fall back to the
+        generic v2 link instead of showing users "Не удалось создать платеж".
+        Set PLATEGA_PAYMENT_METHOD=0 to use the generic v2 link directly.
+        """
         body: dict[str, Any] = {
-            "paymentMethod": int(payment_method),
             "paymentDetails": {
                 "amount": int(amount),
                 "currency": currency,
@@ -78,14 +84,50 @@ class PlategaClient:
             "payload": payload,
         }
 
+        use_fixed_method = False
+        try:
+            use_fixed_method = payment_method is not None and int(payment_method) > 0
+        except Exception:
+            use_fixed_method = False
+
+        last_error: PlategaError | None = None
+        if use_fixed_method:
+            fixed_body = dict(body)
+            fixed_body["paymentMethod"] = int(payment_method)
+            try:
+                data = await self._post_json("/transaction/process", fixed_body)
+                return self._parse_create_result(data)
+            except PlategaError as exc:
+                last_error = exc
+
+        try:
+            data = await self._post_json("/v2/transaction/process", body)
+            return self._parse_create_result(data)
+        except PlategaError as exc:
+            if last_error is not None:
+                raise PlategaError(f"{last_error}; fallback failed: {exc}") from exc
+            raise
+
+    async def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self._base_url}{path}"
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
             async with session.post(url, json=body, headers=self._headers()) as resp:
                 data = await _read_json_best_effort(resp)
                 if resp.status >= 400:
                     raise PlategaError(f"Platega create_transaction failed: HTTP {resp.status}: {data}")
+                return data
 
-        tx_id = str(data.get("transactionId") or data.get("id") or "").strip()
-        redirect = str(data.get("redirect") or "").strip()
+    @staticmethod
+    def _parse_create_result(data: dict[str, Any]) -> PlategaCreateResult:
+        tx_id = str(data.get("transactionId") or data.get("id") or data.get("externalId") or "").strip()
+        redirect = str(
+            data.get("redirect")
+            or data.get("url")
+            or data.get("payUrl")
+            or data.get("paymentUrl")
+            or data.get("payformUrl")
+            or ""
+        ).strip()
         status = str(data.get("status") or "").strip()
         if not tx_id or not redirect:
             raise PlategaError(f"Platega create_transaction: unexpected response: {data}")
