@@ -122,7 +122,11 @@ class Settings:
     # Website auth bridge (Bot -> Website)
     web_app_base_url: str = ""
     web_internal_api_key: str | None = None
-    # Fallback checkout URL used when Platega blocks the bot server IP (DDoS-Guard 403).
+    # Website payment bridge (Bot -> Website).
+    # WEB_PAYMENT_CREATE_URL must point to an internal website endpoint that creates
+    # a real Platega checkout URL server-to-server, without asking the user to log in.
+    web_payment_create_url: str = ""
+    # Legacy fallback page URL. Prefer WEB_PAYMENT_CREATE_URL for Telegram payments.
     web_payment_checkout_url: str = ""
     # Telegram bot payment mode: web bypasses Platega DDoS-Guard block on bot IP; direct uses Platega API from bot.
     bot_payment_mode: str = "web"
@@ -245,6 +249,12 @@ def _load_settings() -> Settings:
         content_request_ttl_seconds=int(os.getenv("CONTENT_REQUEST_TTL_SECONDS", "900")),
         web_app_base_url=(os.getenv("WEB_APP_BASE_URL") or os.getenv("APP_BASE_URL") or "https://sbsconnect.up.railway.app").strip(),
         web_internal_api_key=(os.getenv("WEB_INTERNAL_API_KEY") or "").strip() or None,
+        web_payment_create_url=(
+            os.getenv("WEB_PAYMENT_CREATE_URL")
+            or os.getenv("WEB_CREATE_PAYMENT_URL")
+            or os.getenv("WEB_CHECKOUT_CREATE_URL")
+            or ""
+        ).strip(),
         web_payment_checkout_url=(os.getenv("WEB_PAYMENT_CHECKOUT_URL") or os.getenv("WEB_CHECKOUT_URL") or "").strip(),
         bot_payment_mode=(os.getenv("BOT_PAYMENT_MODE") or os.getenv("TELEGRAM_PAYMENT_MODE") or "web").strip().lower(),
         main_bot_username=(os.getenv("MAIN_BOT_USERNAME") or "sbsconnect_bot").strip(),
