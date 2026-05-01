@@ -122,6 +122,8 @@ class Settings:
     # Website auth bridge (Bot -> Website)
     web_app_base_url: str = ""
     web_internal_api_key: str | None = None
+    # Fallback checkout URL used when Platega blocks the bot server IP (DDoS-Guard 403).
+    web_payment_checkout_url: str = ""
 
     # Bot2 (player) settings (used only by main_player.py)
     main_bot_username: str = "sbsconnect_bot"
@@ -239,8 +241,9 @@ def _load_settings() -> Settings:
 
         # Player bot
         content_request_ttl_seconds=int(os.getenv("CONTENT_REQUEST_TTL_SECONDS", "900")),
-        web_app_base_url=(os.getenv("WEB_APP_BASE_URL") or os.getenv("APP_BASE_URL") or "").strip(),
+        web_app_base_url=(os.getenv("WEB_APP_BASE_URL") or os.getenv("APP_BASE_URL") or "https://sbsconnect.up.railway.app").strip(),
         web_internal_api_key=(os.getenv("WEB_INTERNAL_API_KEY") or "").strip() or None,
+        web_payment_checkout_url=(os.getenv("WEB_PAYMENT_CHECKOUT_URL") or os.getenv("WEB_CHECKOUT_URL") or "").strip(),
         main_bot_username=(os.getenv("MAIN_BOT_USERNAME") or "sbsconnect_bot").strip(),
         player_whitelist_domains=tuple(
             d.strip().lower()
