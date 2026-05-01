@@ -121,6 +121,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     b.button(text="👥 Активные VPN-профили", callback_data="admin:vpn:active_profiles")
     b.button(text="📈 Кто пользовался VPN", callback_data="admin:vpn:usage")
     b.button(text="🩺 Проверка системы", callback_data="admin:diag")
+    b.button(text="🌐 Посмотреть IP сервера", callback_data="admin:outbound_ip")
     b.button(text="🗂 Пользователи по серверам", callback_data="admin:vpn:server_users")
     b.button(text="🛠 Управление VPN-серверами", callback_data="admin:vpn:servers")
     b.button(text="📶 Активные LTE-профили", callback_data="admin:vpn:active_lte_profiles")
