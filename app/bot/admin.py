@@ -6,6 +6,7 @@ import os
 import json
 import html
 import logging
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -134,6 +135,36 @@ async def _send_plain_chunks(message: Message, parts: list[str], *, reply_markup
                     pass
 
 
+
+def _fetch_text_url_sync(url: str, *, timeout: float = 8.0) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "sbsconnect-bot/1.0",
+            "Accept": "text/plain, application/json;q=0.9, */*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(512).decode("utf-8", errors="replace").strip()
+
+
+async def _detect_outbound_ip() -> tuple[str | None, str | None]:
+    """Return public outbound IP for allowlists, without requiring Railway Shell."""
+    services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    last_error: str | None = None
+    for url in services:
+        try:
+            raw = await asyncio.to_thread(_fetch_text_url_sync, url, timeout=8.0)
+            ip = raw.strip().strip('"')
+            if ip:
+                return ip, url
+        except Exception as e:
+            last_error = f"{url}: {type(e).__name__}: {e}"
+    return None, last_error
 def _fmt_bytes_short(num: int) -> str:
     try:
         n = int(num or 0)
@@ -2272,6 +2303,36 @@ async def admin_menu(cb: CallbackQuery) -> None:
 
 
 # ==========================
+
+@router.callback_query(lambda c: c.data == "admin:outbound_ip")
+async def admin_outbound_ip(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        await cb.answer("Проверяю IP…")
+    except Exception:
+        pass
+
+    ip, source = await _detect_outbound_ip()
+    if ip:
+        text = (
+            "🌐 <b>Публичный outbound IP сервера</b>\n\n"
+            f"<code>{html.escape(ip)}</code>\n\n"
+            "Именно этот IP отправь в Platega для allowlist / разблокировки DDoS-Guard.\n"
+            "⚠️ Если в Railway нет Static Outbound IP, IP может поменяться после redeploy.\n\n"
+            f"Источник проверки: <code>{html.escape(source or 'unknown')}</code>"
+        )
+    else:
+        text = (
+            "❌ <b>Не удалось определить outbound IP</b>\n\n"
+            "Сервер не смог обратиться к сервисам проверки IP.\n"
+            f"Последняя ошибка: <code>{html.escape(source or 'unknown')}</code>"
+        )
+    try:
+        await cb.message.edit_text(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=_kb_admin_back(), parse_mode="HTML")
 # ADMIN: USERS LIST
 # ==========================
 
