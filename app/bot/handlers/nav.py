@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+from typing import Any
 from html import escape as html_escape
 from urllib.parse import urlencode
 from pathlib import Path
@@ -114,6 +115,130 @@ def _build_web_payment_url(
     return f"{base}{sep}{urlencode(params)}"
 
 
+def _extract_url_from_web_payment_response(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+
+    keys = (
+        "url",
+        "payment_url",
+        "paymentUrl",
+        "checkout_url",
+        "checkoutUrl",
+        "redirect_url",
+        "redirectUrl",
+        "pay_url",
+        "payUrl",
+    )
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value.strip()
+
+    for nested_key in ("data", "payment", "result", "checkout", "transaction"):
+        nested = data.get(nested_key)
+        if isinstance(nested, dict):
+            found = _extract_url_from_web_payment_response(nested)
+            if found:
+                return found
+    return None
+
+
+def _web_payment_create_urls() -> list[str]:
+    explicit = (getattr(settings, "web_payment_create_url", "") or "").strip()
+    if explicit:
+        return [explicit]
+
+    root = (settings.web_app_base_url or "https://sbsconnect.up.railway.app").rstrip("/")
+    return [
+        f"{root}/internal/telegram/create-payment",
+        f"{root}/internal/telegram/payments/create",
+        f"{root}/internal/payments/create",
+        f"{root}/api/payments/telegram/create",
+        f"{root}/api/payments/create",
+        f"{root}/api/payments/platega/create",
+    ]
+
+
+async def _create_web_payment_link(
+    *,
+    tg_id: int,
+    amount_rub: int,
+    months: int,
+    purpose: str = "subscription",
+    promo_code: str | None = None,
+    seats: int | None = None,
+) -> tuple[str | None, str | None]:
+    """Ask the website service to create the Platega checkout URL.
+
+    The user must receive a real payment URL, not the website home page/login page.
+    The website creates the Platega transaction from its own Railway service,
+    where Platega already works.
+    """
+    import aiohttp
+
+    payload: dict[str, Any] = {
+        "source": "telegram_bot",
+        "tg_id": int(tg_id),
+        "telegram_id": int(tg_id),
+        "amount": int(amount_rub),
+        "amount_rub": int(amount_rub),
+        "currency": "RUB",
+        "months": int(months),
+        "period_months": int(months),
+        "purpose": str(purpose or "subscription"),
+        "return_url": settings.platega_return_url,
+        "failed_url": settings.platega_failed_url,
+    }
+    if promo_code:
+        payload["promo"] = str(promo_code)
+        payload["promo_code"] = str(promo_code)
+    if seats is not None:
+        payload["seats"] = int(seats)
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "sbsconnect-telegram-bot/1.0",
+    }
+    if settings.web_internal_api_key:
+        headers["x-internal-api-key"] = settings.web_internal_api_key
+        headers["X-Internal-Api-Key"] = settings.web_internal_api_key
+
+    last_error: str | None = None
+    timeout = aiohttp.ClientTimeout(total=12)
+    for url in _web_payment_create_urls():
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.post(url, json=payload, headers=headers) as resp:
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text) if text else {}
+                    except Exception:
+                        data = {"_raw": text[:500]}
+
+                    if 200 <= resp.status < 300:
+                        payment_url = _extract_url_from_web_payment_response(data)
+                        if payment_url:
+                            log.info(
+                                "web_payment_create_success",
+                                extra={"url": url, "tg_id": tg_id, "amount": int(amount_rub), "purpose": purpose},
+                            )
+                            return payment_url, None
+                        last_error = f"{url}: нет url в ответе сайта: {str(data)[:300]}"
+                    else:
+                        last_error = f"{url}: HTTP {resp.status}: {str(data)[:300]}"
+        except Exception as exc:
+            last_error = f"{url}: {type(exc).__name__}: {exc}"
+
+        log.warning(
+            "web_payment_create_failed",
+            extra={"url": url, "tg_id": tg_id, "amount": int(amount_rub), "error": last_error},
+        )
+
+    return None, last_error or "website payment create endpoint failed"
+
+
 async def _send_web_payment_fallback(
     cb: CallbackQuery,
     *,
@@ -127,7 +252,7 @@ async def _send_web_payment_fallback(
 ) -> None:
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-    url = _build_web_payment_url(
+    payment_url, error = await _create_web_payment_link(
         tg_id=tg_id,
         amount_rub=amount_rub,
         months=months,
@@ -135,22 +260,69 @@ async def _send_web_payment_fallback(
         promo_code=promo_code,
         seats=seats,
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Оплатить на сайте", url=url)],
-            [InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)],
-        ]
-    )
+
+    if payment_url:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Перейти к оплате", url=payment_url)],
+                [InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)],
+            ]
+        )
+        try:
+            await cb.answer("Ссылка на оплату создана")
+        except Exception:
+            pass
+        await cb.message.edit_text(
+            "💳 <b>Оплата</b>\n\n"
+            f"Сумма: <b>{int(amount_rub)} ₽</b>\n\n"
+            "Ссылка на платеж создана. Нажмите «✅ Перейти к оплате».\n"
+            "Авторизоваться на сайте не нужно.",
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    fallback_url = _build_web_payment_url(
+        tg_id=tg_id,
+        amount_rub=amount_rub,
+        months=months,
+        purpose=purpose,
+        promo_code=promo_code,
+        seats=seats,
+    ) if settings.web_payment_checkout_url else ""
+
+    if fallback_url:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Открыть оплату", url=fallback_url)],
+                [InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)],
+            ]
+        )
+        text = (
+            "💳 <b>Оплата</b>\n\n"
+            f"Сумма: <b>{int(amount_rub)} ₽</b>\n\n"
+            "Не удалось автоматически создать прямую платежную ссылку через сайт. "
+            "Откройте запасную страницу оплаты."
+        )
+    else:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)]]
+        )
+        text = (
+            "💳 <b>Оплата временно недоступна</b>\n\n"
+            "Бот не может создать прямую ссылку Platega через сайт.\n"
+            "Админу: настрой <code>WEB_PAYMENT_CREATE_URL</code> на внутренний endpoint сайта, "
+            "который возвращает JSON с <code>url</code>/<code>payment_url</code>.\n\n"
+            f"Последняя ошибка: <code>{html_escape(str(error or '')[:700])}</code>"
+        )
+
     try:
-        await cb.answer("Откройте оплату на сайте")
+        await cb.answer("Не удалось создать платеж")
     except Exception:
         pass
     await cb.message.edit_text(
-        "💳 <b>Оплата</b>\n\n"
-        f"Сумма: <b>{int(amount_rub)} ₽</b>\n"
-        "Прямой запрос из Telegram-бота сейчас блокируется платежным шлюзом по IP. "
-        "Сайт создает платежи нормально, поэтому оплату нужно открыть через сайт.\n\n"
-        "Нажмите «✅ Оплатить на сайте», войдите через Telegram и завершите оплату.",
+        text,
         reply_markup=kb,
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -4861,6 +5033,19 @@ async def _start_platega_family_payment(cb: CallbackQuery, *, tg_id: int, seats:
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     from app.services.payments.platega import PlategaClient, PlategaError
     from app.db.models import Payment
+
+    bot_payment_mode = str(getattr(settings, "bot_payment_mode", "web") or "web").strip().lower()
+    if bot_payment_mode in {"web", "site", "website", "checkout", "web_first", "web-only", "web_only"}:
+        await _send_web_payment_fallback(
+            cb,
+            tg_id=tg_id,
+            amount_rub=int(amount_rub),
+            months=1,
+            purpose="family",
+            seats=int(seats),
+            back_callback="vpn:family",
+        )
+        return
 
     if not settings.platega_merchant_id or not settings.platega_secret:
         await cb.answer("Платежи временно недоступны")
