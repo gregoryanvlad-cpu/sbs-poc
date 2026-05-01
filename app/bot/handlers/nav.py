@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 from html import escape as html_escape
 from pathlib import Path
@@ -66,6 +67,7 @@ from app.services.lte_vpn.service import lte_vpn_service
 from app.services.message_audit import audit_send_message, audit_log_event
 
 router = Router()
+log = logging.getLogger(__name__)
 
 
 class PromoCodeFSM(StatesGroup):
@@ -2542,7 +2544,8 @@ async def _start_platega_payment(
             failed_url=settings.platega_failed_url,
             payload=payload,
         )
-    except PlategaError:
+    except PlategaError as exc:
+        log.exception("platega_create_payment_failed", extra={"tg_id": tg_id, "amount": price_rub, "error": str(exc)})
         await cb.answer("Ошибка платежного провайдера")
         try:
             await cb.message.edit_text(
@@ -4761,7 +4764,8 @@ async def _start_platega_family_payment(cb: CallbackQuery, *, tg_id: int, seats:
             failed_url=settings.platega_failed_url,
             payload=payload,
         )
-    except PlategaError:
+    except PlategaError as exc:
+        log.exception("platega_create_payment_failed", extra={"tg_id": tg_id, "amount": price_rub, "error": str(exc)})
         await cb.answer("Ошибка платежного провайдера")
         return
 
