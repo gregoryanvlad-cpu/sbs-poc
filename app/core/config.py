@@ -124,6 +124,8 @@ class Settings:
     web_internal_api_key: str | None = None
     # Fallback checkout URL used when Platega blocks the bot server IP (DDoS-Guard 403).
     web_payment_checkout_url: str = ""
+    # Telegram bot payment mode: web bypasses Platega DDoS-Guard block on bot IP; direct uses Platega API from bot.
+    bot_payment_mode: str = "web"
 
     # Bot2 (player) settings (used only by main_player.py)
     main_bot_username: str = "sbsconnect_bot"
@@ -244,6 +246,7 @@ def _load_settings() -> Settings:
         web_app_base_url=(os.getenv("WEB_APP_BASE_URL") or os.getenv("APP_BASE_URL") or "https://sbsconnect.up.railway.app").strip(),
         web_internal_api_key=(os.getenv("WEB_INTERNAL_API_KEY") or "").strip() or None,
         web_payment_checkout_url=(os.getenv("WEB_PAYMENT_CHECKOUT_URL") or os.getenv("WEB_CHECKOUT_URL") or "").strip(),
+        bot_payment_mode=(os.getenv("BOT_PAYMENT_MODE") or os.getenv("TELEGRAM_PAYMENT_MODE") or "web").strip().lower(),
         main_bot_username=(os.getenv("MAIN_BOT_USERNAME") or "sbsconnect_bot").strip(),
         player_whitelist_domains=tuple(
             d.strip().lower()
