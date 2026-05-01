@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from html import escape as html_escape
+from urllib.parse import urlencode
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -68,6 +69,92 @@ from app.services.message_audit import audit_send_message, audit_log_event
 
 router = Router()
 log = logging.getLogger(__name__)
+
+
+
+
+def _platega_error_looks_like_ip_block(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "ddos-guard" in msg
+        or "restricted access from your current ip" in msg
+        or "http 403" in msg
+        or " is not available" in msg
+    )
+
+
+def _build_web_payment_url(
+    *,
+    tg_id: int,
+    amount_rub: int,
+    months: int,
+    purpose: str = "subscription",
+    promo_code: str | None = None,
+    seats: int | None = None,
+) -> str:
+    base = (settings.web_payment_checkout_url or "").strip()
+    if not base:
+        root = (settings.web_app_base_url or "https://sbsconnect.up.railway.app").rstrip("/")
+        base = f"{root}/"
+
+    params = {
+        "source": "telegram_bot",
+        "pay": "1",
+        "tg_id": str(int(tg_id)),
+        "amount": str(int(amount_rub)),
+        "months": str(int(months)),
+        "purpose": purpose,
+    }
+    if promo_code:
+        params["promo"] = str(promo_code)
+    if seats is not None:
+        params["seats"] = str(int(seats))
+
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{urlencode(params)}"
+
+
+async def _send_web_payment_fallback(
+    cb: CallbackQuery,
+    *,
+    tg_id: int,
+    amount_rub: int,
+    months: int,
+    purpose: str = "subscription",
+    promo_code: str | None = None,
+    seats: int | None = None,
+    back_callback: str = "nav:home",
+) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    url = _build_web_payment_url(
+        tg_id=tg_id,
+        amount_rub=amount_rub,
+        months=months,
+        purpose=purpose,
+        promo_code=promo_code,
+        seats=seats,
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Оплатить на сайте", url=url)],
+            [InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)],
+        ]
+    )
+    try:
+        await cb.answer("Откройте оплату на сайте")
+    except Exception:
+        pass
+    await cb.message.edit_text(
+        "💳 <b>Оплата</b>\n\n"
+        f"Сумма: <b>{int(amount_rub)} ₽</b>\n"
+        "Прямой запрос из Telegram-бота сейчас блокируется платежным шлюзом по IP. "
+        "Сайт создает платежи нормально, поэтому оплату нужно открыть через сайт.\n\n"
+        "Нажмите «✅ Оплатить на сайте», войдите через Telegram и завершите оплату.",
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 class PromoCodeFSM(StatesGroup):
@@ -2546,6 +2633,17 @@ async def _start_platega_payment(
         )
     except PlategaError as exc:
         log.exception("platega_create_payment_failed", extra={"tg_id": tg_id, "amount": price_rub, "error": str(exc)})
+        if _platega_error_looks_like_ip_block(exc):
+            await _send_web_payment_fallback(
+                cb,
+                tg_id=tg_id,
+                amount_rub=int(price_rub),
+                months=int(pay_months),
+                purpose=("lte" if promo_code == "lte" else "subscription"),
+                promo_code=promo_code,
+                back_callback="nav:home",
+            )
+            return
         await cb.answer("Ошибка платежного провайдера")
         try:
             await cb.message.edit_text(
@@ -4765,7 +4863,18 @@ async def _start_platega_family_payment(cb: CallbackQuery, *, tg_id: int, seats:
             payload=payload,
         )
     except PlategaError as exc:
-        log.exception("platega_create_payment_failed", extra={"tg_id": tg_id, "amount": price_rub, "error": str(exc)})
+        log.exception("platega_create_payment_failed", extra={"tg_id": tg_id, "amount": int(amount_rub), "error": str(exc)})
+        if _platega_error_looks_like_ip_block(exc):
+            await _send_web_payment_fallback(
+                cb,
+                tg_id=tg_id,
+                amount_rub=int(amount_rub),
+                months=1,
+                purpose="family",
+                seats=int(seats),
+                back_callback="vpn:family",
+            )
+            return
         await cb.answer("Ошибка платежного провайдера")
         return
 
