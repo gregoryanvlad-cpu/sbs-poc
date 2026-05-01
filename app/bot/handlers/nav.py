@@ -144,6 +144,45 @@ def _extract_url_from_web_payment_response(data: Any) -> str | None:
     return None
 
 
+def _extract_int_from_web_payment_response(data: Any, *keys: str) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        try:
+            if value is not None and str(value).strip():
+                parsed = int(value)
+                if parsed > 0:
+                    return parsed
+        except Exception:
+            pass
+    for nested_key in ("data", "payment", "result", "checkout", "transaction"):
+        nested = data.get(nested_key)
+        if isinstance(nested, dict):
+            found = _extract_int_from_web_payment_response(nested, *keys)
+            if found:
+                return found
+    return None
+
+
+def _extract_str_from_web_payment_response(data: Any, *keys: str) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    for nested_key in ("data", "payment", "result", "checkout", "transaction"):
+        nested = data.get(nested_key)
+        if isinstance(nested, dict):
+            found = _extract_str_from_web_payment_response(nested, *keys)
+            if found:
+                return found
+    return None
+
+
 def _web_payment_create_urls() -> list[str]:
     explicit = (getattr(settings, "web_payment_create_url", "") or "").strip()
     if explicit:
@@ -168,7 +207,7 @@ async def _create_web_payment_link(
     purpose: str = "subscription",
     promo_code: str | None = None,
     seats: int | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[dict[str, Any] | None, str | None]:
     """Ask the website service to create the Platega checkout URL.
 
     The user must receive a real payment URL, not the website home page/login page.
@@ -224,7 +263,12 @@ async def _create_web_payment_link(
                                 "web_payment_create_success",
                                 extra={"url": url, "tg_id": tg_id, "amount": int(amount_rub), "purpose": purpose},
                             )
-                            return payment_url, None
+                            return {
+                                "url": payment_url,
+                                "payment_id": _extract_int_from_web_payment_response(data, "payment_id", "paymentId", "id"),
+                                "transaction_id": _extract_str_from_web_payment_response(data, "transaction_id", "transactionId", "provider_payment_id", "providerPaymentId"),
+                                "raw": data,
+                            }, None
                         last_error = f"{url}: нет url в ответе сайта: {str(data)[:300]}"
                     else:
                         last_error = f"{url}: HTTP {resp.status}: {str(data)[:300]}"
@@ -237,6 +281,109 @@ async def _create_web_payment_link(
         )
 
     return None, last_error or "website payment create endpoint failed"
+
+
+async def _ensure_web_payment_db_row(
+    *,
+    tg_id: int,
+    amount_rub: int,
+    months: int,
+    purpose: str,
+    promo_code: str | None,
+    seats: int | None,
+    transaction_id: str | None,
+    payment_id: int | None,
+) -> int | None:
+    """Return a local Payment.id for the web-created checkout.
+
+    The website and bot normally share the same database, and the website already
+    inserts the pending row. This helper makes the flow robust: it reuses the
+    returned id, searches by Platega transaction id, or inserts a local pending
+    row if the website did not return one.
+    """
+    provider = "platega"
+    if purpose == "lte":
+        provider = "platega_lte"
+    elif purpose.startswith("family"):
+        provider = f"platega_family_{int(seats or 1)}"
+    elif promo_code and promo_code not in {"lte", "winback_69", "winback_29"}:
+        provider = f"platega_promo_{promo_code}"
+    elif promo_code:
+        provider = f"platega_{promo_code}"
+
+    async with session_scope() as session:
+        found = None
+        if payment_id:
+            found = await session.get(Payment, int(payment_id))
+            if found and int(found.tg_id) == int(tg_id):
+                return int(found.id)
+        if transaction_id:
+            found = await session.scalar(
+                select(Payment).where(Payment.provider_payment_id == str(transaction_id)).limit(1)
+            )
+            if found:
+                return int(found.id)
+
+        if not transaction_id:
+            return None
+
+        p = Payment(
+            tg_id=int(tg_id),
+            amount=int(amount_rub),
+            currency="RUB",
+            provider=provider,
+            status="pending",
+            period_days=30,
+            period_months=max(1, int(months or 1)),
+            provider_payment_id=str(transaction_id),
+        )
+        session.add(p)
+        await session.commit()
+        return int(p.id)
+
+
+async def _get_web_payment_status(*, transaction_id: str | None = None, payment_id: int | None = None) -> str | None:
+    """Ask the website service to check Platega status from the website outbound IP."""
+    import aiohttp
+
+    root = (settings.web_app_base_url or "https://sbsconnect.up.railway.app").rstrip("/")
+    urls = [f"{root}/internal/telegram/check-payment", f"{root}/internal/telegram/payment-status"]
+    payload: dict[str, Any] = {}
+    if transaction_id:
+        payload["transaction_id"] = str(transaction_id)
+        payload["provider_payment_id"] = str(transaction_id)
+    if payment_id:
+        payload["payment_id"] = int(payment_id)
+    if not payload:
+        return None
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "sbsconnect-telegram-bot/1.0",
+    }
+    if settings.web_internal_api_key:
+        headers["x-internal-api-key"] = settings.web_internal_api_key
+        headers["X-Internal-Api-Key"] = settings.web_internal_api_key
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    for url in urls:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.post(url, json=payload, headers=headers) as resp:
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text) if text else {}
+                    except Exception:
+                        data = {"_raw": text[:500]}
+                    if 200 <= resp.status < 300:
+                        status = _extract_str_from_web_payment_response(data, "status", "payment_status", "paymentStatus")
+                        if status:
+                            return status.upper()
+                    log.warning("web_payment_status_failed", extra={"url": url, "status": resp.status, "response": str(data)[:300]})
+        except Exception as exc:
+            log.warning("web_payment_status_failed", extra={"url": url, "error": str(exc)[:300]})
+    return None
 
 
 async def _send_web_payment_fallback(
@@ -252,7 +399,7 @@ async def _send_web_payment_fallback(
 ) -> None:
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-    payment_url, error = await _create_web_payment_link(
+    web_payment, error = await _create_web_payment_link(
         tg_id=tg_id,
         amount_rub=amount_rub,
         months=months,
@@ -261,12 +408,24 @@ async def _send_web_payment_fallback(
         seats=seats,
     )
 
-    if payment_url:
+    if web_payment and web_payment.get("url"):
+        payment_url = str(web_payment.get("url"))
+        payment_db_id = await _ensure_web_payment_db_row(
+            tg_id=tg_id,
+            amount_rub=amount_rub,
+            months=months,
+            purpose=purpose,
+            promo_code=promo_code,
+            seats=seats,
+            transaction_id=web_payment.get("transaction_id"),
+            payment_id=web_payment.get("payment_id"),
+        )
+        rows = [[InlineKeyboardButton(text="✅ Перейти к оплате", url=payment_url)]]
+        if payment_db_id:
+            rows.append([InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pay:check:{payment_db_id}")])
+        rows.append([InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)])
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Перейти к оплате", url=payment_url)],
-                [InlineKeyboardButton(text="🏠 Главное меню" if back_callback == "nav:home" else "⬅️ Назад", callback_data=back_callback)],
-            ]
+            inline_keyboard=rows
         )
         try:
             await cb.answer("Ссылка на оплату создана")
@@ -281,6 +440,8 @@ async def _send_web_payment_fallback(
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
+        if payment_db_id:
+            _ensure_pay_watch_task(cb.bot, payment_db_id=payment_db_id, tg_id=tg_id)
         return
 
     fallback_url = _build_web_payment_url(
@@ -2552,11 +2713,15 @@ async def _auto_watch_platega_payment(bot, *, payment_db_id: int, tg_id: int) ->
                     return
 
                 try:
-                    st = await client.get_transaction_status(transaction_id=provider_tid)
+                    web_status = await _get_web_payment_status(transaction_id=provider_tid, payment_id=payment_db_id)
+                    if web_status:
+                        status = web_status.upper()
+                    else:
+                        st = await client.get_transaction_status(transaction_id=provider_tid)
+                        status = (st.status or "").upper()
                 except PlategaError:
                     continue
 
-                status = (st.status or "").upper()
                 if status in ("CONFIRMED", "SUCCESS", "PAID", "COMPLETED"):
                     # Family group payment (seats) vs normal subscription
                     if (pay.provider or "").startswith("platega_family_"):
@@ -2932,12 +3097,15 @@ async def on_pay_check(cb: CallbackQuery) -> None:
 
         client = PlategaClient(merchant_id=settings.platega_merchant_id, secret=settings.platega_secret)
         try:
-            st = await client.get_transaction_status(transaction_id=pay.provider_payment_id)
+            web_status = await _get_web_payment_status(transaction_id=pay.provider_payment_id, payment_id=payment_id)
+            if web_status:
+                status = web_status.upper()
+            else:
+                st = await client.get_transaction_status(transaction_id=pay.provider_payment_id)
+                status = (st.status or "").upper()
         except PlategaError:
             await cb.answer("Не удалось проверить статус")
             return
-
-        status = (st.status or "").upper()
 
         # Platega callback docs use status="CONFIRMED".
         # The status API page doesn't enumerate all terminal statuses,
