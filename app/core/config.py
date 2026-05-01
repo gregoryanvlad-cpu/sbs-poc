@@ -78,7 +78,7 @@ class Settings:
     payment_provider: str = "mock"  # mock | platega
     platega_merchant_id: str | None = None
     platega_secret: str | None = None
-    platega_payment_method: int = 2
+    platega_payment_method: int = 0
     platega_return_url: str = "https://example.com/success"
     platega_failed_url: str = "https://example.com/fail"
 
@@ -207,8 +207,8 @@ def _load_settings() -> Settings:
         # Payments
         payment_provider=os.getenv("PAYMENT_PROVIDER", "mock").strip().lower(),
         platega_merchant_id=(os.getenv("PLATEGA_MERCHANT_ID") or "").strip() or None,
-        platega_secret=(os.getenv("PLATEGA_SECRET") or "").strip() or None,
-        platega_payment_method=int(os.getenv("PLATEGA_PAYMENT_METHOD", "2")),
+        platega_secret=(os.getenv("PLATEGA_SECRET") or os.getenv("PLATEGA_API_KEY") or "").strip() or None,
+        platega_payment_method=int(os.getenv("PLATEGA_PAYMENT_METHOD", "0")),
         platega_return_url=os.getenv("PLATEGA_RETURN_URL", "https://example.com/success").strip(),
         platega_failed_url=os.getenv("PLATEGA_FAILED_URL", "https://example.com/fail").strip(),
         vpn_mode=os.getenv("VPN_MODE", "mock").strip().lower(),
