@@ -40,12 +40,17 @@ class PlategaClient:
         merchant_id: str,
         secret: str,
         base_url: str = "https://app.platega.io",
-        timeout_seconds: int = 20,
+        timeout_seconds: int = 8,
     ) -> None:
         self._merchant_id = merchant_id
         self._secret = secret
         self._base_url = base_url.rstrip("/")
-        self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._timeout = aiohttp.ClientTimeout(
+            total=timeout_seconds,
+            connect=min(5, timeout_seconds),
+            sock_connect=min(5, timeout_seconds),
+            sock_read=timeout_seconds,
+        )
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -110,12 +115,19 @@ class PlategaClient:
 
     async def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
-        async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            async with session.post(url, json=body, headers=self._headers()) as resp:
-                data = await _read_json_best_effort(resp)
-                if resp.status >= 400:
-                    raise PlategaError(f"Platega create_transaction failed: HTTP {resp.status}: {data}")
-                return data
+        try:
+            async with aiohttp.ClientSession(timeout=self._timeout) as session:
+                async with session.post(url, json=body, headers=self._headers()) as resp:
+                    data = await _read_json_best_effort(resp)
+                    if resp.status >= 400:
+                        raise PlategaError(f"Platega create_transaction failed: HTTP {resp.status}: {data}")
+                    return data
+        except PlategaError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise PlategaError(f"Platega request timed out: POST {path}") from exc
+        except aiohttp.ClientError as exc:
+            raise PlategaError(f"Platega request failed: POST {path}: {exc}") from exc
 
     @staticmethod
     def _parse_create_result(data: dict[str, Any]) -> PlategaCreateResult:
