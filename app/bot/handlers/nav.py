@@ -5854,6 +5854,10 @@ async def faq_terms(cb: CallbackQuery) -> None:
 
 
 
+def _lte_rotation_note() -> str:
+    return "<tg-spoiler>ℹ️ Сервера VPN LTE обновляются раз в 2 месяца. Если подключение перестало работать, откройте этот раздел и скопируйте актуальную ссылку.</tg-spoiler>"
+
+
 def _lte_summary_text(*, has_access: bool, paid: bool, sub_end: datetime | None, lte_price: int) -> str:
     lines = [
         "📶 <b>VPN LTE</b>",
@@ -5896,6 +5900,8 @@ def _lte_menu_text(*, has_access: bool, sub_end: datetime | None, lte_price: int
         lines.append(f"Активация на 1 месяц: <b>{lte_price} ₽</b>.")
         if not paid:
             lines.append("Для пользователей на пробном периоде доплата не требуется.")
+    lines.append("")
+    lines.append(_lte_rotation_note())
     return "\n".join(lines)
 def _lte_about_text(*, has_access: bool, sub_end: datetime | None) -> str:
     active_until_text = f"\n\n✅ LTE уже активирован.\nАктивно до: <b>{fmt_dt(sub_end)}</b>." if has_access and sub_end else ""
@@ -5925,7 +5931,9 @@ VPN LTE — это отдельный профиль для ситуаций, к
 <b>Законность использования</b>
 Профиль предназначен для личного использования как средство защищённого соединения и стабильного доступа к обычным интернет‑сервисам. Пользователь обязан соблюдать применимое законодательство и правила используемых сервисов.
 
-<i>⚠️ Не работает в городе Санкт-Петербург.</i>"""
+<i>⚠️ Не работает в городе Санкт-Петербург.</i>
+
+<tg-spoiler>ℹ️ Сервера VPN LTE обновляются раз в 2 месяца. Если подключение перестало работать, откройте этот раздел и скопируйте актуальную ссылку.</tg-spoiler>"""
 
 
 async def _lte_is_main_sub_active(tg_id: int) -> tuple[bool, datetime | None]:
@@ -5949,6 +5957,19 @@ async def _lte_has_access(tg_id: int) -> tuple[bool, datetime | None, bool]:
 async def _lte_price_rub() -> int:
     async with session_scope() as session:
         return await get_app_setting_int(session, "lte_activation_rub", default=settings.lte_activation_rub)
+
+
+async def _lte_capacity_available_for_user(tg_id: int) -> tuple[bool, int, int]:
+    """Return whether the user may receive/sync a profile without stealing a slot.
+
+    Existing active LTE users keep access even when the global limit is full.
+    New activations are blocked once LTE_MAX_CLIENTS is reached.
+    """
+    used = await lte_vpn_service.active_clients_count()
+    limit = int(settings.lte_max_clients)
+    if await lte_vpn_service.user_has_active_lte_slot(tg_id):
+        return True, used, limit
+    return used < limit, used, limit
 
 
 @router.callback_query(lambda c: c.data == "vpn:lte")
@@ -5991,6 +6012,15 @@ async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
         if not paid:
             await cb.answer("Для пробного периода доплата не нужна", show_alert=True)
             return
+    capacity_ok, used, limit = await _lte_capacity_available_for_user(cb.from_user.id)
+    if not capacity_ok:
+        await cb.message.edit_text(
+            f"📶 <b>VPN LTE</b>\n\nСейчас все места заняты: <b>{used}/{limit}</b>. Попробуйте позже.",
+            reply_markup=kb_lte_vpn(has_access=False, activation_rub=await _lte_price_rub()),
+            parse_mode="HTML",
+        )
+        await _safe_cb_answer(cb)
+        return
     provider = settings.payment_provider
     if provider == "platega":
         lte_price = await _lte_price_rub()
@@ -6027,10 +6057,10 @@ async def on_vpn_lte_install(cb: CallbackQuery) -> None:
     if not has_access:
         await cb.answer("Сначала активируйте VPN LTE", show_alert=True)
         return
-    used = await lte_vpn_service.active_clients_count()
-    if used >= settings.lte_max_clients:
+    capacity_ok, used, limit = await _lte_capacity_available_for_user(cb.from_user.id)
+    if not capacity_ok:
         await cb.message.edit_text(
-            f"📶 <b>VPN LTE</b>\n\nСейчас все места заняты: <b>{used}/{settings.lte_max_clients}</b>. Попробуйте позже.",
+            f"📶 <b>VPN LTE</b>\n\nСейчас все места заняты: <b>{used}/{limit}</b>. Попробуйте позже.",
             reply_markup=kb_lte_vpn(has_access=True, activation_rub=await _lte_price_rub()),
             parse_mode="HTML",
         )
@@ -6088,7 +6118,8 @@ async def on_vpn_lte_install(cb: CallbackQuery) -> None:
         f"{howto}\n\n"
         "🔗 <b>Ссылка для Happ Plus</b>\n"
         f"{link_block}\n\n"
-        "После подключения отключайтесь при переходе на Wi‑Fi.",
+        "После подключения отключайтесь при переходе на Wi‑Fi.\n\n"
+        f"{_lte_rotation_note()}",
         reply_markup=kb,
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -6149,7 +6180,8 @@ async def on_vpn_lte_reset(cb: CallbackQuery) -> None:
         "📌 <b>Как добавить новый конфиг в Happ Plus</b>\n"
         f"{howto}\n\n"
         "🔗 <b>Новая ссылка</b>\n"
-        f"{link_block}",
+        f"{link_block}\n\n"
+        f"{_lte_rotation_note()}",
         reply_markup=kb,
         parse_mode="HTML",
         disable_web_page_preview=True,
