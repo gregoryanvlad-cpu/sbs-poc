@@ -122,6 +122,15 @@ class LteVpnService:
         )
         await self._run(cmd)
 
+    @staticmethod
+    def _is_lte_client(client: dict) -> bool:
+        email = str((client or {}).get("email") or "").strip().lower()
+        return email.endswith("@lte")
+
+    @staticmethod
+    def _client_email(client: dict) -> str:
+        return str((client or {}).get("email") or "").strip()
+
     def _find_inbound(self, cfg: dict) -> _InboundRef:
         for ib in (cfg.get("inbounds") or []):
             if not isinstance(ib, dict):
@@ -217,6 +226,131 @@ class LteVpnService:
             )
             val = await session.scalar(q)
             return int(val or 0)
+
+    async def active_client_rows(self, *, limit: int | None = None) -> list[LteVpnClient]:
+        """Return local LTE profiles that should currently have remote access.
+
+        The local database is the source of truth for already activated LTE users.
+        Rows are ordered so older activated profiles keep priority when the capacity
+        limit is reached during a server migration.
+        """
+        async with session_scope() as session:
+            now = datetime.now(timezone.utc)
+            q = (
+                select(LteVpnClient)
+                .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+                .where(
+                    LteVpnClient.is_enabled == True,
+                    or_(
+                        and_(Subscription.is_active == True, Subscription.end_at.is_not(None), Subscription.end_at > now),
+                        and_(LteVpnClient.cycle_anchor_end_at.is_not(None), LteVpnClient.cycle_anchor_end_at > now),
+                    ),
+                )
+                .order_by(LteVpnClient.created_at.asc(), LteVpnClient.tg_id.asc())
+            )
+            if limit is not None:
+                q = q.limit(max(1, int(limit)))
+            rows = list((await session.execute(q)).scalars().all())
+            return rows
+
+    async def user_has_active_lte_slot(self, tg_id: int) -> bool:
+        async with session_scope() as session:
+            now = datetime.now(timezone.utc)
+            row = await session.scalar(
+                select(LteVpnClient)
+                .outerjoin(Subscription, Subscription.tg_id == LteVpnClient.tg_id)
+                .where(
+                    LteVpnClient.tg_id == int(tg_id),
+                    LteVpnClient.is_enabled == True,
+                    or_(
+                        and_(Subscription.is_active == True, Subscription.end_at.is_not(None), Subscription.end_at > now),
+                        and_(LteVpnClient.cycle_anchor_end_at.is_not(None), LteVpnClient.cycle_anchor_end_at > now),
+                    ),
+                )
+                .limit(1)
+            )
+            return row is not None
+
+    async def sync_active_clients_to_remote(self, *, prune_stale_lte: bool = True, limit: int | None = None) -> dict[str, int | list[int]]:
+        """Bulk-sync active LTE profiles from DB into the Xray config.
+
+        Used after moving LTE to a new server/IP. Existing active local UUIDs are
+        preserved, so users keep their individual profiles. The VLESS URL host is
+        still generated from LTE_VLESS_HOST/LTE_SSH_HOST at send time.
+
+        If prune_stale_lte=True, outdated remote *@lte clients not active in DB
+        are removed from the server. Non-LTE clients in the same inbound are kept.
+        """
+        hard_limit = max(1, int(limit or self.max_clients or settings.lte_max_clients or 1))
+        active_rows = await self.active_client_rows(limit=None)
+        desired_all = {self.email_for_tg_id(int(r.tg_id)): str(r.uuid) for r in active_rows if str(r.uuid or "").strip()}
+
+        cfg = await self._read_xray_config()
+        ref = self._find_inbound(cfg)
+
+        non_lte_clients: list = []
+        existing_lte_order: list[str] = []
+        existing_lte_uuid: dict[str, str] = {}
+        for c in ref.clients:
+            if not isinstance(c, dict):
+                non_lte_clients.append(c)
+                continue
+            email = self._client_email(c)
+            if self._is_lte_client(c):
+                if email and email not in existing_lte_order:
+                    existing_lte_order.append(email)
+                    existing_lte_uuid[email] = str(c.get("id") or "").strip()
+            else:
+                non_lte_clients.append(c)
+
+        selected_emails: list[str] = []
+        for email in existing_lte_order:
+            if email in desired_all and email not in selected_emails:
+                selected_emails.append(email)
+                if len(selected_emails) >= hard_limit:
+                    break
+        if len(selected_emails) < hard_limit:
+            for row in active_rows:
+                email = self.email_for_tg_id(int(row.tg_id))
+                if email in desired_all and email not in selected_emails:
+                    selected_emails.append(email)
+                    if len(selected_emails) >= hard_limit:
+                        break
+
+        selected = {email: desired_all[email] for email in selected_emails}
+        new_clients = list(non_lte_clients)
+        for email in selected_emails:
+            new_clients.append({"id": selected[email], "email": email})
+
+        if not prune_stale_lte:
+            for email in existing_lte_order:
+                if email not in selected:
+                    cid = existing_lte_uuid.get(email)
+                    if cid:
+                        new_clients.append({"id": cid, "email": email})
+
+        old_clients = ref.clients
+        changed = old_clients != new_clients
+        if changed:
+            ref.inbound.setdefault("settings", {})["clients"] = new_clients
+            await self._write_xray_config(cfg)
+            await self._restart_xray()
+
+        overflow_tg_ids = []
+        if len(active_rows) > len(selected_emails):
+            selected_set = set(selected_emails)
+            overflow_tg_ids = [int(r.tg_id) for r in active_rows if self.email_for_tg_id(int(r.tg_id)) not in selected_set]
+
+        return {
+            "active_local": len(active_rows),
+            "synced_remote": len(selected_emails),
+            "remote_lte_before": len(existing_lte_order),
+            "remote_lte_after": len([c for c in new_clients if isinstance(c, dict) and self._is_lte_client(c)]),
+            "changed": int(bool(changed)),
+            "capacity_limit": hard_limit,
+            "overflow": len(overflow_tg_ids),
+            "overflow_tg_ids": overflow_tg_ids[:50],
+        }
 
     async def get_or_create_client(self, tg_id: int, *, subscription_end_at: datetime | None, force_rotate: bool = False) -> LteVpnClient:
         async with session_scope() as session:
