@@ -2613,6 +2613,7 @@ def _kb_user_card(tg_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🗓 Изменить дату окончания", callback_data=f"admin:user:set_end_at:{tg_id}"),
             ],
             [InlineKeyboardButton(text="💰 Цена места семьи", callback_data=f"admin:user:set_family_price:{tg_id}")],
+            [InlineKeyboardButton(text="♻️ Восстановить/обесточить WG", callback_data=f"admin:user:peer_power_menu:{tg_id}")],
             [InlineKeyboardButton(text="🗑 Удалить peer", callback_data=f"admin:user:peer_delete_menu:{tg_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")],
         ]
@@ -3451,6 +3452,240 @@ async def admin_user_peer_delete_apply(cb: CallbackQuery) -> None:
         [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
     ])
     await cb.message.edit_text(summary_text, reply_markup=kb, parse_mode="HTML")
+
+
+
+def _peer_power_label(peer: VpnPeer) -> str:
+    status = "✅ активен" if bool(getattr(peer, "is_active", False)) else "⛔️ выключен"
+    server = str(getattr(peer, "server_code", None) or "—").upper()
+    ip = str(getattr(peer, "client_ip", None) or "—")
+    reason = str(getattr(peer, "rotation_reason", None) or "")
+    tail = f" | {reason}" if reason else ""
+    return f"peer#{int(peer.id)} | {status} | {server} | {ip}{tail}"
+
+
+async def _peer_restore_capacity(session, peer: VpnPeer) -> tuple[bool, str, int, int]:
+    """Check whether the peer can be restored on its original server."""
+    server_code = str(getattr(peer, "server_code", None) or vpn_service._default_server_code()).strip().upper()
+    servers = await vpn_service._enabled_servers(session)
+    server = None
+    for srv in servers:
+        if str(srv.get("code") or "").strip().upper() == server_code:
+            server = srv
+            break
+    if server is None:
+        return False, server_code or "—", 0, 0
+    used = await vpn_service._vpn_seats_by_server(session)
+    seats = int(used.get(server_code, 0) or 0)
+    cap = int(vpn_service._server_capacity(server))
+    return seats < cap, server_code, seats, cap
+
+
+async def _peer_power_menu_text(session, tg_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    peers = list((await session.execute(
+        select(VpnPeer)
+        .where(VpnPeer.tg_id == int(tg_id))
+        .order_by(VpnPeer.is_active.desc(), VpnPeer.id.desc())
+        .limit(30)
+    )).scalars().all())
+
+    lines = [
+        "♻️ <b>Восстановление / обесточивание WG</b>",
+        f"Пользователь: <code>{int(tg_id)}</code>",
+        "",
+        "Выберите конкретный конфиг. Активный можно обесточить, выключенный — восстановить даже после grace, если на его сервере есть место.",
+    ]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if not peers:
+        lines.append("\nУ пользователя нет WireGuard-конфигов.")
+    else:
+        lines.append("")
+        for peer in peers:
+            label = _peer_power_label(peer)
+            action = "Обесточить" if bool(getattr(peer, "is_active", False)) else "Восстановить"
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=f"{action}: {label}"[:64],
+                    callback_data=f"admin:user:peer_power_confirm:{int(tg_id)}:{int(peer.id)}",
+                )
+            ])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{int(tg_id)}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_power_menu:"))
+async def admin_user_peer_power_menu(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        tg_id = int((cb.data or "").split(":")[-1])
+    except Exception:
+        return
+    async with session_scope() as session:
+        text_, kb = await _peer_power_menu_text(session, tg_id)
+    await cb.message.edit_text(text_, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_power_confirm:"))
+async def admin_user_peer_power_confirm(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer()
+    try:
+        parts = (cb.data or "").split(":")
+        tg_id = int(parts[-2])
+        peer_id = int(parts[-1])
+    except Exception:
+        return
+
+    async with session_scope() as session:
+        peer = await session.get(VpnPeer, peer_id)
+        if not peer or int(getattr(peer, "tg_id", 0) or 0) != tg_id:
+            await cb.message.edit_text(
+                "❌ Конфиг не найден.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")]]),
+                parse_mode="HTML",
+            )
+            return
+        active = bool(getattr(peer, "is_active", False))
+        label = html.escape(_peer_power_label(peer))
+        pub = html.escape(str(getattr(peer, "client_public_key", "") or "—"))
+        if active:
+            text_ = (
+                "⚡️ <b>Обесточить WG-конфиг?</b>\n"
+                f"Пользователь: <code>{tg_id}</code>\n"
+                f"{label}\n"
+                f"Public key: <code>{pub[:32]}…</code>\n\n"
+                "Конфиг будет удалён с VPN-сервера, но останется в базе как выключенный. Его можно будет восстановить из этого же меню."
+            )
+            btn_text = "⚡️ Обесточить конфиг"
+        else:
+            ok, code, used, cap = await _peer_restore_capacity(session, peer)
+            if not ok:
+                text_ = (
+                    "❌ <b>Восстановление невозможно</b>\n"
+                    f"Пользователь: <code>{tg_id}</code>\n"
+                    f"{label}\n\n"
+                    f"На сервере <b>{html.escape(code)}</b> нет свободных мест или сервер отключён/не найден.\n"
+                    f"Занято: <b>{used}/{cap}</b>."
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ К списку конфигов", callback_data=f"admin:user:peer_power_menu:{tg_id}")],
+                    [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+                ])
+                await cb.message.edit_text(text_, reply_markup=kb, parse_mode="HTML")
+                return
+            text_ = (
+                "♻️ <b>Восстановить WG-конфиг?</b>\n"
+                f"Пользователь: <code>{tg_id}</code>\n"
+                f"{label}\n"
+                f"Public key: <code>{pub[:32]}…</code>\n\n"
+                f"На сервере <b>{html.escape(code)}</b> есть место: <b>{used}/{cap}</b>.\n"
+                "После восстановления этот конфиг снова займёт место на сервере."
+            )
+            btn_text = "♻️ Восстановить конфиг"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn_text, callback_data=f"admin:user:peer_power_apply:{tg_id}:{peer_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку конфигов", callback_data=f"admin:user:peer_power_menu:{tg_id}")],
+        [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+    ])
+    await cb.message.edit_text(text_, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("admin:user:peer_power_apply:"))
+async def admin_user_peer_power_apply(cb: CallbackQuery) -> None:
+    if not is_owner(cb.from_user.id):
+        await cb.answer()
+        return
+    try:
+        parts = (cb.data or "").split(":")
+        tg_id = int(parts[-2])
+        peer_id = int(parts[-1])
+    except Exception:
+        await cb.answer()
+        return
+
+    async with session_scope() as session:
+        peer = await session.get(VpnPeer, peer_id)
+        if not peer or int(getattr(peer, "tg_id", 0) or 0) != tg_id:
+            await cb.answer("Конфиг не найден", show_alert=True)
+            return
+
+        if bool(getattr(peer, "is_active", False)):
+            await cb.answer("Обесточиваю…")
+            remote_ok = False
+            try:
+                remote_ok = await vpn_service.remove_peer_for_server(
+                    str(getattr(peer, "client_public_key", "") or ""),
+                    server_code=getattr(peer, "server_code", None),
+                )
+            except Exception:
+                log.exception("admin_peer_depower_remote_failed tg_id=%s peer_id=%s", tg_id, peer_id)
+            peer.is_active = False
+            peer.revoked_at = _utcnow()
+            peer.rotation_reason = "admin_disabled"
+            await session.flush()
+            status_text = "✅ <b>Конфиг обесточен</b>"
+            detail = "Удалён с VPN-сервера." if remote_ok else "С VPN-сервера удалён best-effort; проверьте сервер при необходимости."
+        else:
+            ok, code, used, cap = await _peer_restore_capacity(session, peer)
+            if not ok:
+                await cb.answer("Нет свободных мест", show_alert=True)
+                text_ = (
+                    "❌ <b>Восстановление невозможно</b>\n"
+                    f"Пользователь: <code>{tg_id}</code>\n"
+                    f"Peer: <b>#{peer_id}</b>\n"
+                    f"Сервер: <b>{html.escape(code)}</b>\n"
+                    f"Занято: <b>{used}/{cap}</b>."
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ К списку конфигов", callback_data=f"admin:user:peer_power_menu:{tg_id}")],
+                    [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+                ])
+                await cb.message.edit_text(text_, reply_markup=kb, parse_mode="HTML")
+                return
+            await cb.answer("Восстанавливаю…")
+            try:
+                provider, resolved_code = vpn_service._provider_for_server_code(getattr(peer, "server_code", None))
+                await provider.add_peer(str(peer.client_public_key), str(peer.client_ip), tg_id=tg_id)
+                peer.server_code = resolved_code
+                peer.is_active = True
+                peer.revoked_at = None
+                peer.rotation_reason = None
+                await session.flush()
+                status_text = "✅ <b>Конфиг восстановлен</b>"
+                detail = f"Сервер: <b>{html.escape(str(resolved_code))}</b>. Место занято: <b>{used + 1}/{cap}</b>."
+            except Exception as exc:
+                log.exception("admin_peer_restore_failed tg_id=%s peer_id=%s", tg_id, peer_id)
+                await cb.answer("Ошибка восстановления", show_alert=True)
+                text_ = (
+                    "❌ <b>Не удалось восстановить конфиг</b>\n"
+                    f"Пользователь: <code>{tg_id}</code>\n"
+                    f"Peer: <b>#{peer_id}</b>\n"
+                    f"Ошибка: <code>{html.escape(type(exc).__name__)}: {html.escape(str(exc))}</code>"
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ К списку конфигов", callback_data=f"admin:user:peer_power_menu:{tg_id}")],
+                    [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+                ])
+                await cb.message.edit_text(text_, reply_markup=kb, parse_mode="HTML")
+                return
+        await session.commit()
+
+    text_ = (
+        f"{status_text}\n"
+        f"Пользователь: <code>{tg_id}</code>\n"
+        f"Peer: <b>#{peer_id}</b>\n"
+        f"{detail}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♻️ Управлять ещё", callback_data=f"admin:user:peer_power_menu:{tg_id}")],
+        [InlineKeyboardButton(text="⬅️ К карточке", callback_data=f"admin:user:card:{tg_id}")],
+    ])
+    await cb.message.edit_text(text_, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(lambda c: (c.data or "").startswith("admin:user:gift_revoke:"))
 async def admin_user_gift_revoke_menu(cb: CallbackQuery) -> None:
