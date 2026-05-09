@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 
 import qrcode
 from aiogram import Router, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -5972,8 +5973,29 @@ async def _lte_capacity_available_for_user(tg_id: int) -> tuple[bool, int, int]:
     return used < limit, used, limit
 
 
+LTE_DISABLED_TEXT = (
+    "📶 <b>VPN LTE</b>\n\n"
+    "🚫 В связи усилением контроля со стороны РКН функция обхода глушилок была отключена на неопределенное время.\n\n"
+    "Если вы уже оплатили эту подписку и не можете ей воспользоваться — напишите в поддержку, вам вернут средства."
+)
+
+LTE_DISABLED_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🛠 Поддержка", callback_data="nav:support")],
+    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:home")],
+])
+
+async def _show_lte_disabled(cb: CallbackQuery) -> None:
+    try:
+        await cb.message.edit_text(LTE_DISABLED_TEXT, reply_markup=LTE_DISABLED_KB, parse_mode="HTML")
+    except TelegramBadRequest:
+        await cb.message.answer(LTE_DISABLED_TEXT, reply_markup=LTE_DISABLED_KB, parse_mode="HTML")
+    await _safe_cb_answer(cb, "VPN LTE временно отключён")
+
+
 @router.callback_query(lambda c: c.data == "vpn:lte")
 async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
+    await _show_lte_disabled(cb)
+    return
     if not settings.lte_enabled:
         await cb.answer("Раздел временно отключён", show_alert=True)
         return
@@ -5995,6 +6017,8 @@ async def on_vpn_lte_menu(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:lte:about")
 async def on_vpn_lte_about(cb: CallbackQuery) -> None:
+    await _show_lte_disabled(cb)
+    return
     has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
     lte_price = await _lte_price_rub()
     await cb.message.edit_text(_lte_about_text(has_access=has_access, sub_end=sub_end), reply_markup=kb_lte_vpn(has_access=has_access, activation_rub=lte_price), parse_mode="HTML")
@@ -6003,6 +6027,8 @@ async def on_vpn_lte_about(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:lte:pay")
 async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
+    await _show_lte_disabled(cb)
+    return
     has_sub, _ = await _lte_is_main_sub_active(cb.from_user.id)
     if not has_sub:
         await cb.answer("Сначала нужна основная подписка", show_alert=True)
@@ -6053,6 +6079,8 @@ async def on_vpn_lte_pay(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:lte:install")
 async def on_vpn_lte_install(cb: CallbackQuery) -> None:
+    await _show_lte_disabled(cb)
+    return
     has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
     if not has_access:
         await cb.answer("Сначала активируйте VPN LTE", show_alert=True)
@@ -6130,6 +6158,8 @@ async def on_vpn_lte_install(cb: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "vpn:lte:reset")
 async def on_vpn_lte_reset(cb: CallbackQuery) -> None:
+    await _show_lte_disabled(cb)
+    return
     has_access, sub_end, _ = await _lte_has_access(cb.from_user.id)
     if not has_access:
         await cb.answer("Сначала активируйте VPN LTE", show_alert=True)
